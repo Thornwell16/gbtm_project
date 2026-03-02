@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from scipy.optimize import minimize
+import matplotlib.pyplot as plt
 
 def load_cambridge_data():
     """
@@ -144,3 +145,37 @@ print(f"Maximum Log-Likelihood: {-1 * result.fun:.4f}")
 print(f"Optimized B0 (Intercept): {result.x[0]:.4f}")
 print(f"Optimized B1 (Linear):    {result.x[1]:.4f}")
 print(f"Optimized B2 (Quadratic): {result.x[2]:.4f}")
+
+# --- Step 10: Graphing the Trajectory ---
+
+print("Generating graph...")
+
+# 1. Create a blank canvas
+plt.figure(figsize=(10, 6))
+
+# 2. Plot the raw, actual data points
+# We add a slight visual "jitter" to the Y-axis so the dots don't completely overlap
+jittered_y = actual_outcomes + np.random.normal(0, 0.02, size=len(actual_outcomes))
+plt.scatter(actual_times, jittered_y, alpha=0.1, color='gray', label='Actual Observations')
+
+# 3. Generate the smooth predicted curve
+# Create 100 evenly spaced time points between the minimum and maximum time
+smooth_times = np.linspace(min(actual_times), max(actual_times), 100)
+
+# Calculate the predicted probability for each of those 100 points using the betas the optimizer found!
+# (result.x contains the [Intercept, Linear, Quadratic] values)
+predicted_probs = [calc_logit_prob(result.x, t) for t in smooth_times]
+
+# 4. Draw the curve
+plt.plot(smooth_times, predicted_probs, color='red', linewidth=3, label='Predicted Trajectory (1-Group)')
+
+# 5. Make it look professional
+plt.title("GBTM Rewrite: 1-Group Quadratic Logit Model", fontsize=14)
+plt.xlabel("Time Period", fontsize=12)
+plt.ylabel("Probability of Outcome", fontsize=12)
+plt.ylim(-0.1, 1.1) # Keep Y-axis bounded tightly around 0 and 1
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.5)
+
+# 6. Show the graph on the screen!
+plt.show()
