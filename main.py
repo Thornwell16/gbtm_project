@@ -1,181 +1,99 @@
 import pandas as pd
 import numpy as np
 from scipy.optimize import minimize
-import matplotlib.pyplot as plt
+from scipy.special import logsumexp
 
 def load_cambridge_data():
     """
     Loads the Cambridge dataset used for testing logit trajectory models.
-    
-    Data Source Attribution:
-    Dataset provided by Dr. Bobby L. Jones. 
-    Originally utilized in the development and demonstration of the SAS PROC TRAJ package.
     Reference: https://www.andrew.cmu.edu/user/bjj/traj/
     """
     df = pd.read_csv("cambridge.txt", sep=r'\s+')
-    
     return df
-cambridge_df = load_cambridge_data()
-
-
-def calc_logit_prob(betas, time):
-    """
-    Calculates the probability of an event using a quadratic logit model.
-    betas: A list of 3 numbers [intercept, linear_slope, quadratic_slope]
-    time: The time point (T)
-    """
-    beta0, beta1, beta2 = betas
-    
-    # 1. Calculate the core equation (z)
-    z = beta0 + (beta1 * time) + (beta2 * (time**2))
-    
-    # 2. Apply the logistic function to turn 'z' into a probability between 0 and 1
-    probability = 1 / (1 + np.exp(-z))
-    
-    return probability
-
-def calc_log_likelihood(betas, actual_times, actual_outcomes):
-    """
-    Calculates the Bernoulli Log-Likelihood for a set of data points.
-    Higher values (closer to 0, since they are negative) mean a better fit.
-    """
-    total_log_likelihood = 0
-    
-    # Loop through every single observation in our data
-    for i in range(len(actual_times)):
-        time = actual_times[i]
-        y = actual_outcomes[i]
-        
-        # 1. Use our previous function to guess the probability
-        p = calc_logit_prob(betas, time)
-        
-        # 2. Prevent the math engine from crashing
-        # The natural log of 0 is undefined. If our probability gets too close 
-        # to 0 or 1, we nudge it slightly so the computer doesn't crash.
-        p = np.clip(p, 1e-10, 1 - 1e-10)
-        
-        # 3. The Bernoulli Log-Likelihood Calculus
-        ll = (y * np.log(p)) + ((1 - y) * np.log(1 - p))
-        total_log_likelihood += ll
-        
-    return total_log_likelihood
 
 def prep_trajectory_data(df):
-    """
-    Takes a wide-format dataset (one row per subject) and pivots it 
-    into a long-format dataset (one row per observation) for the math engine.
-    """
-    # We use wide_to_long. 
-    # stubnames: 'C' is the outcome column prefix, 'T' is the time column prefix
-    # i: the unique subject identifier
-    # j: the name we want to give to the new "measurement period" column (1 through 23)
-    long_df = pd.wide_to_long(
-        df, 
-        stubnames=['C', 'T'], 
-        i='ID', 
-        j='Measurement_Period'
-    )
-    
-    # wide_to_long creates a complex multi-index. We reset it to a standard flat table.
-    long_df = long_df.reset_index()
-    
-    # Clean up: Rename 'C' and 'T' to be more descriptive for our math engine
+    """Pivots wide-format subject data into long-format observation data."""
+    long_df = pd.wide_to_long(df, stubnames=['C', 'T'], i='ID', j='Measurement_Period').reset_index()
     long_df = long_df.rename(columns={'C': 'Outcome', 'T': 'Time'})
-    
-    # Sort by ID and Period so it reads chronologically per subject
     long_df = long_df.sort_values(by=['ID', 'Measurement_Period'])
-    
     return long_df
 
-# --- Let's test the data pipeline! ---
+def create_design_matrix(times, order):
+    """Creates a dynamic design matrix (X) for any polynomial order."""
+    return np.column_stack([times**p for p in range(order + 1)])
 
-# 1. Load the raw wide data (from Step 3)
-raw_wide_data = load_cambridge_data()
+def calc_logit_prob_matrix(betas, X):
+    """Calculates probabilities for ALL observations simultaneously."""
+    z = np.dot(X, betas)
+    return 1 / (1 + np.exp(-z))
 
-# 2. Pass it through our new pivot function
-clean_long_data = prep_trajectory_data(raw_wide_data)
+def calc_log_likelihood_matrix(betas, X, actual_outcomes):
+    """Calculates the Bernoulli Log-Likelihood for an array of observations."""
+    p = np.clip(calc_logit_prob_matrix(betas, X), 1e-10, 1 - 1e-10)
+    ll_array = (actual_outcomes * np.log(p)) + ((1 - actual_outcomes) * np.log(1 - p))
+    return np.sum(ll_array)
 
-# 3. Print the results to verify
-print("\n--- Data Pipeline Test ---")
-print("First 10 rows of the mathematical 'Long' dataset:")
-print("-" * 50)
-print(clean_long_data[['ID', 'Measurement_Period', 'Time', 'Outcome']].head(10))
+def calc_dynamic_nll(params, df, orders):
+    """Calculates the Negative Log-Likelihood for ANY number of groups/orders."""
+    k = len(orders)
+    
+    # Parse Thetas
+    thetas = np.zeros(k)
+    if k > 1:
+        thetas[1:] = params[0 : k-1]
+    log_pis = thetas - logsumexp(thetas)
+    
+    # Parse Betas
+    group_betas = []
+    current_idx = k - 1
+    for order in orders:
+        n_betas = order + 1
+        group_betas.append(params[current_idx : current_idx + n_betas])
+        current_idx += n_betas
 
-def negative_log_likelihood(betas, actual_times, actual_outcomes):
-    """
-    Wrapper function for SciPy. 
-    It calculates the log-likelihood and flips the sign so the optimizer can minimize it.
-    """
-    ll = calc_log_likelihood(betas, actual_times, actual_outcomes)
-    return -1 * ll
+    total_ll = 0
+    grouped = df.groupby('ID')
+    
+    for subject_id, subject_data in grouped:
+        times = subject_data['Time'].values
+        outcomes = subject_data['Outcome'].values
+        subject_group_lls = []
+        
+        for g in range(k):
+            X = create_design_matrix(times, orders[g])
+            ll_g = calc_log_likelihood_matrix(group_betas[g], X, outcomes)
+            subject_group_lls.append(log_pis[g] + ll_g)
+            
+        total_ll += logsumexp(subject_group_lls)
+        
+    return -1 * total_ll
 
-# --- Let's run the model! ---
+# ==========================================
+# EXECUTION BLOCK
+# ==========================================
+if __name__ == "__main__":
+    # 1. Load and prep data
+    raw_wide = load_cambridge_data()
+    long_data = prep_trajectory_data(raw_wide).dropna(subset=['Time', 'Outcome'])
 
-# 1. Load and prep the data
-raw_wide = load_cambridge_data()
-long_data = prep_trajectory_data(raw_wide)
+    # 2. Define Model Architecture
+    model_orders = [1, 2, 3] 
+    k = len(model_orders)
+    num_params = (k - 1) + sum([order + 1 for order in model_orders])
+    initial_guess = np.zeros(num_params)
 
-# Standard practice: Drop any rows where the Outcome or Time is missing (NaN)
-long_data = long_data.dropna(subset=['Time', 'Outcome'])
+    print(f"Running dynamic {k}-Group optimization...")
+    print(f"Model architecture (orders): {model_orders}")
 
-# Extract just the columns of numbers we need for the math engine
-# .values turns the Pandas column into a flat, fast Numpy array
-actual_times = long_data['Time'].values
-actual_outcomes = long_data['Outcome'].values
+    # 3. Run Optimizer
+    result = minimize(
+        calc_dynamic_nll, 
+        initial_guess, 
+        args=(long_data, model_orders),
+        method='BFGS'
+    )
 
-# 2. Set an initial guess for the optimizer (Intercept, Linear, Quadratic)
-# Starting at 0.0 is standard practice
-initial_guess = [0.0, 0.0, 0.0]
-
-print("Running optimization engine... (this might take a few seconds)...")
-
-# 3. Ask SciPy to find the best betas
-# method='BFGS' is a very standard, robust algorithm for solving unconstrained MLE
-result = minimize(
-    negative_log_likelihood, 
-    initial_guess, 
-    args=(actual_times, actual_outcomes),
-    method='BFGS' 
-)
-
-# 4. Print the final results!
-print("\n--- 1-Group Quadratic Model Results ---")
-print(f"Optimization Success: {result.success}")
-print(f"Maximum Log-Likelihood: {-1 * result.fun:.4f}")
-print(f"Optimized B0 (Intercept): {result.x[0]:.4f}")
-print(f"Optimized B1 (Linear):    {result.x[1]:.4f}")
-print(f"Optimized B2 (Quadratic): {result.x[2]:.4f}")
-
-# --- Step 10: Graphing the Trajectory ---
-
-print("Generating graph...")
-
-# 1. Create a blank canvas
-plt.figure(figsize=(10, 6))
-
-# 2. Plot the raw, actual data points
-# We add a slight visual "jitter" to the Y-axis so the dots don't completely overlap
-jittered_y = actual_outcomes + np.random.normal(0, 0.02, size=len(actual_outcomes))
-plt.scatter(actual_times, jittered_y, alpha=0.1, color='gray', label='Actual Observations')
-
-# 3. Generate the smooth predicted curve
-# Create 100 evenly spaced time points between the minimum and maximum time
-smooth_times = np.linspace(min(actual_times), max(actual_times), 100)
-
-# Calculate the predicted probability for each of those 100 points using the betas the optimizer found!
-# (result.x contains the [Intercept, Linear, Quadratic] values)
-predicted_probs = [calc_logit_prob(result.x, t) for t in smooth_times]
-
-# 4. Draw the curve
-plt.plot(smooth_times, predicted_probs, color='red', linewidth=3, label='Predicted Trajectory (1-Group)')
-
-# 5. Make it look professional
-plt.title("GBTM Rewrite: 1-Group Quadratic Logit Model", fontsize=14)
-plt.xlabel("Time Period", fontsize=12)
-plt.ylabel("Probability of Outcome", fontsize=12)
-plt.ylim(-0.1, 1.1) # Keep Y-axis bounded tightly around 0 and 1
-plt.legend()
-plt.grid(True, linestyle='--', alpha=0.5)
-
-# 6. Show the graph on the screen!
-plt.show()
+    # 4. Results
+    print(f"\n--- {k}-Group Dynamic Model Results ---")
+    print(f"Optimization Success: {result.success}")
+    print(f"Maximum Log-Likelihood: {-1 * result.fun:.4f}")
