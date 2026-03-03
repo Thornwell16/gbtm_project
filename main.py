@@ -12,7 +12,14 @@ def load_cambridge_data():
     return df
 
 def prep_trajectory_data(df, id_col='ID', outcome_prefix='C', time_prefix='T'):
-    long_df = pd.wide_to_long(df, stubnames=[outcome_prefix, time_prefix], i=id_col, j='Measurement_Period').reset_index()
+    # Clean column names to prevent invisible characters
+    df.columns = [str(c).strip().replace('\ufeff', '') for c in df.columns]
+    id_col = id_col.strip()
+    outcome_prefix = outcome_prefix.strip()
+    time_prefix = time_prefix.strip()
+    
+    # suffix='\d+' prevents 'w' prefix from accidentally grabbing columns like 'wheeze3mon'
+    long_df = pd.wide_to_long(df, stubnames=[outcome_prefix, time_prefix], i=id_col, j='Measurement_Period', suffix=r'\d+').reset_index()
     long_df = long_df.rename(columns={outcome_prefix: 'Outcome', time_prefix: 'Time', id_col: 'ID'})
     long_df = long_df.sort_values(by=['ID', 'Measurement_Period'])
     return long_df
@@ -330,11 +337,13 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
 
 def run_single_model(df, orders_list, use_dropout=False):
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
+    n_subjects = len(subj_breaks) - 1
+    n_obs = len(times)
     _ = create_design_matrix_jit(np.array([1.0]), 1)
     
+    # PERFECT SCALING: Forces Time to be exactly [0, 1] to prevent massive gradients (e.g. 72^5)
     max_t = np.max(np.abs(times))
-    scale_factor = 1.0
-    if max_t > 0: scale_factor = 10.0 ** np.floor(np.log10(max_t))
+    scale_factor = max_t if max_t > 0 else 1.0
     times_scaled = times / scale_factor
     
     orders_arr = np.array(orders_list, dtype=np.int32)
@@ -344,7 +353,7 @@ def run_single_model(df, orders_list, use_dropout=False):
     initial_guess = np.zeros(num_params)
     
     current_beta_idx = k - 1
-    staggered_intercepts = np.linspace(-2.0, 2.0, k) if k > 1 else [0.0]
+    staggered_intercepts = np.linspace(-3.0, 3.0, k) if k > 1 else [0.0]
     for g in range(k):
         initial_guess[current_beta_idx] = staggered_intercepts[g]
         current_beta_idx += orders_list[g] + 1
@@ -357,7 +366,7 @@ def run_single_model(df, orders_list, use_dropout=False):
     
     result = minimize(
         calc_dynamic_nll_jit, initial_guess, args=(times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
-        method='BFGS', jac=calc_dynamic_jacobian_jit
+        method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 2000, 'gtol': 1e-5}
     )
     
     is_valid, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis = process_optimization_result(
@@ -375,11 +384,12 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
     valid_models = []
     all_evaluated_models = []
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
+    n_subjects = len(subj_breaks) - 1
+    n_obs = len(times)
     _ = create_design_matrix_jit(np.array([1.0]), 1)
     
     max_t = np.max(np.abs(times))
-    scale_factor = 1.0
-    if max_t > 0: scale_factor = 10.0 ** np.floor(np.log10(max_t))
+    scale_factor = max_t if max_t > 0 else 1.0
     times_scaled = times / scale_factor
     
     all_combinations = []
@@ -395,7 +405,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         initial_guess = np.zeros(num_params)
         
         current_beta_idx = k - 1
-        staggered_intercepts = np.linspace(-2.0, 2.0, k) if k > 1 else [0.0]
+        staggered_intercepts = np.linspace(-3.0, 3.0, k) if k > 1 else [0.0]
         for g in range(k):
             initial_guess[current_beta_idx] = staggered_intercepts[g]
             current_beta_idx += orders_list[g] + 1
@@ -408,7 +418,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         
         result = minimize(
             calc_dynamic_nll_jit, initial_guess, args=(times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
-            method='BFGS', jac=calc_dynamic_jacobian_jit
+            method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 2000, 'gtol': 1e-5}
         )
         
         is_converged, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis = process_optimization_result(

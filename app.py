@@ -137,14 +137,14 @@ else:
                 raw_df = pd.read_csv(uploaded_file, encoding='utf-8-sig')
             else:
                 raw_df = pd.read_csv(uploaded_file, sep=r'\s+', encoding='utf-8-sig')
-            raw_df.columns = [str(c).strip().replace('\ufeff', '') for c in raw_df.columns]
+            raw_df.columns = [str(c).strip() for c in raw_df.columns]
             st.success("Custom file uploaded successfully!")
         except Exception as e:
             st.error(f"Error loading file: {e}")
     elif st.session_state.use_sample_data:
         try:
             raw_df = pd.read_csv("cambridge.txt", sep=r'\s+', encoding='utf-8-sig')
-            raw_df.columns = [str(c).strip().replace('\ufeff', '') for c in raw_df.columns]
+            raw_df.columns = [str(c).strip() for c in raw_df.columns]
             st.success("Cambridge sample dataset loaded! (Note: Sample data is in Wide format)")
         except Exception as e:
             st.error("Could not locate cambridge.txt in the repository.")
@@ -355,7 +355,7 @@ else:
                     fig_bic.add_trace(go.Scatter(x=ks, y=bics, mode='lines+markers', marker=dict(size=10, color='#1f77b4'), line=dict(width=3)))
                     fig_bic.update_layout(
                         xaxis_title="Number of Groups", 
-                        yaxis_title="BIC (Lowest point on graph is best)", 
+                        yaxis_title="BIC (Lower on graph = Closer to 0)", 
                         xaxis=dict(tickmode='linear', tick0=1, dtick=1), 
                         yaxis=dict(autorange="reversed"), 
                         template="plotly_white"
