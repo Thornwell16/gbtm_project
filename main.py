@@ -12,13 +12,11 @@ def load_cambridge_data():
     return df
 
 def prep_trajectory_data(df, id_col='ID', outcome_prefix='C', time_prefix='T'):
-    # Clean column names to prevent invisible characters
     df.columns = [str(c).strip().replace('\ufeff', '') for c in df.columns]
     id_col = id_col.strip()
     outcome_prefix = outcome_prefix.strip()
     time_prefix = time_prefix.strip()
     
-    # suffix='\d+' prevents 'w' prefix from accidentally grabbing columns like 'wheeze3mon'
     long_df = pd.wide_to_long(df, stubnames=[outcome_prefix, time_prefix], i=id_col, j='Measurement_Period', suffix=r'\d+').reset_index()
     long_df = long_df.rename(columns={outcome_prefix: 'Outcome', time_prefix: 'Time', id_col: 'ID'})
     long_df = long_df.sort_values(by=['ID', 'Measurement_Period'])
@@ -279,8 +277,15 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, or
             grad_flat[j] += grad_subj[i, j]
     return grad_flat
 
+def calculate_fit_stats(result, n_params, n_subjects, n_obs):
+    ll = -1 * result.fun
+    aic = ll - n_params
+    bic_subj = ll - 0.5 * n_params * np.log(n_subjects)
+    bic_obs = ll - 0.5 * n_params * np.log(n_obs)
+    return ll, aic, bic_subj, bic_obs
+
 def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor):
-    """Handles Unscaling, Robust SE computation, and Fit Statistics exactly like PROC TRAJ."""
+    """Handles High-Precision Hessian Computation, Unscaling, and Robust SE."""
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
     orders_arr = np.array(orders_list, dtype=np.int32)
@@ -304,18 +309,32 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     D = np.diag(D_diag)
     
     try:
-        H_inv_scaled = result.hess_inv
-        if not isinstance(H_inv_scaled, np.ndarray):
-            H_inv_scaled = H_inv_scaled.todense()
-        
+        # 1. HIGH-PRECISION NUMERICAL HESSIAN (Replaces BFGS Approximation)
         times_scaled = times / scale_factor
-        grad_subj_scaled = calc_subject_gradients_jit(result.x, times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
+        args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
+        H_scaled = np.zeros((num_params, num_params))
+        eps = 1e-5
+        for i in range(num_params):
+            p_plus = np.copy(result.x)
+            p_minus = np.copy(result.x)
+            p_plus[i] += eps
+            p_minus[i] -= eps
+            g_plus = calc_dynamic_jacobian_jit(p_plus, *args)
+            g_minus = calc_dynamic_jacobian_jit(p_minus, *args)
+            H_scaled[i, :] = (g_plus - g_minus) / (2.0 * eps)
+            
+        H_scaled = (H_scaled + H_scaled.T) / 2.0 # Force symmetry
+        H_inv_scaled = np.linalg.pinv(H_scaled) # Pseudo-inverse for stability
+        
+        # 2. ROBUST SE (Sandwich)
+        grad_subj_scaled = calc_subject_gradients_jit(result.x, *args)
         G_scaled = grad_subj_scaled.T @ grad_subj_scaled
         V_robust_scaled = H_inv_scaled @ G_scaled @ H_inv_scaled
-    except:
+    except Exception as e:
         H_inv_scaled = np.eye(num_params)
         V_robust_scaled = np.eye(num_params)
         
+    # 3. UNSCALE MATRICES
     params_unscaled = D @ result.x
     V_model_unscaled = D @ H_inv_scaled @ D
     V_robust_unscaled = D @ V_robust_scaled @ D
@@ -341,7 +360,6 @@ def run_single_model(df, orders_list, use_dropout=False):
     n_obs = len(times)
     _ = create_design_matrix_jit(np.array([1.0]), 1)
     
-    # PERFECT SCALING: Forces Time to be exactly [0, 1] to prevent massive gradients (e.g. 72^5)
     max_t = np.max(np.abs(times))
     scale_factor = max_t if max_t > 0 else 1.0
     times_scaled = times / scale_factor
