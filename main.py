@@ -29,7 +29,6 @@ def extract_flat_arrays(df):
     changes = np.where(ids[:-1] != ids[1:])[0] + 1
     subj_breaks = np.concatenate(([0], changes, [len(df)])).astype(np.int64)
     
-    # 1 = Subject dropped out after this observation. 0 = Survived/Completed study.
     dropouts = np.zeros(len(df), dtype=np.float64)
     n_subjects = len(subj_breaks) - 1
     
@@ -119,15 +118,15 @@ def calc_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders)
                 prob = max(1e-10, min(1.0 - 1e-10, prob))
                 ll_g += (y_val * np.log(prob)) + ((1.0 - y_val) * np.log(1.0 - prob))
                 
-                # 2. Survival Likelihood (If not the first observation)
+                # 2. Survival Likelihood
                 if obs > 0:
                     y_prev = outcomes[idx - 1]
                     z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
                     p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
                     p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
-                    ll_g += np.log(1.0 - p_drop) # Survived
+                    ll_g += np.log(1.0 - p_drop) 
                     
-            # 3. Dropout Event Likelihood (At final observation)
+            # 3. Dropout Event Likelihood
             last_idx = end - 1
             if dropouts[last_idx] == 1.0:
                 t_last = times[last_idx]
@@ -135,7 +134,7 @@ def calc_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders)
                 z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
                 p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
                 p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
-                ll_g += np.log(p_drop) # Dropped Out
+                ll_g += np.log(p_drop) 
                 
             subject_group_lls[g] = log_pis[g] + ll_g
             
@@ -260,7 +259,7 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, or
                     y_prev = outcomes[idx - 1]
                     z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
                     p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
-                    err_drop = (0.0 - p_drop) * posterior_ig[g] # Survived = target 0
+                    err_drop = (0.0 - p_drop) * posterior_ig[g] 
                     grad_flat[current_gamma_idx] += err_drop * 1.0
                     grad_flat[current_gamma_idx + 1] += err_drop * t_val
                     grad_flat[current_gamma_idx + 2] += err_drop * y_prev
@@ -272,7 +271,7 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, or
                 y_last = outcomes[last_idx]
                 z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
                 p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
-                err_drop = (1.0 - p_drop) * posterior_ig[g] # Dropped out = target 1
+                err_drop = (1.0 - p_drop) * posterior_ig[g] 
                 grad_flat[current_gamma_idx] += err_drop * 1.0
                 grad_flat[current_gamma_idx + 1] += err_drop * t_last
                 grad_flat[current_gamma_idx + 2] += err_drop * y_last
@@ -286,6 +285,37 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, or
             
     return grad_flat
 
+def run_single_model(df, orders_list):
+    """Executes a single model without evaluating heuristics or grids."""
+    times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
+    n_subjects = len(subj_breaks) - 1
+    
+    # Pass dummy arrays to pre-compile the Numba functions instantly
+    _ = create_design_matrix_jit(np.array([1.0]), 1)
+    
+    orders_arr = np.array(orders_list, dtype=np.int32)
+    k = len(orders_list)
+    num_params = (k - 1) + sum([order + 1 for order in orders_list]) + (3 * k)
+    initial_guess = np.zeros(num_params)
+    
+    result = minimize(
+        calc_dynamic_nll_jit, initial_guess, args=(times, outcomes, dropouts, subj_breaks, orders_arr),
+        method='BFGS', jac=calc_dynamic_jacobian_jit
+    )
+    
+    max_ll = -1 * result.fun if result.success or result.status == 2 else np.nan
+    bic = (-2 * max_ll) + (num_params * np.log(n_subjects)) if not np.isnan(max_ll) else np.nan
+    
+    thetas = np.zeros(k)
+    if k > 1: thetas[1:] = result.x[0 : k-1]
+    pis = np.exp(thetas - logsumexp(thetas))
+    min_group_size = np.min(pis) * 100
+    
+    return {
+        'bic': bic, 'orders': orders_list, 'result': result, 
+        'min_pct': min_group_size, 'pis': pis
+    }
+
 def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05):
     valid_models = []
     n_subjects = df['ID'].nunique()
@@ -294,9 +324,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
     print("STARTING C-COMPILED MNAR SEARCH (Informative Dropout Active)")
     print("*"*80)
     
-    # Pass dummy arrays to pre-compile the Numba functions
     _ = create_design_matrix_jit(np.array([1.0]), 1)
-    
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     
     all_combinations = []
@@ -311,7 +339,6 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         print(f"Testing Model {i+1}/{total_models}: {len(orders_list)}-Group {orders_list}...".ljust(40), end=" ", flush=True)
         
         k = len(orders_list)
-        # New parameter space: thetas + betas + gammas (3 per group)
         num_params = (k - 1) + sum([order + 1 for order in orders_list]) + (3 * k)
         initial_guess = np.zeros(num_params)
         
@@ -340,7 +367,6 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
             current_beta_idx = k - 1
             for g in range(k):
                 n_betas = orders_list[g] + 1
-                # Check ONLY the highest-order polynomial term (ignore gammas for this check)
                 highest_est = result.x[current_beta_idx + n_betas - 1]
                 highest_se = se[current_beta_idx + n_betas - 1]
                 z_score = highest_est / highest_se if highest_se > 0 else 0
@@ -438,9 +464,12 @@ def get_subject_assignments(result, df, orders):
         
     return pd.DataFrame(assignments)
 
-def get_parameter_estimates(result, orders):
-    """Extracts Betas and Gammas (Dropout Params) into a clean DataFrame."""
+def get_parameter_estimates(result, orders, group_names=None):
+    """Extracts Betas and Gammas with explicit component labels."""
     k = len(orders)
+    if group_names is None or len(group_names) != k:
+        group_names = [f"Group {g+1}" for g in range(k)]
+        
     params = result.x
     try: se = np.sqrt(np.diag(result.hess_inv))
     except: se = np.full(len(params), np.nan)
@@ -450,32 +479,32 @@ def get_parameter_estimates(result, orders):
     current_gamma_idx = (k - 1) + sum([o + 1 for o in orders])
     
     labels = ["Intercept", "Linear", "Quadratic", "Cubic", "Quartic", "Quintic"]
-    gamma_labels = ["Dropout: Intercept", "Dropout: Time", "Dropout: Prev Outcome"]
+    gamma_labels = ["Intercept", "Time", "Previous Outcome"]
     
     for g in range(k):
         n_betas = orders[g] + 1
         
-        # 1. Extract Trajectory Betas
+        # 1. Trajectory Betas
         for b_idx in range(n_betas):
             est = params[current_beta_idx + b_idx]
             err = se[current_beta_idx + b_idx]
             z_score = est / err if err > 0 else 0
             p_val = 2 * (1 - norm.cdf(abs(z_score)))
             data.append({
-                "Group": f"Group {g+1}", "Parameter": labels[b_idx],
+                "Component": "Trajectory", "Group": group_names[g], "Parameter": labels[b_idx],
                 "Estimate": round(est, 4), "Std Error": round(err, 4),
                 "P-Value": round(p_val, 4) if p_val >= 0.0001 else "< 0.0001"
             })
         current_beta_idx += n_betas
         
-        # 2. Extract Informative Dropout Gammas
+        # 2. Dropout Gammas
         for gam_idx in range(3):
             est = params[current_gamma_idx + gam_idx]
             err = se[current_gamma_idx + gam_idx]
             z_score = est / err if err > 0 else 0
             p_val = 2 * (1 - norm.cdf(abs(z_score)))
             data.append({
-                "Group": f"Group {g+1}", "Parameter": gamma_labels[gam_idx],
+                "Component": "Dropout", "Group": group_names[g], "Parameter": gamma_labels[gam_idx],
                 "Estimate": round(est, 4), "Std Error": round(err, 4),
                 "P-Value": round(p_val, 4) if p_val >= 0.0001 else "< 0.0001"
             })
@@ -483,7 +512,10 @@ def get_parameter_estimates(result, orders):
         
     return pd.DataFrame(data)
 
-def calc_model_adequacy(assignments_df, pis):
+def calc_model_adequacy(assignments_df, pis, group_names=None):
+    if group_names is None or len(group_names) != len(pis):
+        group_names = [f"Group {g+1}" for g in range(len(pis))]
+        
     adequacy_data = []
     for g in range(1, len(pis) + 1):
         group_subjects = assignments_df[assignments_df['Assigned_Group'] == g]
@@ -494,7 +526,7 @@ def calc_model_adequacy(assignments_df, pis):
         occ = (ave_pp / (1 - ave_pp)) / (pi_safe / (1 - pi_safe))
         
         adequacy_data.append({
-            "Group": f"Group {g}", "N Assigned": len(group_subjects),
+            "Group": group_names[g-1], "N Assigned": len(group_subjects),
             "Est. Population %": f"{pis[g-1] * 100:.1f}%",
             "AvePP": round(ave_pp, 3), "OCC": round(occ, 2)
         })
