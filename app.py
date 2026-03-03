@@ -133,17 +133,18 @@ else:
     raw_df = None
     if uploaded_file is not None:
         try:
-            # FIX: Use utf-8-sig to automatically strip invisible Byte-Order Marks (BOM) from the first column name
             if uploaded_file.name.lower().endswith('.csv'):
                 raw_df = pd.read_csv(uploaded_file, encoding='utf-8-sig')
             else:
                 raw_df = pd.read_csv(uploaded_file, sep=r'\s+', encoding='utf-8-sig')
+            raw_df.columns = [str(c).strip().replace('\ufeff', '') for c in raw_df.columns]
             st.success("Custom file uploaded successfully!")
         except Exception as e:
             st.error(f"Error loading file: {e}")
     elif st.session_state.use_sample_data:
         try:
             raw_df = pd.read_csv("cambridge.txt", sep=r'\s+', encoding='utf-8-sig')
+            raw_df.columns = [str(c).strip().replace('\ufeff', '') for c in raw_df.columns]
             st.success("Cambridge sample dataset loaded! (Note: Sample data is in Wide format)")
         except Exception as e:
             st.error("Could not locate cambridge.txt in the repository.")
@@ -222,7 +223,7 @@ else:
                 name = cols[g].text_input(f"Group {g+1} Label", value=f"Group {g+1}")
                 group_names.append(name)
                 
-            assignments_df = get_subject_assignments(winning_result, long_df, winning_orders, use_dropout_state)
+            assignments_df = get_subject_assignments(winning_model, long_df)
             
             st.divider()
             st.subheader("Publication Suite")
@@ -312,7 +313,7 @@ else:
                 st.download_button(label="📥 Download Observed Averages (CSV)", data=obs_means.to_csv(index=False).encode('utf-8'), file_name='trajectory_observed_averages.csv', mime='text/csv')
                     
             with tab_est:
-                estimates_df = get_parameter_estimates(winning_result, winning_orders, long_df, group_names, use_dropout_state)
+                estimates_df = get_parameter_estimates(winning_model, group_names)
                 st.dataframe(estimates_df, use_container_width=True, hide_index=True)
                 csv_est = estimates_df.to_csv(index=False).encode('utf-8')
                 st.download_button(label="📥 Download Parameter Estimates Table", data=csv_est, file_name='trajectory_parameters.csv', mime='text/csv')
@@ -354,7 +355,7 @@ else:
                     fig_bic.add_trace(go.Scatter(x=ks, y=bics, mode='lines+markers', marker=dict(size=10, color='#1f77b4'), line=dict(width=3)))
                     fig_bic.update_layout(
                         xaxis_title="Number of Groups", 
-                        yaxis_title="BIC (Lower on graph = Closer to 0)", 
+                        yaxis_title="BIC (Lowest point on graph is best)", 
                         xaxis=dict(tickmode='linear', tick0=1, dtick=1), 
                         yaxis=dict(autorange="reversed"), 
                         template="plotly_white"
