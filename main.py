@@ -20,16 +20,27 @@ def prep_trajectory_data(df, id_col='ID', outcome_prefix='C', time_prefix='T'):
     return long_df
 
 def extract_flat_arrays(df):
-    """Flattens the Pandas DataFrame into contiguous Numpy memory blocks for C-compilation."""
+    """Flattens Pandas DataFrame and generates binary flags for FMM Informative Dropout."""
     ids = df['ID'].values
     times = df['Time'].values.astype(np.float64)
     outcomes = df['Outcome'].values.astype(np.float64)
-    # Find the indices where a new subject begins
+    
+    max_study_time = np.max(times)
     changes = np.where(ids[:-1] != ids[1:])[0] + 1
     subj_breaks = np.concatenate(([0], changes, [len(df)])).astype(np.int64)
-    return times, outcomes, subj_breaks
+    
+    # 1 = Subject dropped out after this observation. 0 = Survived/Completed study.
+    dropouts = np.zeros(len(df), dtype=np.float64)
+    n_subjects = len(subj_breaks) - 1
+    
+    for i in range(n_subjects):
+        start_idx = subj_breaks[i]
+        end_idx = subj_breaks[i+1] - 1 
+        if times[end_idx] < max_study_time:
+            dropouts[end_idx] = 1.0 
+            
+    return times, outcomes, dropouts, subj_breaks
 
-# --- PLOTTING UTILS FOR APP.PY ---
 @njit(cache=True)
 def create_design_matrix_jit(times, order):
     n = len(times)
@@ -49,18 +60,16 @@ def calc_logit_prob_jit(betas, X):
             probs[i] = exp_z / (1.0 + exp_z)
     return probs
 
-# --- THE PURE C-COMPILED MATH ENGINE ---
 @njit(cache=True)
 def logsumexp_jit(a):
-    """C-compiled logsumexp for internal loops."""
     max_val = np.max(a)
     sum_exp = 0.0
     for i in range(len(a)): sum_exp += np.exp(a[i] - max_val)
     return max_val + np.log(sum_exp)
 
 @njit(cache=True)
-def calc_dynamic_nll_jit(params, times, outcomes, subj_breaks, orders):
-    """Calculates NLL using flat arrays. Never touches Python."""
+def calc_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders):
+    """Calculates NLL using flat arrays, including MNAR Dropout Probability."""
     k = len(orders)
     thetas = np.zeros(k)
     if k > 1: thetas[1:] = params[0 : k-1]
@@ -69,6 +78,10 @@ def calc_dynamic_nll_jit(params, times, outcomes, subj_breaks, orders):
     sum_exp_theta = 0.0
     for i in range(k): sum_exp_theta += np.exp(thetas[i] - max_theta)
     log_pis = thetas - (max_theta + np.log(sum_exp_theta))
+    
+    num_betas = 0
+    for g in range(k): num_betas += orders[g] + 1
+    gamma_start_idx = (k - 1) + num_betas
     
     total_ll = 0.0
     n_subjects = len(subj_breaks) - 1
@@ -79,13 +92,19 @@ def calc_dynamic_nll_jit(params, times, outcomes, subj_breaks, orders):
         n_obs = end - start
         
         subject_group_lls = np.zeros(k)
-        current_idx = k - 1
+        current_beta_idx = k - 1
+        current_gamma_idx = gamma_start_idx
         
         for g in range(k):
             order = orders[g]
             n_betas = order + 1
-            group_betas = params[current_idx : current_idx + n_betas]
-            current_idx += n_betas
+            group_betas = params[current_beta_idx : current_beta_idx + n_betas]
+            current_beta_idx += n_betas
+            
+            gamma_0 = params[current_gamma_idx]
+            gamma_1 = params[current_gamma_idx + 1]
+            gamma_2 = params[current_gamma_idx + 2]
+            current_gamma_idx += 3
             
             ll_g = 0.0
             for obs in range(n_obs):
@@ -93,18 +112,30 @@ def calc_dynamic_nll_jit(params, times, outcomes, subj_breaks, orders):
                 t_val = times[idx]
                 y_val = outcomes[idx]
                 
+                # 1. Outcome Likelihood
                 z = 0.0
                 for p in range(order + 1): z += group_betas[p] * (t_val ** p)
-                    
-                if z >= 0: prob = 1.0 / (1.0 + np.exp(-z))
-                else:
-                    exp_z = np.exp(z)
-                    prob = exp_z / (1.0 + exp_z)
-                    
-                if prob < 1e-10: prob = 1e-10
-                elif prob > 1.0 - 1e-10: prob = 1.0 - 1e-10
-                
+                prob = 1.0 / (1.0 + np.exp(-z)) if z >= 0 else np.exp(z) / (1.0 + np.exp(z))
+                prob = max(1e-10, min(1.0 - 1e-10, prob))
                 ll_g += (y_val * np.log(prob)) + ((1.0 - y_val) * np.log(1.0 - prob))
+                
+                # 2. Survival Likelihood (If not the first observation)
+                if obs > 0:
+                    y_prev = outcomes[idx - 1]
+                    z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
+                    p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
+                    p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
+                    ll_g += np.log(1.0 - p_drop) # Survived
+                    
+            # 3. Dropout Event Likelihood (At final observation)
+            last_idx = end - 1
+            if dropouts[last_idx] == 1.0:
+                t_last = times[last_idx]
+                y_last = outcomes[last_idx]
+                z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
+                p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
+                p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
+                ll_g += np.log(p_drop) # Dropped Out
                 
             subject_group_lls[g] = log_pis[g] + ll_g
             
@@ -113,8 +144,8 @@ def calc_dynamic_nll_jit(params, times, outcomes, subj_breaks, orders):
     return -1.0 * total_ll
 
 @njit(cache=True)
-def calc_dynamic_jacobian_jit(params, times, outcomes, subj_breaks, orders):
-    """Calculates analytical gradient using flat arrays. Instant execution."""
+def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders):
+    """Calculates analytical gradient, incorporating Dropout Gammas."""
     k = len(orders)
     thetas = np.zeros(k)
     if k > 1: thetas[1:] = params[0 : k-1]
@@ -135,6 +166,10 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, subj_breaks, orders):
     grad_flat = np.zeros(len(params))
     n_subjects = len(subj_breaks) - 1
     
+    num_betas = 0
+    for g in range(k): num_betas += orders[g] + 1
+    gamma_start_idx = (k - 1) + num_betas
+    
     for i in range(n_subjects):
         start = subj_breaks[i]
         end = subj_breaks[i+1]
@@ -143,12 +178,19 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, subj_breaks, orders):
         L_ig_log = np.zeros(k)
         p_ig = np.zeros((k, n_obs))
         
-        current_idx = k - 1
+        current_beta_idx = k - 1
+        current_gamma_idx = gamma_start_idx
+        
         for g in range(k):
             order = orders[g]
             n_betas = order + 1
-            group_betas = params[current_idx : current_idx + n_betas]
-            current_idx += n_betas
+            group_betas = params[current_beta_idx : current_beta_idx + n_betas]
+            current_beta_idx += n_betas
+            
+            gamma_0 = params[current_gamma_idx]
+            gamma_1 = params[current_gamma_idx + 1]
+            gamma_2 = params[current_gamma_idx + 2]
+            current_gamma_idx += 3
             
             ll_g = 0.0
             for obs in range(n_obs):
@@ -158,17 +200,27 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, subj_breaks, orders):
                 
                 z = 0.0
                 for p in range(order + 1): z += group_betas[p] * (t_val ** p)
-                    
-                if z >= 0: prob = 1.0 / (1.0 + np.exp(-z))
-                else:
-                    exp_z = np.exp(z)
-                    prob = exp_z / (1.0 + exp_z)
-                    
-                if prob < 1e-10: prob = 1e-10
-                elif prob > 1.0 - 1e-10: prob = 1.0 - 1e-10
+                prob = 1.0 / (1.0 + np.exp(-z)) if z >= 0 else np.exp(z) / (1.0 + np.exp(z))
+                prob = max(1e-10, min(1.0 - 1e-10, prob))
                 
                 p_ig[g, obs] = prob
                 ll_g += (y_val * np.log(prob)) + ((1.0 - y_val) * np.log(1.0 - prob))
+                
+                if obs > 0:
+                    y_prev = outcomes[idx - 1]
+                    z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
+                    p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
+                    p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
+                    ll_g += np.log(1.0 - p_drop)
+                    
+            last_idx = end - 1
+            if dropouts[last_idx] == 1.0:
+                t_last = times[last_idx]
+                y_last = outcomes[last_idx]
+                z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
+                p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
+                p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
+                ll_g += np.log(p_drop)
                 
             L_ig_log[g] = ll_g
             
@@ -184,17 +236,49 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, subj_breaks, orders):
             posterior_ig[g] = np.exp(numerator_log[g] - (post_max + np.log(post_sum_exp)))
             grad_thetas[g] += (posterior_ig[g] - pis[g])
             
-        current_idx = k - 1
+        current_beta_idx = k - 1
+        current_gamma_idx = gamma_start_idx
+        
         for g in range(k):
             order = orders[g]
             n_betas = order + 1
+            gamma_0 = params[current_gamma_idx]
+            gamma_1 = params[current_gamma_idx + 1]
+            gamma_2 = params[current_gamma_idx + 2]
+            
             for obs in range(n_obs):
                 idx = start + obs
-                error = (outcomes[idx] - p_ig[g, obs]) * posterior_ig[g]
                 t_val = times[idx]
+                
+                # Beta Gradients
+                error_y = (outcomes[idx] - p_ig[g, obs]) * posterior_ig[g]
                 for p in range(order + 1):
-                    grad_flat[current_idx + p] += error * (t_val ** p)
-            current_idx += n_betas
+                    grad_flat[current_beta_idx + p] += error_y * (t_val ** p)
+                    
+                # Survival Gradients
+                if obs > 0:
+                    y_prev = outcomes[idx - 1]
+                    z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
+                    p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
+                    err_drop = (0.0 - p_drop) * posterior_ig[g] # Survived = target 0
+                    grad_flat[current_gamma_idx] += err_drop * 1.0
+                    grad_flat[current_gamma_idx + 1] += err_drop * t_val
+                    grad_flat[current_gamma_idx + 2] += err_drop * y_prev
+                    
+            # Dropout Gradients
+            last_idx = end - 1
+            if dropouts[last_idx] == 1.0:
+                t_last = times[last_idx]
+                y_last = outcomes[last_idx]
+                z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
+                p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
+                err_drop = (1.0 - p_drop) * posterior_ig[g] # Dropped out = target 1
+                grad_flat[current_gamma_idx] += err_drop * 1.0
+                grad_flat[current_gamma_idx + 1] += err_drop * t_last
+                grad_flat[current_gamma_idx + 2] += err_drop * y_last
+                
+            current_beta_idx += n_betas
+            current_gamma_idx += 3
             
     for i in range(len(grad_flat)): grad_flat[i] = -1.0 * grad_flat[i]
     if k > 1:
@@ -203,19 +287,17 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, subj_breaks, orders):
     return grad_flat
 
 def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05):
-    """Highly stable, fully vectorized sequential search."""
     valid_models = []
     n_subjects = df['ID'].nunique()
     
     print("\n" + "*"*80)
-    print("STARTING FULLY VECTORIZED C-COMPILED SEARCH")
+    print("STARTING C-COMPILED MNAR SEARCH (Informative Dropout Active)")
     print("*"*80)
     
-    # 1. Warm up Numba so the first run doesn't lag
+    # Pass dummy arrays to pre-compile the Numba functions
     _ = create_design_matrix_jit(np.array([1.0]), 1)
     
-    # 2. Extract Data to Flat Arrays (Eliminates Pandas overhead)
-    times, outcomes, subj_breaks = extract_flat_arrays(df)
+    times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     
     all_combinations = []
     for k in range(min_groups, max_groups + 1):
@@ -224,17 +306,17 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         
     total_models = len(all_combinations)
     
-    # 3. Standard sequential loop using the ultra-fast flat arrays
     for i, orders_list in enumerate(all_combinations):
         orders_arr = np.array(orders_list, dtype=np.int32)
         print(f"Testing Model {i+1}/{total_models}: {len(orders_list)}-Group {orders_list}...".ljust(40), end=" ", flush=True)
         
         k = len(orders_list)
-        num_params = (k - 1) + sum([order + 1 for order in orders_list])
+        # New parameter space: thetas + betas + gammas (3 per group)
+        num_params = (k - 1) + sum([order + 1 for order in orders_list]) + (3 * k)
         initial_guess = np.zeros(num_params)
         
         result = minimize(
-            calc_dynamic_nll_jit, initial_guess, args=(times, outcomes, subj_breaks, orders_arr),
+            calc_dynamic_nll_jit, initial_guess, args=(times, outcomes, dropouts, subj_breaks, orders_arr),
             method='BFGS', jac=calc_dynamic_jacobian_jit
         )
         
@@ -255,14 +337,15 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
             except: se = np.full(num_params, np.nan)
                 
             all_significant = True
-            current_idx = k - 1
+            current_beta_idx = k - 1
             for g in range(k):
                 n_betas = orders_list[g] + 1
-                highest_est = result.x[current_idx + n_betas - 1]
-                highest_se = se[current_idx + n_betas - 1]
+                # Check ONLY the highest-order polynomial term (ignore gammas for this check)
+                highest_est = result.x[current_beta_idx + n_betas - 1]
+                highest_se = se[current_beta_idx + n_betas - 1]
                 z_score = highest_est / highest_se if highest_se > 0 else 0
                 if 2 * (1 - norm.cdf(abs(z_score))) >= p_val_thresh: all_significant = False
-                current_idx += n_betas
+                current_beta_idx += n_betas
                     
             if all_significant:
                 print(f"VALID! BIC: {bic:.2f}")
@@ -279,8 +362,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
     return valid_models[:5]
 
 def get_subject_assignments(result, df, orders):
-    """Calculates the Posterior Probability of group membership."""
-    times, outcomes, subj_breaks = extract_flat_arrays(df)
+    times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     ids = df['ID'].values
     subject_ids_unique = ids[subj_breaks[:-1]]
     
@@ -291,26 +373,58 @@ def get_subject_assignments(result, df, orders):
     pis = np.exp(thetas - logsumexp(thetas))
     pis_safe = np.clip(pis, 1e-15, 1.0)
     
+    num_betas = 0
+    for g in range(k): num_betas += orders[g] + 1
+    gamma_start_idx = (k - 1) + num_betas
+    
     assignments = []
     n_subjects = len(subj_breaks) - 1
     
     for i in range(n_subjects):
         start, end = subj_breaks[i], subj_breaks[i+1]
-        t_i, y_i = times[start:end], outcomes[start:end]
+        n_obs = end - start
         
         L_ig_log = np.zeros(k)
-        current_idx = k - 1
+        current_beta_idx = k - 1
+        current_gamma_idx = gamma_start_idx
+        
         for g in range(k):
             n_betas = orders[g] + 1
-            group_betas = params[current_idx : current_idx + n_betas]
-            current_idx += n_betas
+            group_betas = params[current_beta_idx : current_beta_idx + n_betas]
+            current_beta_idx += n_betas
+            
+            gamma_0 = params[current_gamma_idx]
+            gamma_1 = params[current_gamma_idx + 1]
+            gamma_2 = params[current_gamma_idx + 2]
+            current_gamma_idx += 3
             
             ll_g = 0.0
-            for obs in range(len(t_i)):
-                z = sum(group_betas[p] * (t_i[obs] ** p) for p in range(orders[g] + 1))
+            for obs in range(n_obs):
+                idx = start + obs
+                t_val = times[idx]
+                y_val = outcomes[idx]
+                
+                z = sum(group_betas[p] * (t_val ** p) for p in range(orders[g] + 1))
                 prob = 1.0 / (1.0 + np.exp(-z)) if z >= 0 else np.exp(z) / (1.0 + np.exp(z))
                 prob = max(1e-10, min(1.0 - 1e-10, prob))
-                ll_g += y_i[obs] * np.log(prob) + (1.0 - y_i[obs]) * np.log(1.0 - prob)
+                ll_g += y_val * np.log(prob) + (1.0 - y_val) * np.log(1.0 - prob)
+                
+                if obs > 0:
+                    y_prev = outcomes[idx - 1]
+                    z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
+                    p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
+                    p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
+                    ll_g += np.log(1.0 - p_drop)
+                    
+            last_idx = end - 1
+            if dropouts[last_idx] == 1.0:
+                t_last = times[last_idx]
+                y_last = outcomes[last_idx]
+                z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
+                p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
+                p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
+                ll_g += np.log(p_drop)
+                
             L_ig_log[g] = ll_g
             
         numerator_log = np.log(pis_safe) + L_ig_log
@@ -325,20 +439,26 @@ def get_subject_assignments(result, df, orders):
     return pd.DataFrame(assignments)
 
 def get_parameter_estimates(result, orders):
+    """Extracts Betas and Gammas (Dropout Params) into a clean DataFrame."""
     k = len(orders)
     params = result.x
     try: se = np.sqrt(np.diag(result.hess_inv))
     except: se = np.full(len(params), np.nan)
         
     data = []
-    current_idx = k - 1
+    current_beta_idx = k - 1
+    current_gamma_idx = (k - 1) + sum([o + 1 for o in orders])
+    
     labels = ["Intercept", "Linear", "Quadratic", "Cubic", "Quartic", "Quintic"]
+    gamma_labels = ["Dropout: Intercept", "Dropout: Time", "Dropout: Prev Outcome"]
     
     for g in range(k):
         n_betas = orders[g] + 1
+        
+        # 1. Extract Trajectory Betas
         for b_idx in range(n_betas):
-            est = params[current_idx + b_idx]
-            err = se[current_idx + b_idx]
+            est = params[current_beta_idx + b_idx]
+            err = se[current_beta_idx + b_idx]
             z_score = est / err if err > 0 else 0
             p_val = 2 * (1 - norm.cdf(abs(z_score)))
             data.append({
@@ -346,7 +466,21 @@ def get_parameter_estimates(result, orders):
                 "Estimate": round(est, 4), "Std Error": round(err, 4),
                 "P-Value": round(p_val, 4) if p_val >= 0.0001 else "< 0.0001"
             })
-        current_idx += n_betas
+        current_beta_idx += n_betas
+        
+        # 2. Extract Informative Dropout Gammas
+        for gam_idx in range(3):
+            est = params[current_gamma_idx + gam_idx]
+            err = se[current_gamma_idx + gam_idx]
+            z_score = est / err if err > 0 else 0
+            p_val = 2 * (1 - norm.cdf(abs(z_score)))
+            data.append({
+                "Group": f"Group {g+1}", "Parameter": gamma_labels[gam_idx],
+                "Estimate": round(est, 4), "Std Error": round(err, 4),
+                "P-Value": round(p_val, 4) if p_val >= 0.0001 else "< 0.0001"
+            })
+        current_gamma_idx += 3
+        
     return pd.DataFrame(data)
 
 def calc_model_adequacy(assignments_df, pis):
@@ -367,7 +501,7 @@ def calc_model_adequacy(assignments_df, pis):
     return pd.DataFrame(adequacy_data)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="GBTM Python Engine")
     parser.add_argument('--mode', choices=['single', 'auto'], default='single')
     args = parser.parse_args()
     if args.mode == 'auto':

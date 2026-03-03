@@ -22,7 +22,7 @@ from main import (
 )
 
 st.set_page_config(page_title="GBTM AutoTraj Engine", layout="wide")
-st.title("Group-Based Trajectory Modeling (GBTM)")
+st.title("AutoTRAJ: Automated Group-Based Trajectory Modeling (GBTM)")
 st.markdown("Automated trajectory selection, visualization, and parameter extraction.")
 
 with st.expander("📖 About AutoTraj & Instructions", expanded=False):
@@ -41,7 +41,7 @@ with st.expander("📖 About AutoTraj & Instructions", expanded=False):
     4. Click Run. The engine will evaluate all permutations and return the mathematically optimal model.
     
     **Attribution**
-    Built by Dr. Donald E. Warden, PhD, MPH
+    Built by Donald E. Warden, PhD, MPH
     """)
 
 if 'run_complete' not in st.session_state:
