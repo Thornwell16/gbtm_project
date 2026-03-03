@@ -43,26 +43,35 @@ with st.sidebar:
     st.markdown("---")
     
     if app_mode != "About & Docs":
-        st.markdown("**1. Data Mapping**")
-        col_id, col_out, col_time = st.columns(3)
-        with col_id: id_col = st.text_input("ID", value="ID")
-        with col_out: outcome_col = st.text_input("Out.", value="C")
-        with col_time: time_col = st.text_input("Time", value="T")
+        st.markdown("**1. Data Format**")
+        data_format = st.radio("Select Data Structure:", ["Wide Format", "Long Format"], horizontal=True)
         
-        st.markdown("**2. Engine Options**")
-        use_dropout = st.checkbox("Include MNAR Dropout Model", value=False, help="Adds logistic survival equations conditional on previous outcomes. Leave unchecked to align exactly with base PROC TRAJ.")
+        st.markdown("**2. Data Mapping**")
+        if data_format == "Wide Format":
+            col_id, col_out, col_time = st.columns(3)
+            with col_id: id_col = st.text_input("ID", value="ID")
+            with col_out: outcome_col = st.text_input("Out. Prefix", value="C")
+            with col_time: time_col = st.text_input("Time Prefix", value="T")
+        else:
+            col_id, col_out, col_time = st.columns(3)
+            with col_id: id_col = st.text_input("ID Col", value="ID")
+            with col_out: outcome_col = st.text_input("Out. Col", value="Outcome")
+            with col_time: time_col = st.text_input("Time Col", value="Time")
+        
+        st.markdown("**3. Engine Options**")
+        use_dropout = st.checkbox("Include MNAR Dropout Model", value=False, help="Adds logistic survival equations conditional on previous outcomes. Leave unchecked to align exactly with base FIML FMM.")
         
         if app_mode == "AutoTraj Search":
-            st.markdown("**3. Search Grid**")
+            st.markdown("**4. Search Grid**")
             group_range = st.slider("Min & Max Groups", 1, 8, (1, 3))
             order_range = st.slider("Min & Max Polynomial Order", 0, 5, (0, 2))
             
-            st.markdown("**4. Heuristic Rules**")
+            st.markdown("**5. Heuristic Rules**")
             min_pct = st.slider("Min Group Size (%)", 1.0, 15.0, 5.0, 0.5)
             p_val = st.number_input("P-Value Threshold", value=0.05, format="%.3f")
             
         elif app_mode == "Single Model Mode":
-            st.markdown("**3. Model Specifications**")
+            st.markdown("**4. Model Specifications**")
             k_single = st.number_input("Number of Groups", min_value=1, max_value=8, value=2)
             orders_single = []
             cols_ord = st.columns(2)
@@ -112,7 +121,7 @@ if app_mode == "About & Docs":
 else:
     st.title(f"GBTM Engine: {app_mode}")
     
-    uploaded_file = st.file_uploader("Upload Wide-Format Dataset (.csv or .txt)", type=["csv", "txt"])
+    uploaded_file = st.file_uploader("Upload Dataset (.csv or .txt)", type=["csv", "txt"])
     st.markdown("*Or, just here to try out the engine? Click below to load sample data (Nagin, 1999).*")
     
     if st.button("Load Cambridge Sample Data", use_container_width=False):
@@ -129,7 +138,7 @@ else:
     elif st.session_state.use_sample_data:
         try:
             raw_df = pd.read_csv("cambridge.txt", sep=r'\s+')
-            st.success("Cambridge sample dataset loaded!")
+            st.success("Cambridge sample dataset loaded! (Note: Sample data is in Wide format)")
         except Exception as e:
             st.error("Could not locate cambridge.txt in the repository.")
 
@@ -139,7 +148,18 @@ else:
         if st.button(button_label, type="primary", use_container_width=True):
             start_time = time.time()
             with st.spinner("Executing C-Compiled Math Engine..."):
-                long_df = prep_trajectory_data(raw_df, id_col, outcome_col, time_col).dropna(subset=['Time', 'Outcome'])
+                
+                # --- WIDE VS LONG DATA PREP ---
+                if data_format == "Wide Format" or st.session_state.use_sample_data:
+                    long_df = prep_trajectory_data(raw_df, id_col, outcome_col, time_col).dropna(subset=['Time', 'Outcome'])
+                else:
+                    # User explicitly uploaded long data. Rename to standardized column names.
+                    long_df = raw_df.rename(columns={id_col: 'ID', outcome_col: 'Outcome', time_col: 'Time'})
+                    long_df = long_df[['ID', 'Time', 'Outcome']].dropna(subset=['Time', 'Outcome'])
+                    long_df['Time'] = pd.to_numeric(long_df['Time'])
+                    long_df['Outcome'] = pd.to_numeric(long_df['Outcome'])
+                    # Must sort by ID and Time for the contiguous FMM C-compiler logic to work
+                    long_df = long_df.sort_values(by=['ID', 'Time'])
                 
                 if app_mode == "AutoTraj Search":
                     top_models, all_evaluated = run_autotraj(
@@ -299,15 +319,20 @@ else:
 
             with tab_char:
                 if HAS_TABLEONE:
-                    potential_covariates = [col for col in raw_df.columns.tolist() if not col.startswith((outcome_col, time_col))]
-                    selected_vars = st.multiselect("Variables to include:", potential_covariates)
-                    categorical_vars = st.multiselect("Which of these are categorical?", selected_vars)
-                    if selected_vars and st.button("Generate Table 1"):
-                        merged_df = pd.merge(raw_df, assignments_df[['ID', 'Assigned_Group']], left_on=id_col, right_on='ID')
-                        group_map = {i+1: name for i, name in enumerate(group_names)}
-                        merged_df['Assigned_Group'] = merged_df['Assigned_Group'].map(group_map)
-                        mytable = TableOne(merged_df, columns=selected_vars, categorical=categorical_vars, groupby="Assigned_Group", pval=True)
-                        st.markdown(mytable.to_html(), unsafe_allow_html=True)
+                    # In long format, demographics need to be extracted carefully to avoid duplicating the same subject's stats.
+                    # We join assignments on the UNIQUE raw wide df if provided, otherwise grab distinct IDs from long_df.
+                    if data_format == "Wide Format" or st.session_state.use_sample_data:
+                        potential_covariates = [col for col in raw_df.columns.tolist() if not col.startswith((outcome_col, time_col))]
+                        selected_vars = st.multiselect("Variables to include:", potential_covariates)
+                        categorical_vars = st.multiselect("Which of these are categorical?", selected_vars)
+                        if selected_vars and st.button("Generate Table 1"):
+                            merged_df = pd.merge(raw_df, assignments_df[['ID', 'Assigned_Group']], left_on=id_col, right_on='ID')
+                            group_map = {i+1: name for i, name in enumerate(group_names)}
+                            merged_df['Assigned_Group'] = merged_df['Assigned_Group'].map(group_map)
+                            mytable = TableOne(merged_df, columns=selected_vars, categorical=categorical_vars, groupby="Assigned_Group", pval=True)
+                            st.markdown(mytable.to_html(), unsafe_allow_html=True)
+                    else:
+                        st.info("Baseline characteristics table generation requires wide-format data to prevent duplicating subjects across timepoints. Please join the exported posterior assignments CSV to your baseline demographics dataset.")
                 else: st.warning("Please run `pip install tableone` in your terminal to enable this feature.")
 
             with tab_comp:
@@ -330,7 +355,7 @@ else:
                         xaxis_title="Number of Groups", 
                         yaxis_title="BIC (Lower on graph = Closer to 0)", 
                         xaxis=dict(tickmode='linear', tick0=1, dtick=1), 
-                        yaxis=dict(autorange="reversed"), # Reverses Y axis so best BIC is at the bottom visually
+                        yaxis=dict(autorange="reversed"), 
                         template="plotly_white"
                     )
                     st.plotly_chart(fig_bic, use_container_width=True)
@@ -338,7 +363,6 @@ else:
                     st.markdown("##### Full Exhaustive Search Results")
                     comp_df = pd.DataFrame(all_evaluated)
                     
-                    # Formatting for clean display
                     comp_df['BIC'] = comp_df['BIC'].apply(lambda x: round(x, 2) if pd.notnull(x) else "NaN")
                     comp_df['AIC'] = comp_df['AIC'].apply(lambda x: round(x, 2) if pd.notnull(x) else "NaN")
                     comp_df['Min_Group_%'] = comp_df['Min_Group_%'].apply(lambda x: round(x, 1) if pd.notnull(x) else "NaN")
