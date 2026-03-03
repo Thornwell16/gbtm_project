@@ -6,7 +6,7 @@ AutoTraj is an open-source, high-performance Python engine for Group-Based Traje
 
 By bypassing standard interpreted Python using `numba` Just-In-Time (JIT) C-compilation and fully vectorized analytical Jacobians, AutoTraj evaluates hundreds of combinatorial polynomial grids in seconds.
 
-## Key Features
+## Key Features (V1.0 - Logit)
 * **Automated Heuristic Selection:** Automatically discards models with spurious subgroups or non-significant highest-order polynomial terms (Nagin & Jones, 2005).
 * **Missing Not At Random (MNAR) Capability:** Integrates an optional dropout model, utilizing logistic survival equations conditioned on previous health states to account for informative attrition.
 * **Robust Statistics:** Automatically computes Huber-White robust sandwich estimators for standard errors alongside model-based Hessian SEs.
