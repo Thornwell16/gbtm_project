@@ -27,3 +27,22 @@ git clone [https://github.com/Thornwell16/gbtm_project.git](https://github.com/T
 cd gbtm_project
 pip install -r requirements.txt
 streamlit run app.py
+```
+
+## Future Roadmap
+AutoTraj is actively maintained. Upcoming architecture upgrades include:
+
+* **Alternative Distributions (V2.0):** Censored Normal (Tobit) for continuous biomarkers and Poisson/ZIP for count data.
+
+* **Covariate Architecture (V3.0):** Multinomial baseline risk factors for group membership prediction and Time-Varying Covariates (TVC) for trajectory deflection.
+
+* **Survey Weights (V4.0):** Inverse probability sampling weights for complex stratified national surveys.
+
+* **Joint Trajectories (V5.0):** Dual-trajectory FMM architecture for modeling interacting longitudinal outcomes.
+
+Methodology & Attribution
+Code architecture and UI generation were assisted by Large Language Models, under the strict mathematical direction and validation of the author to ensure alignment with established FMM and GBTM statistical formulas.
+
+Built by **Donald E. Warden, PhD, MPH**
+
+If you utilize this tool in your research, please view the included CITATION.cff for citing the software.
