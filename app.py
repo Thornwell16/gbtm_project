@@ -41,7 +41,7 @@ with st.expander("📖 About AutoTraj & Instructions", expanded=False):
     4. Click Run. The engine will evaluate all permutations and return the mathematically optimal model.
     
     **Attribution**
-    Built by Dr. Don Warden (Westat / Texas A&M University-Corpus Christi).
+    Built by Dr. Donald E. Warden, PhD, MPH
     """)
 
 if 'run_complete' not in st.session_state:
