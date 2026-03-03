@@ -12,8 +12,13 @@ def load_cambridge_data():
     return df
 
 def prep_trajectory_data(df, id_col='ID', outcome_prefix='C', time_prefix='T'):
+    # Strip invisible spaces/BOMs from column names
+    df.columns = [str(c).strip() for c in df.columns]
+    id_col = id_col.strip()
+    outcome_prefix = outcome_prefix.strip()
+    time_prefix = time_prefix.strip()
+    
     long_df = pd.wide_to_long(df, stubnames=[outcome_prefix, time_prefix], i=id_col, j='Measurement_Period').reset_index()
-    # FIX: Ensure the user's custom ID column is renamed to 'ID' for the math engine
     long_df = long_df.rename(columns={outcome_prefix: 'Outcome', time_prefix: 'Time', id_col: 'ID'})
     long_df = long_df.sort_values(by=['ID', 'Measurement_Period'])
     return long_df
@@ -286,6 +291,11 @@ def run_single_model(df, orders_list, use_dropout=False):
     n_obs = len(times)
     _ = create_design_matrix_jit(np.array([1.0]), 1)
     
+    # DYNAMIC SCALING: Prevents polynomial explosion for orders 3+
+    scale_factor = np.max(np.abs(times))
+    if scale_factor == 0: scale_factor = 1.0
+    times_scaled = times / scale_factor
+    
     orders_arr = np.array(orders_list, dtype=np.int32)
     k = len(orders_list)
     num_params = (k - 1) + sum([order + 1 for order in orders_list])
@@ -305,9 +315,33 @@ def run_single_model(df, orders_list, use_dropout=False):
             current_gamma_idx += 3
     
     result = minimize(
-        calc_dynamic_nll_jit, initial_guess, args=(times, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
+        calc_dynamic_nll_jit, initial_guess, args=(times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
         method='BFGS', jac=calc_dynamic_jacobian_jit
     )
+    
+    # UNSCALE THE PARAMETERS AND HESSIAN TO MATCH EXACT PROC TRAJ OUTPUT
+    D_diag = np.ones(num_params)
+    current_beta_idx = k - 1
+    for g in range(k):
+        for p in range(orders_list[g] + 1):
+            D_diag[current_beta_idx + p] = 1.0 / (scale_factor ** p)
+        current_beta_idx += orders_list[g] + 1
+        
+    if use_dropout:
+        current_gamma_idx = (k - 1) + sum([o + 1 for o in orders_list])
+        for g in range(k):
+            D_diag[current_gamma_idx + 1] = 1.0 / scale_factor
+            current_gamma_idx += 3
+            
+    D = np.diag(D_diag)
+    result.x = D @ result.x
+    try:
+        if hasattr(result, 'hess_inv'):
+            if isinstance(result.hess_inv, np.ndarray):
+                result.hess_inv = D @ result.hess_inv @ D
+            else:
+                result.hess_inv = D @ result.hess_inv.todense() @ D
+    except: pass
     
     if result.success or result.status == 2:
         ll, aic, bic_subj, bic_obs = calculate_fit_stats(result, num_params, n_subjects, n_obs)
@@ -331,6 +365,10 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
     _ = create_design_matrix_jit(np.array([1.0]), 1)
+    
+    scale_factor = np.max(np.abs(times))
+    if scale_factor == 0: scale_factor = 1.0
+    times_scaled = times / scale_factor
     
     all_combinations = []
     for k in range(min_groups, max_groups + 1):
@@ -357,9 +395,33 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                 current_gamma_idx += 3
         
         result = minimize(
-            calc_dynamic_nll_jit, initial_guess, args=(times, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
+            calc_dynamic_nll_jit, initial_guess, args=(times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
             method='BFGS', jac=calc_dynamic_jacobian_jit
         )
+        
+        # UNSCALE RESULTS
+        D_diag = np.ones(num_params)
+        current_beta_idx = k - 1
+        for g in range(k):
+            for p in range(orders_list[g] + 1):
+                D_diag[current_beta_idx + p] = 1.0 / (scale_factor ** p)
+            current_beta_idx += orders_list[g] + 1
+            
+        if use_dropout:
+            current_gamma_idx = (k - 1) + sum([o + 1 for o in orders_list])
+            for g in range(k):
+                D_diag[current_gamma_idx + 1] = 1.0 / scale_factor
+                current_gamma_idx += 3
+                
+        D = np.diag(D_diag)
+        result.x = D @ result.x
+        try:
+            if hasattr(result, 'hess_inv'):
+                if isinstance(result.hess_inv, np.ndarray):
+                    result.hess_inv = D @ result.hess_inv @ D
+                else:
+                    result.hess_inv = D @ result.hess_inv.todense() @ D
+        except: pass
         
         if result.success or result.status == 2:
             ll, aic, bic_subj, bic_obs = calculate_fit_stats(result, num_params, n_subjects, n_obs)
