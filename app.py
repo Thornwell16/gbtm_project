@@ -24,12 +24,15 @@ from main import (
 
 st.set_page_config(page_title="AutoTraj | GBTM Engine", layout="wide")
 
+# --- INITIALIZE SESSION STATE ---
 if 'run_complete' not in st.session_state:
     st.session_state.run_complete = False
     st.session_state.top_models = None
+    st.session_state.all_evaluated = None
     st.session_state.run_time = 0
     st.session_state.long_df = None
     st.session_state.raw_df = None
+    st.session_state.use_sample_data = False
 
 # ==========================================
 # SIDEBAR NAVIGATION & SETTINGS
@@ -96,7 +99,7 @@ if app_mode == "About & Docs":
     
     ---
     **Suggested Citation**
-    Warden, D. E. (2026). AutoTraj: Automated Group-Based Trajectory Modeling Engine [Software]. GitHub. https://github.com/YOUR_USERNAME/gbtm_project
+    Warden, D. E. (2026). AutoTraj: Automated Group-Based Trajectory Modeling Engine [Software]. GitHub. https://github.com/Thornwell16/gbtm_project
     
     **References**
     * Haviland, A. M., Jones, B. L., & Nagin, D. S. (2011). Group-based trajectory modeling: extended statistical and survival analysis capabilities. *Sociological Methods & Research*, 40(3), 485-492.
@@ -111,14 +114,19 @@ else:
     
     uploaded_file = st.file_uploader("Upload Wide-Format Dataset (.csv or .txt)", type=["csv", "txt"])
     st.markdown("*Or, just here to try out the engine? Click below to load sample data (Nagin, 1999).*")
-    use_sample = st.button("Load Cambridge Sample Data", use_container_width=False)
+    
+    if st.button("Load Cambridge Sample Data", use_container_width=False):
+        st.session_state.use_sample_data = True
+        
+    if uploaded_file is not None:
+        st.session_state.use_sample_data = False 
 
     raw_df = None
     if uploaded_file is not None:
         try: raw_df = pd.read_csv(uploaded_file, sep=r'\s+')
         except Exception: raw_df = pd.read_csv(uploaded_file)
-        st.success("File uploaded successfully!")
-    elif use_sample:
+        st.success("Custom file uploaded successfully!")
+    elif st.session_state.use_sample_data:
         try:
             raw_df = pd.read_csv("cambridge.txt", sep=r'\s+')
             st.success("Cambridge sample dataset loaded!")
@@ -134,7 +142,7 @@ else:
                 long_df = prep_trajectory_data(raw_df, id_col, outcome_col, time_col).dropna(subset=['Time', 'Outcome'])
                 
                 if app_mode == "AutoTraj Search":
-                    top_models = run_autotraj(
+                    top_models, all_evaluated = run_autotraj(
                         long_df, min_groups=group_range[0], max_groups=group_range[1],
                         min_order=order_range[0], max_order=order_range[1],
                         min_group_pct=min_pct, p_val_thresh=p_val, use_dropout=use_dropout
@@ -142,9 +150,11 @@ else:
                 else:
                     single_res = run_single_model(long_df, orders_single, use_dropout=use_dropout)
                     top_models = [single_res] if single_res['result'].success or single_res['result'].status == 2 else []
+                    all_evaluated = []
             
             st.session_state.run_complete = True
             st.session_state.top_models = top_models
+            st.session_state.all_evaluated = all_evaluated
             st.session_state.run_time = time.time() - start_time
             st.session_state.long_df = long_df
             st.session_state.raw_df = raw_df
@@ -152,6 +162,7 @@ else:
 
     if st.session_state.run_complete:
         top_models = st.session_state.top_models
+        all_evaluated = st.session_state.all_evaluated
         long_df = st.session_state.long_df
         raw_df = st.session_state.raw_df
         use_dropout_state = st.session_state.use_dropout
@@ -162,7 +173,7 @@ else:
             if len(top_models) > 1 and app_mode == "AutoTraj Search":
                 st.markdown("#### 🔍 Model Explorer")
                 model_choices = [f"Rank {i+1} | {len(m['orders'])}-Group {m['orders']} | BIC: {m['bic']:.2f}" for i, m in enumerate(top_models[:10])]
-                selected_model_str = st.selectbox("Select a model to visualize:", model_choices, label_visibility="collapsed")
+                selected_model_str = st.selectbox("Select a valid model to visualize:", model_choices, label_visibility="collapsed")
                 selected_rank = int(selected_model_str.split("|")[0].replace("Rank ", "").strip()) - 1
                 winning_model = top_models[selected_rank]
             else:
@@ -300,27 +311,39 @@ else:
                 else: st.warning("Please run `pip install tableone` in your terminal to enable this feature.")
 
             with tab_comp:
-                if app_mode == "AutoTraj Search" and len(top_models) > 0:
+                if app_mode == "AutoTraj Search" and all_evaluated:
                     st.markdown("##### 📈 BIC Curve (Optimal Model per Group Size)")
                     
                     best_per_k = {}
-                    for m in top_models:
-                        k = len(m['orders'])
-                        # SAS BIC is negative, closer to 0 is better, so we want the MAXIMUM value.
-                        if k not in best_per_k or m['bic'] > best_per_k[k]['bic']:
-                            best_per_k[k] = m
+                    for m in all_evaluated:
+                        if m['Status'] != "Failed Convergence" and not np.isnan(m['BIC']):
+                            k = m['Groups']
+                            if k not in best_per_k or m['BIC'] > best_per_k[k]['BIC']:
+                                best_per_k[k] = m
                     
                     ks = sorted(list(best_per_k.keys()))
-                    bics = [best_per_k[k]['bic'] for k in ks]
+                    bics = [best_per_k[k]['BIC'] for k in ks]
                     
                     fig_bic = go.Figure()
                     fig_bic.add_trace(go.Scatter(x=ks, y=bics, mode='lines+markers', marker=dict(size=10, color='#1f77b4'), line=dict(width=3)))
-                    fig_bic.update_layout(xaxis_title="Number of Groups", yaxis_title="BIC (Closer to 0 is better)", xaxis=dict(tickmode='linear', tick0=1, dtick=1), template="plotly_white")
+                    fig_bic.update_layout(
+                        xaxis_title="Number of Groups", 
+                        yaxis_title="BIC (Lower on graph = Closer to 0)", 
+                        xaxis=dict(tickmode='linear', tick0=1, dtick=1), 
+                        yaxis=dict(autorange="reversed"), # Reverses Y axis so best BIC is at the bottom visually
+                        template="plotly_white"
+                    )
                     st.plotly_chart(fig_bic, use_container_width=True)
                     
                     st.markdown("##### Full Exhaustive Search Results")
-                    comp_data = [{"Rank": i+1, "Groups": len(m['orders']), "Orders": str(m['orders']), "BIC": round(m['bic'], 2), "AIC": round(m['aic'], 2), "Smallest Group (%)": round(m['min_pct'], 1)} for i, m in enumerate(top_models)]
-                    st.dataframe(pd.DataFrame(comp_data), hide_index=True)
+                    comp_df = pd.DataFrame(all_evaluated)
+                    
+                    # Formatting for clean display
+                    comp_df['BIC'] = comp_df['BIC'].apply(lambda x: round(x, 2) if pd.notnull(x) else "NaN")
+                    comp_df['AIC'] = comp_df['AIC'].apply(lambda x: round(x, 2) if pd.notnull(x) else "NaN")
+                    comp_df['Min_Group_%'] = comp_df['Min_Group_%'].apply(lambda x: round(x, 1) if pd.notnull(x) else "NaN")
+                    
+                    st.dataframe(comp_df, hide_index=True)
                 else:
                     st.info("Run an AutoTraj search across multiple group sizes to view the Model Comparison table.")
 
