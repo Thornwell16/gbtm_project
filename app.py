@@ -133,16 +133,17 @@ else:
     raw_df = None
     if uploaded_file is not None:
         try:
+            # FIX: Use utf-8-sig to automatically strip invisible Byte-Order Marks (BOM) from the first column name
             if uploaded_file.name.lower().endswith('.csv'):
-                raw_df = pd.read_csv(uploaded_file)
+                raw_df = pd.read_csv(uploaded_file, encoding='utf-8-sig')
             else:
-                raw_df = pd.read_csv(uploaded_file, sep=r'\s+')
+                raw_df = pd.read_csv(uploaded_file, sep=r'\s+', encoding='utf-8-sig')
             st.success("Custom file uploaded successfully!")
         except Exception as e:
             st.error(f"Error loading file: {e}")
     elif st.session_state.use_sample_data:
         try:
-            raw_df = pd.read_csv("cambridge.txt", sep=r'\s+')
+            raw_df = pd.read_csv("cambridge.txt", sep=r'\s+', encoding='utf-8-sig')
             st.success("Cambridge sample dataset loaded! (Note: Sample data is in Wide format)")
         except Exception as e:
             st.error("Could not locate cambridge.txt in the repository.")
