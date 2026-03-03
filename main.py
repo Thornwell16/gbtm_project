@@ -131,7 +131,8 @@ def calc_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders,
     return -1.0 * total_ll
 
 @njit(cache=True)
-def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout):
+def calc_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout):
+    """Calculates subject-level gradients for the Huber-White Robust Sandwich Estimator."""
     k = len(orders)
     thetas = np.zeros(k)
     if k > 1: thetas[1:] = params[0 : k-1]
@@ -148,9 +149,8 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, or
         pis[i] = p_val
         pis_safe[i] = 1e-15 if p_val < 1e-15 else p_val
         
-    grad_thetas = np.zeros(k)
-    grad_flat = np.zeros(len(params))
     n_subjects = len(subj_breaks) - 1
+    grad_subj = np.zeros((n_subjects, len(params)))
     
     num_betas = 0
     for g in range(k): num_betas += orders[g] + 1
@@ -218,7 +218,8 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, or
         posterior_ig = np.zeros(k)
         for g in range(k):
             posterior_ig[g] = np.exp(numerator_log[g] - (post_max + np.log(post_sum_exp)))
-            grad_thetas[g] += (posterior_ig[g] - pis[g])
+            if k > 1 and g > 0:
+                grad_subj[i, g - 1] = -1.0 * (posterior_ig[g] - pis[g])
             
         current_beta_idx = k - 1
         current_gamma_idx = gamma_start_idx
@@ -236,16 +237,16 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, or
                 t_val = times[idx]
                 error_y = (outcomes[idx] - p_ig[g, obs]) * posterior_ig[g]
                 for p in range(order + 1):
-                    grad_flat[current_beta_idx + p] += error_y * (t_val ** p)
+                    grad_subj[i, current_beta_idx + p] += -1.0 * error_y * (t_val ** p)
                     
                 if use_dropout and obs > 0:
                     y_prev = outcomes[idx - 1]
                     z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
                     p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
                     err_drop = (0.0 - p_drop) * posterior_ig[g] 
-                    grad_flat[current_gamma_idx] += err_drop * 1.0
-                    grad_flat[current_gamma_idx + 1] += err_drop * t_val
-                    grad_flat[current_gamma_idx + 2] += err_drop * y_prev
+                    grad_subj[i, current_gamma_idx] += -1.0 * err_drop * 1.0
+                    grad_subj[i, current_gamma_idx + 1] += -1.0 * err_drop * t_val
+                    grad_subj[i, current_gamma_idx + 2] += -1.0 * err_drop * y_prev
                     
             if use_dropout:
                 last_idx = end - 1
@@ -255,19 +256,24 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, or
                     z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
                     p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
                     err_drop = (1.0 - p_drop) * posterior_ig[g] 
-                    grad_flat[current_gamma_idx] += err_drop * 1.0
-                    grad_flat[current_gamma_idx + 1] += err_drop * t_last
-                    grad_flat[current_gamma_idx + 2] += err_drop * y_last
+                    grad_subj[i, current_gamma_idx] += -1.0 * err_drop * 1.0
+                    grad_subj[i, current_gamma_idx + 1] += -1.0 * err_drop * t_last
+                    grad_subj[i, current_gamma_idx + 2] += -1.0 * err_drop * y_last
                 current_gamma_idx += 3
             current_beta_idx += n_betas
             
-    for i in range(len(grad_flat)): grad_flat[i] = -1.0 * grad_flat[i]
-    if k > 1:
-        for i in range(1, k): grad_flat[i - 1] = -1.0 * grad_thetas[i]
+    return grad_subj
+
+@njit(cache=True)
+def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout):
+    grad_subj = calc_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout)
+    grad_flat = np.zeros(len(params))
+    for i in range(grad_subj.shape[0]):
+        for j in range(grad_subj.shape[1]):
+            grad_flat[j] += grad_subj[i, j]
     return grad_flat
 
 def calculate_fit_stats(result, n_params, n_subjects, n_obs):
-    """Calculates fit statistics matching the exact formulas from SAS PROC TRAJ."""
     ll = -1 * result.fun
     aic = ll - n_params
     bic_subj = ll - 0.5 * n_params * np.log(n_subjects)
@@ -382,7 +388,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                     'orders': orders_list, 'result': result, 'min_pct': min_group_size, 'pis': pis, 'use_dropout': use_dropout
                 })
                 
-    valid_models = sorted(valid_models, key=lambda x: x['bic'], reverse=True) # SAS formatting: Higher BIC is better (closer to 0)
+    valid_models = sorted(valid_models, key=lambda x: x['bic'], reverse=True) 
     return valid_models[:5]
 
 def get_subject_assignments(result, df, orders, use_dropout):
@@ -462,14 +468,28 @@ def get_subject_assignments(result, df, orders, use_dropout):
         
     return pd.DataFrame(assignments)
 
-def get_parameter_estimates(result, orders, group_names=None, use_dropout=False):
+def get_parameter_estimates(result, orders, df, group_names=None, use_dropout=False):
+    """Extracts Estimates and computes Huber-White Robust Standard Errors."""
     k = len(orders)
     if group_names is None or len(group_names) != k:
         group_names = [f"Group {g+1}" for g in range(k)]
         
     params = result.x
-    try: se = np.sqrt(np.abs(np.diag(result.hess_inv)))
-    except: se = np.full(len(params), np.nan)
+    orders_arr = np.array(orders, dtype=np.int32)
+    
+    try: 
+        H_inv = result.hess_inv
+        se_model = np.sqrt(np.abs(np.diag(H_inv)))
+        
+        # Calculate Robust Sandwich Estimator (H_inv * G * H_inv)
+        times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
+        grad_subj = calc_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
+        G = grad_subj.T @ grad_subj 
+        V_robust = H_inv @ G @ H_inv
+        se_robust = np.sqrt(np.abs(np.diag(V_robust)))
+    except: 
+        se_model = np.full(len(params), np.nan)
+        se_robust = np.full(len(params), np.nan)
         
     data = []
     current_beta_idx = k - 1
@@ -481,12 +501,13 @@ def get_parameter_estimates(result, orders, group_names=None, use_dropout=False)
         n_betas = orders[g] + 1
         for b_idx in range(n_betas):
             est = params[current_beta_idx + b_idx]
-            err = se[current_beta_idx + b_idx]
-            z_score = est / err if err > 0 else 0
+            err_m = se_model[current_beta_idx + b_idx]
+            err_r = se_robust[current_beta_idx + b_idx]
+            z_score = est / err_r if err_r > 0 else 0
             p_val = 2 * (1 - norm.cdf(abs(z_score)))
             data.append({
                 "Component": "Trajectory", "Group": group_names[g], "Parameter": labels[b_idx],
-                "Estimate": round(est, 5), "Std Error": round(err, 5),
+                "Estimate": round(est, 5), "SE (Model)": round(err_m, 5), "SE (Robust)": round(err_r, 5),
                 "P-Value": round(p_val, 4) if p_val >= 0.0001 else "< 0.0001"
             })
         current_beta_idx += n_betas
@@ -494,12 +515,13 @@ def get_parameter_estimates(result, orders, group_names=None, use_dropout=False)
         if use_dropout:
             for gam_idx in range(3):
                 est = params[current_gamma_idx + gam_idx]
-                err = se[current_gamma_idx + gam_idx]
-                z_score = est / err if err > 0 else 0
+                err_m = se_model[current_gamma_idx + gam_idx]
+                err_r = se_robust[current_gamma_idx + gam_idx]
+                z_score = est / err_r if err_r > 0 else 0
                 p_val = 2 * (1 - norm.cdf(abs(z_score)))
                 data.append({
                     "Component": "Dropout", "Group": group_names[g], "Parameter": gamma_labels[gam_idx],
-                    "Estimate": round(est, 5), "Std Error": round(err, 5),
+                    "Estimate": round(est, 5), "SE (Model)": round(err_m, 5), "SE (Robust)": round(err_r, 5),
                     "P-Value": round(p_val, 4) if p_val >= 0.0001 else "< 0.0001"
                 })
             current_gamma_idx += 3
