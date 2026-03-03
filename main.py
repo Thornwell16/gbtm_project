@@ -325,6 +325,7 @@ def run_single_model(df, orders_list, use_dropout=False):
 
 def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False):
     valid_models = []
+    all_evaluated_models = []
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
@@ -366,29 +367,51 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
             pis = np.exp(thetas - logsumexp(thetas))
             min_group_size = np.min(pis) * 100
             
-            if min_group_size < min_group_pct: continue
-                
-            try: se = np.sqrt(np.abs(np.diag(result.hess_inv)))
-            except: se = np.full(num_params, np.nan)
-                
-            all_significant = True
-            current_beta_idx = k - 1
-            for g in range(k):
-                n_betas = orders_list[g] + 1
-                highest_est = result.x[current_beta_idx + n_betas - 1]
-                highest_se = se[current_beta_idx + n_betas - 1]
-                z_score = highest_est / highest_se if highest_se > 0 else 0
-                if 2 * (1 - norm.cdf(abs(z_score))) >= p_val_thresh: all_significant = False
-                current_beta_idx += n_betas
+            status = ""
+            is_valid = True
+            
+            if min_group_size < min_group_pct: 
+                status = f"Rejected (Group Size < {min_group_pct}%)"
+                is_valid = False
+            else:
+                try: se = np.sqrt(np.abs(np.diag(result.hess_inv)))
+                except: se = np.full(num_params, np.nan)
                     
-            if all_significant:
+                all_significant = True
+                current_beta_idx = k - 1
+                for g in range(k):
+                    n_betas = orders_list[g] + 1
+                    highest_est = result.x[current_beta_idx + n_betas - 1]
+                    highest_se = se[current_beta_idx + n_betas - 1]
+                    z_score = highest_est / highest_se if highest_se > 0 else 0
+                    if 2 * (1 - norm.cdf(abs(z_score))) >= p_val_thresh: all_significant = False
+                    current_beta_idx += n_betas
+                        
+                if not all_significant:
+                    status = f"Rejected (P-Value > {p_val_thresh})"
+                    is_valid = False
+                else:
+                    status = "Valid"
+            
+            all_evaluated_models.append({
+                'Groups': k, 'Orders': str(orders_list), 'Status': status,
+                'BIC': bic_subj, 'AIC': aic, 'LL': ll, 'Min_Group_%': min_group_size
+            })
+            
+            if is_valid:
                 valid_models.append({
                     'bic': bic_subj, 'bic_obs': bic_obs, 'aic': aic, 'll': ll,
                     'orders': orders_list, 'result': result, 'min_pct': min_group_size, 'pis': pis, 'use_dropout': use_dropout
                 })
+        else:
+            all_evaluated_models.append({
+                'Groups': k, 'Orders': str(orders_list), 'Status': "Failed Convergence",
+                'BIC': np.nan, 'AIC': np.nan, 'LL': np.nan, 'Min_Group_%': np.nan
+            })
                 
     valid_models = sorted(valid_models, key=lambda x: x['bic'], reverse=True) 
-    return valid_models 
+    all_evaluated_models = sorted(all_evaluated_models, key=lambda x: x['BIC'] if not np.isnan(x['BIC']) else -np.inf, reverse=True)
+    return valid_models, all_evaluated_models
 
 def get_subject_assignments(result, df, orders, use_dropout):
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
