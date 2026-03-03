@@ -40,7 +40,7 @@ AutoTraj is actively maintained. Upcoming architecture upgrades include:
 
 * **Joint Trajectories (V5.0):** Dual-trajectory FMM architecture for modeling interacting longitudinal outcomes.
 
-Methodology & Attribution
+## Methodology & Attribution
 Code architecture and UI generation were assisted by Large Language Models, under the strict mathematical direction and validation of the author to ensure alignment with established FMM and GBTM statistical formulas.
 
 Built by **Donald E. Warden, PhD, MPH**
