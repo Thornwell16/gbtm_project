@@ -25,6 +25,25 @@ st.set_page_config(page_title="GBTM AutoTraj Engine", layout="wide")
 st.title("Group-Based Trajectory Modeling (GBTM)")
 st.markdown("Automated trajectory selection, visualization, and parameter extraction.")
 
+with st.expander("📖 About AutoTraj & Instructions", expanded=False):
+    st.markdown("""
+    **Overview**
+    This application automates the exhaustive search, selection, and visualization of finite mixture models for longitudinal data. It utilizes a custom-built, C-compiled analytical Jacobian engine to rapidly evaluate combinatorial polynomial grids.
+    
+    **Methodology**
+    * **Selection:** The engine adheres to established GBTM heuristics, discarding models that produce spurious groups (size < user-defined threshold) or lack significance in their highest-order polynomial term.
+    * **Adequacy:** Model fit is evaluated using Average Posterior Probability (AvePP) and Odds of Correct Classification (OCC).
+    
+    **Instructions**
+    1. Upload your data in **wide format** (.csv or .txt).
+    2. Map your column prefixes in the sidebar (e.g., if your time variables are T1, T2, T3, enter 'T').
+    3. Set your search grid and statistical thresholds.
+    4. Click Run. The engine will evaluate all permutations and return the mathematically optimal model.
+    
+    **Attribution**
+    Built by Dr. Don Warden (Westat / Texas A&M University-Corpus Christi).
+    """)
+
 if 'run_complete' not in st.session_state:
     st.session_state.run_complete = False
     st.session_state.top_models = None
@@ -92,7 +111,15 @@ if st.session_state.run_complete:
         
         st.divider()
         st.subheader("Publication Suite")
-        tab1, tab2, tab3, tab4 = st.tabs(["Visualization", "Exact Estimates", "Adequacy Metrics", "Demographics (Table 1)"])
+        
+        # We now have 5 tabs to include the internal documentation
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "Visualization", 
+            "Exact Estimates", 
+            "Adequacy Metrics", 
+            "Demographics (Table 1)",
+            "About & Docs"
+        ])
         
         with tab1:
             col_viz1, col_viz2 = st.columns([3, 1])
@@ -168,6 +195,22 @@ if st.session_state.run_complete:
                     mytable = TableOne(merged_df, columns=selected_vars, categorical=categorical_vars, groupby="Assigned_Group", pval=True)
                     st.markdown(mytable.to_html(), unsafe_allow_html=True)
             else: st.warning("Please run `pip install tableone` in your terminal to enable this feature.")
+            
+        with tab5:
+            st.markdown("### AutoTraj: Automated Group-Based Trajectory Modeling")
+            st.markdown("""
+            **Engine Architecture**
+            AutoTraj replaces traditional manual heuristic step-down approaches with a fully vectorized, C-compiled exhaustive search grid. 
+            
+            By utilizing the `numba` library, the Python interpreter is bypassed, allowing the Negative Log-Likelihood and Analytical Jacobian to be calculated directly at the machine-code level. This allows for the evaluation of hundreds of complex finite mixture models in seconds.
+            
+            **Selection Criteria**
+            * **Group Size Penalty:** Discards any model containing a spurious trajectory group smaller than the user-defined threshold (default 5.0%).
+            * **Polynomial Significance:** Adheres strictly to Nagin & Jones (2005) methodology; if the highest-order polynomial term of any group is non-significant, the model is rejected in favor of a trimmed alternative.
+            * **Optimization:** Determines the global optimal model using the Bayesian Information Criterion (BIC).
+                        
+            Copyright \u00A9 2026 Donald E. Warden 
+            """)
 
         st.divider()
         col_down1, col_down2 = st.columns(2)
