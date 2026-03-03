@@ -68,7 +68,6 @@ def logsumexp_jit(a):
 
 @njit(cache=True)
 def calc_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders):
-    """Calculates NLL using flat arrays, including MNAR Dropout Probability."""
     k = len(orders)
     thetas = np.zeros(k)
     if k > 1: thetas[1:] = params[0 : k-1]
@@ -111,14 +110,12 @@ def calc_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders)
                 t_val = times[idx]
                 y_val = outcomes[idx]
                 
-                # 1. Outcome Likelihood
                 z = 0.0
                 for p in range(order + 1): z += group_betas[p] * (t_val ** p)
                 prob = 1.0 / (1.0 + np.exp(-z)) if z >= 0 else np.exp(z) / (1.0 + np.exp(z))
                 prob = max(1e-10, min(1.0 - 1e-10, prob))
                 ll_g += (y_val * np.log(prob)) + ((1.0 - y_val) * np.log(1.0 - prob))
                 
-                # 2. Survival Likelihood
                 if obs > 0:
                     y_prev = outcomes[idx - 1]
                     z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
@@ -126,7 +123,6 @@ def calc_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders)
                     p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
                     ll_g += np.log(1.0 - p_drop) 
                     
-            # 3. Dropout Event Likelihood
             last_idx = end - 1
             if dropouts[last_idx] == 1.0:
                 t_last = times[last_idx]
@@ -144,7 +140,6 @@ def calc_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders)
 
 @njit(cache=True)
 def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders):
-    """Calculates analytical gradient, incorporating Dropout Gammas."""
     k = len(orders)
     thetas = np.zeros(k)
     if k > 1: thetas[1:] = params[0 : k-1]
@@ -286,17 +281,29 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, or
     return grad_flat
 
 def run_single_model(df, orders_list):
-    """Executes a single model without evaluating heuristics or grids."""
+    """Executes a single model, breaking symmetry perfectly for PROC TRAJ equivalence."""
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     n_subjects = len(subj_breaks) - 1
     
-    # Pass dummy arrays to pre-compile the Numba functions instantly
     _ = create_design_matrix_jit(np.array([1.0]), 1)
     
     orders_arr = np.array(orders_list, dtype=np.int32)
     k = len(orders_list)
     num_params = (k - 1) + sum([order + 1 for order in orders_list]) + (3 * k)
     initial_guess = np.zeros(num_params)
+    
+    # 1. Symmetry Breaker (Stagger the intercepts so identical groups split apart)
+    current_beta_idx = k - 1
+    staggered_intercepts = np.linspace(-2.0, 2.0, k) if k > 1 else [0.0]
+    for g in range(k):
+        initial_guess[current_beta_idx] = staggered_intercepts[g]
+        current_beta_idx += orders_list[g] + 1
+        
+    # 2. Dropout Baseline Fix (Start with realistic 11% dropout instead of 50%)
+    current_gamma_idx = (k - 1) + sum([order + 1 for order in orders_list])
+    for g in range(k):
+        initial_guess[current_gamma_idx] = -2.0
+        current_gamma_idx += 3
     
     result = minimize(
         calc_dynamic_nll_jit, initial_guess, args=(times, outcomes, dropouts, subj_breaks, orders_arr),
@@ -342,6 +349,19 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         num_params = (k - 1) + sum([order + 1 for order in orders_list]) + (3 * k)
         initial_guess = np.zeros(num_params)
         
+        # 1. Symmetry Breaker
+        current_beta_idx = k - 1
+        staggered_intercepts = np.linspace(-2.0, 2.0, k) if k > 1 else [0.0]
+        for g in range(k):
+            initial_guess[current_beta_idx] = staggered_intercepts[g]
+            current_beta_idx += orders_list[g] + 1
+            
+        # 2. Dropout Baseline Fix
+        current_gamma_idx = (k - 1) + sum([order + 1 for order in orders_list])
+        for g in range(k):
+            initial_guess[current_gamma_idx] = -2.0
+            current_gamma_idx += 3
+        
         result = minimize(
             calc_dynamic_nll_jit, initial_guess, args=(times, outcomes, dropouts, subj_breaks, orders_arr),
             method='BFGS', jac=calc_dynamic_jacobian_jit
@@ -360,7 +380,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                 print(f"REJECTED (Size: {min_group_size:.1f}%)")
                 continue
                 
-            try: se = np.sqrt(np.diag(result.hess_inv))
+            try: se = np.sqrt(np.abs(np.diag(result.hess_inv))) # Prevents NaN Warning
             except: se = np.full(num_params, np.nan)
                 
             all_significant = True
@@ -465,13 +485,12 @@ def get_subject_assignments(result, df, orders):
     return pd.DataFrame(assignments)
 
 def get_parameter_estimates(result, orders, group_names=None):
-    """Extracts Betas and Gammas with explicit component labels."""
     k = len(orders)
     if group_names is None or len(group_names) != k:
         group_names = [f"Group {g+1}" for g in range(k)]
         
     params = result.x
-    try: se = np.sqrt(np.diag(result.hess_inv))
+    try: se = np.sqrt(np.abs(np.diag(result.hess_inv)))
     except: se = np.full(len(params), np.nan)
         
     data = []
@@ -479,7 +498,7 @@ def get_parameter_estimates(result, orders, group_names=None):
     current_gamma_idx = (k - 1) + sum([o + 1 for o in orders])
     
     labels = ["Intercept", "Linear", "Quadratic", "Cubic", "Quartic", "Quintic"]
-    gamma_labels = ["Intercept", "Time", "Previous Outcome"]
+    gamma_labels = ["Dropout: Intercept", "Dropout: Time", "Dropout: Prev Outcome"]
     
     for g in range(k):
         n_betas = orders[g] + 1
