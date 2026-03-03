@@ -527,7 +527,7 @@ def get_parameter_estimates(result, orders, df, group_names=None, use_dropout=Fa
             data.append({
                 "Component": "Trajectory", "Group": group_names[g], "Parameter": labels[b_idx],
                 "Estimate": round(est, 5), "SE (Model)": round(err_m, 5), "SE (Robust)": round(err_r, 5),
-                "P-Value": round(p_val, 4) if p_val >= 0.0001 else "< 0.0001"
+                "P-Value": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
             })
         current_beta_idx += n_betas
         
@@ -541,7 +541,7 @@ def get_parameter_estimates(result, orders, df, group_names=None, use_dropout=Fa
                 data.append({
                     "Component": "Dropout", "Group": group_names[g], "Parameter": gamma_labels[gam_idx],
                     "Estimate": round(est, 5), "SE (Model)": round(err_m, 5), "SE (Robust)": round(err_r, 5),
-                    "P-Value": round(p_val, 4) if p_val >= 0.0001 else "< 0.0001"
+                    "P-Value": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
                 })
             current_gamma_idx += 3
     return pd.DataFrame(data)

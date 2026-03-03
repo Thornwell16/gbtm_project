@@ -85,7 +85,7 @@ with st.sidebar:
 # ==========================================
 if app_mode == "About & Docs":
     st.header("About AutoTraj")
-    st.markdown("""
+    st.markdown(r"""
     **Overview**
     AutoTraj is a high-performance engine for Group-Based Trajectory Modeling (GBTM), a specialized application of finite mixture modeling utilized to identify latent subpopulations following distinct developmental trajectories over time. It automates the exhaustive search, selection, and visualization of these models by leveraging a fully vectorized, C-compiled analytical Jacobian engine to rapidly evaluate combinatorial polynomial grids.
     
@@ -97,7 +97,7 @@ if app_mode == "About & Docs":
     
     st.latex(r"P(Dropout_{it} = 1 | g) = \frac{1}{1 + e^{-(\gamma_{0g} + \gamma_{1g} t + \gamma_{2g} y_{i, t-1})}}")
     
-    st.markdown("""
+    st.markdown(r"""
     **Robust Standard Errors**
     In addition to model-based standard errors derived from the inverse Hessian matrix, AutoTraj natively computes Huber-White sandwich estimators. This is achieved by cross-multiplying the analytical subject-level gradient vectors against the inverse Hessian, providing standard errors robust to minor model misspecifications and heteroskedasticity.
     
@@ -132,9 +132,15 @@ else:
 
     raw_df = None
     if uploaded_file is not None:
-        try: raw_df = pd.read_csv(uploaded_file, sep=r'\s+')
-        except Exception: raw_df = pd.read_csv(uploaded_file)
-        st.success("Custom file uploaded successfully!")
+        try:
+            # FIX: Safely parse CSVs versus TXTs
+            if uploaded_file.name.lower().endswith('.csv'):
+                raw_df = pd.read_csv(uploaded_file)
+            else:
+                raw_df = pd.read_csv(uploaded_file, sep=r'\s+')
+            st.success("Custom file uploaded successfully!")
+        except Exception as e:
+            st.error(f"Error loading file: {e}")
     elif st.session_state.use_sample_data:
         try:
             raw_df = pd.read_csv("cambridge.txt", sep=r'\s+')
@@ -149,16 +155,13 @@ else:
             start_time = time.time()
             with st.spinner("Executing C-Compiled Math Engine..."):
                 
-                # --- WIDE VS LONG DATA PREP ---
                 if data_format == "Wide Format" or st.session_state.use_sample_data:
                     long_df = prep_trajectory_data(raw_df, id_col, outcome_col, time_col).dropna(subset=['Time', 'Outcome'])
                 else:
-                    # User explicitly uploaded long data. Rename to standardized column names.
                     long_df = raw_df.rename(columns={id_col: 'ID', outcome_col: 'Outcome', time_col: 'Time'})
                     long_df = long_df[['ID', 'Time', 'Outcome']].dropna(subset=['Time', 'Outcome'])
                     long_df['Time'] = pd.to_numeric(long_df['Time'])
                     long_df['Outcome'] = pd.to_numeric(long_df['Outcome'])
-                    # Must sort by ID and Time for the contiguous FMM C-compiler logic to work
                     long_df = long_df.sort_values(by=['ID', 'Time'])
                 
                 if app_mode == "AutoTraj Search":
@@ -319,8 +322,6 @@ else:
 
             with tab_char:
                 if HAS_TABLEONE:
-                    # In long format, demographics need to be extracted carefully to avoid duplicating the same subject's stats.
-                    # We join assignments on the UNIQUE raw wide df if provided, otherwise grab distinct IDs from long_df.
                     if data_format == "Wide Format" or st.session_state.use_sample_data:
                         potential_covariates = [col for col in raw_df.columns.tolist() if not col.startswith((outcome_col, time_col))]
                         selected_vars = st.multiselect("Variables to include:", potential_covariates)
