@@ -13,8 +13,9 @@ def load_cambridge_data():
 
 def prep_trajectory_data(df, id_col='ID', outcome_prefix='C', time_prefix='T'):
     long_df = pd.wide_to_long(df, stubnames=[outcome_prefix, time_prefix], i=id_col, j='Measurement_Period').reset_index()
-    long_df = long_df.rename(columns={outcome_prefix: 'Outcome', time_prefix: 'Time'})
-    long_df = long_df.sort_values(by=[id_col, 'Measurement_Period'])
+    # FIX: Ensure the user's custom ID column is renamed to 'ID' for the math engine
+    long_df = long_df.rename(columns={outcome_prefix: 'Outcome', time_prefix: 'Time', id_col: 'ID'})
+    long_df = long_df.sort_values(by=['ID', 'Measurement_Period'])
     return long_df
 
 def extract_flat_arrays(df):
