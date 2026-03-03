@@ -132,7 +132,6 @@ def calc_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders,
 
 @njit(cache=True)
 def calc_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout):
-    """Calculates subject-level gradients for the Huber-White Robust Sandwich Estimator."""
     k = len(orders)
     thetas = np.zeros(k)
     if k > 1: thetas[1:] = params[0 : k-1]
@@ -389,7 +388,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                 })
                 
     valid_models = sorted(valid_models, key=lambda x: x['bic'], reverse=True) 
-    return valid_models[:5]
+    return valid_models 
 
 def get_subject_assignments(result, df, orders, use_dropout):
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
@@ -469,7 +468,6 @@ def get_subject_assignments(result, df, orders, use_dropout):
     return pd.DataFrame(assignments)
 
 def get_parameter_estimates(result, orders, df, group_names=None, use_dropout=False):
-    """Extracts Estimates and computes Huber-White Robust Standard Errors."""
     k = len(orders)
     if group_names is None or len(group_names) != k:
         group_names = [f"Group {g+1}" for g in range(k)]
@@ -480,8 +478,6 @@ def get_parameter_estimates(result, orders, df, group_names=None, use_dropout=Fa
     try: 
         H_inv = result.hess_inv
         se_model = np.sqrt(np.abs(np.diag(H_inv)))
-        
-        # Calculate Robust Sandwich Estimator (H_inv * G * H_inv)
         times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
         grad_subj = calc_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
         G = grad_subj.T @ grad_subj 

@@ -75,15 +75,17 @@ if app_mode == "About & Docs":
     st.header("About AutoTraj")
     st.markdown("""
     **Overview**
-    AutoTraj is a high-performance engine for Group-Based Trajectory Modeling (GBTM), a specialized application of finite mixture modeling utilized to identify latent subpopulations following distinct developmental trajectories over time (Nagin, 1999). It automates the exhaustive search, selection, and visualization of these models by leveraging a fully vectorized, C-compiled analytical Jacobian engine to rapidly evaluate combinatorial polynomial grids.
+    AutoTraj is a high-performance engine for Group-Based Trajectory Modeling (GBTM), a specialized application of finite mixture modeling utilized to identify latent subpopulations following distinct developmental trajectories over time. It automates the exhaustive search, selection, and visualization of these models by leveraging a fully vectorized, C-compiled analytical Jacobian engine to rapidly evaluate combinatorial polynomial grids.
     
     **Methodology & Missing Data**
     By default, the engine utilizes Full Information Maximum Likelihood (FIML), which provides unbiased parameter estimates under the assumption that missing data is Missing At Random (MAR). 
     
-    To account for informative attrition (Missing Not At Random - MNAR), users can toggle the **Dropout Model**. This fits a joint likelihood model integrating a logistic survival equation conditioned on the subject's previous health state (Haviland, Jones, & Nagin, 2011; Jones, Nagin, & Roeder, 2001):
+    To account for informative attrition (Missing Not At Random - MNAR), users can toggle the **Dropout Model**. This fits a joint likelihood model integrating a logistic survival equation conditioned on the subject's previous health state:
+    """)
     
-    $$P(Dropout_{it} = 1 | g) = \frac{1}{1 + e^{-(\gamma_{0g} + \gamma_{1g} t + \gamma_{2g} y_{i, t-1})}}$$
+    st.latex(r"P(Dropout_{it} = 1 | g) = \frac{1}{1 + e^{-(\gamma_{0g} + \gamma_{1g} t + \gamma_{2g} y_{i, t-1})}}")
     
+    st.markdown("""
     **Robust Standard Errors**
     In addition to model-based standard errors derived from the inverse Hessian matrix, AutoTraj natively computes Huber-White sandwich estimators. This is achieved by cross-multiplying the analytical subject-level gradient vectors against the inverse Hessian, providing standard errors robust to minor model misspecifications and heteroskedasticity.
     
@@ -93,6 +95,9 @@ if app_mode == "About & Docs":
     * **BIC:** $LL - 0.5 \cdot p \cdot \ln(N)$
     
     ---
+    **Suggested Citation**
+    Warden, D. E. (2026). AutoTraj: Automated Group-Based Trajectory Modeling Engine [Software]. GitHub. https://github.com/YOUR_USERNAME/gbtm_project
+    
     **References**
     * Haviland, A. M., Jones, B. L., & Nagin, D. S. (2011). Group-based trajectory modeling: extended statistical and survival analysis capabilities. *Sociological Methods & Research*, 40(3), 485-492.
     * Jones, B. L., Nagin, D. S., & Roeder, K. (2001). A SAS procedure based on mixture models for estimating developmental trajectories. *Sociological Methods & Research*, 29(3), 374-393.
@@ -104,12 +109,9 @@ if app_mode == "About & Docs":
 else:
     st.title(f"GBTM Engine: {app_mode}")
     
-    col_up1, col_up2 = st.columns([2, 1])
-    with col_up1:
-        uploaded_file = st.file_uploader("Upload Wide-Format Dataset (.csv or .txt)", type=["csv", "txt"])
-    with col_up2:
-        st.markdown("<br>", unsafe_allow_html=True)
-        use_sample = st.button("Load Cambridge Sample Data", use_container_width=True)
+    uploaded_file = st.file_uploader("Upload Wide-Format Dataset (.csv or .txt)", type=["csv", "txt"])
+    st.markdown("*Or, just here to try out the engine? Click below to load sample data (Nagin, 1999).*")
+    use_sample = st.button("Load Cambridge Sample Data", use_container_width=False)
 
     raw_df = None
     if uploaded_file is not None:
@@ -159,7 +161,7 @@ else:
             
             if len(top_models) > 1 and app_mode == "AutoTraj Search":
                 st.markdown("#### 🔍 Model Explorer")
-                model_choices = [f"Rank {i+1} | {len(m['orders'])}-Group {m['orders']} | BIC: {m['bic']:.2f}" for i, m in enumerate(top_models)]
+                model_choices = [f"Rank {i+1} | {len(m['orders'])}-Group {m['orders']} | BIC: {m['bic']:.2f}" for i, m in enumerate(top_models[:10])]
                 selected_model_str = st.selectbox("Select a model to visualize:", model_choices, label_visibility="collapsed")
                 selected_rank = int(selected_model_str.split("|")[0].replace("Rank ", "").strip()) - 1
                 winning_model = top_models[selected_rank]
@@ -204,7 +206,7 @@ else:
                 with col_viz2:
                     viz_style = st.selectbox("Graphic Style:", ["Interactive Web (Plotly)", "Publication: Grayscale (Matplotlib)", "Publication: Color (Matplotlib)"])
                     st.markdown("**Plot Elements:**")
-                    show_spaghetti = st.checkbox("Individual Trajectories (Spaghetti)", value=False)
+                    show_spaghetti = st.checkbox("Individual Trajectories", value=False)
                     show_smooth = st.checkbox("Estimated Curves (Smoothed)", value=True)
                     show_obs = st.checkbox("Observed Averages", value=True)
                 
@@ -304,6 +306,7 @@ else:
                     best_per_k = {}
                     for m in top_models:
                         k = len(m['orders'])
+                        # SAS BIC is negative, closer to 0 is better, so we want the MAXIMUM value.
                         if k not in best_per_k or m['bic'] > best_per_k[k]['bic']:
                             best_per_k[k] = m
                     
