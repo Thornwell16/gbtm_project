@@ -1,9 +1,10 @@
 import pandas as pd
 import numpy as np
 from scipy.optimize import minimize
-from scipy.special import logsumexp
+from scipy.special import logsumexp, expit
 from scipy.stats import norm
 import itertools
+import argparse
 
 def load_cambridge_data():
     """
@@ -13,11 +14,11 @@ def load_cambridge_data():
     df = pd.read_csv("cambridge.txt", sep=r'\s+')
     return df
 
-def prep_trajectory_data(df):
+def prep_trajectory_data(df, id_col='ID', outcome_prefix='C', time_prefix='T'):
     """Pivots wide-format subject data into long-format observation data."""
-    long_df = pd.wide_to_long(df, stubnames=['C', 'T'], i='ID', j='Measurement_Period').reset_index()
-    long_df = long_df.rename(columns={'C': 'Outcome', 'T': 'Time'})
-    long_df = long_df.sort_values(by=['ID', 'Measurement_Period'])
+    long_df = pd.wide_to_long(df, stubnames=[outcome_prefix, time_prefix], i=id_col, j='Measurement_Period').reset_index()
+    long_df = long_df.rename(columns={outcome_prefix: 'Outcome', time_prefix: 'Time'})
+    long_df = long_df.sort_values(by=[id_col, 'Measurement_Period'])
     return long_df
 
 def create_design_matrix(times, order):
@@ -25,9 +26,9 @@ def create_design_matrix(times, order):
     return np.column_stack([times**p for p in range(order + 1)])
 
 def calc_logit_prob_matrix(betas, X):
-    """Calculates probabilities for ALL observations simultaneously."""
+    """Calculates probabilities for ALL observations safely."""
     z = np.dot(X, betas)
-    return 1 / (1 + np.exp(-z))
+    return expit(z)  # This handles the extreme numbers without crashing RAM!
 
 def calc_log_likelihood_matrix(betas, X, actual_outcomes):
     """Calculates the Bernoulli Log-Likelihood for an array of observations."""
@@ -69,6 +70,79 @@ def calc_dynamic_nll(params, df, orders):
         total_ll += logsumexp(subject_group_lls)
         
     return -1 * total_ll
+
+def calc_dynamic_jacobian(params, df, orders):
+    """
+    Calculates the exact analytical gradient (Jacobian) of the Negative Log-Likelihood.
+    This replaces SciPy's slow numerical guessing, making the optimization lightning fast.
+    """
+    k = len(orders)
+    
+    # 1. Parse Thetas
+    thetas = np.zeros(k)
+    if k > 1:
+        thetas[1:] = params[0 : k-1]
+    pis = np.exp(thetas - logsumexp(thetas))
+    
+    # 2. Parse Betas
+    group_betas = []
+    current_idx = k - 1
+    for order in orders:
+        n_betas = order + 1
+        group_betas.append(params[current_idx : current_idx + n_betas])
+        current_idx += n_betas
+
+    # Initialize empty arrays to hold our calculated slopes
+    grad_thetas = np.zeros(k)
+    grad_betas = [np.zeros(len(b)) for b in group_betas]
+    
+    grouped = df.groupby('ID')
+    
+    for subject_id, subject_data in grouped:
+        times = subject_data['Time'].values
+        outcomes = subject_data['Outcome'].values
+        
+        # Calculate likelihoods for this subject
+        L_ig_log = np.zeros(k)
+        p_ig = [] 
+        X_ig = [] 
+        
+        for g in range(k):
+            X = create_design_matrix(times, orders[g])
+            X_ig.append(X)
+            
+            p = np.clip(calc_logit_prob_matrix(group_betas[g], X), 1e-10, 1 - 1e-10)
+            p_ig.append(p)
+            
+            ll_array = (outcomes * np.log(p)) + ((1 - outcomes) * np.log(1 - p))
+            L_ig_log[g] = np.sum(ll_array)
+            
+        # Calculate Posterior Probability (hat{pi}_{ig})
+        numerator_log = np.log(pis) + L_ig_log
+        posterior_ig = np.exp(numerator_log - logsumexp(numerator_log))
+        
+        # Add to Gradients
+        for g in range(k):
+            # Gradient for group size
+            grad_thetas[g] += (posterior_ig[g] - pis[g])
+            
+            # Gradient for trajectory shape: X^T * (y - p) * posterior
+            error = outcomes - p_ig[g]
+            grad_betas[g] += np.dot(X_ig[g].T, error) * posterior_ig[g]
+
+    # Because we are MINIMIZING the negative log-likelihood, flip the signs
+    grad_thetas = -1 * grad_thetas
+    grad_betas = [-1 * gb for gb in grad_betas]
+    
+    # Flatten everything back into a single 1D array to hand back to SciPy
+    flat_gradient = []
+    if k > 1:
+        flat_gradient.extend(grad_thetas[1:]) 
+    for gb in grad_betas:
+        flat_gradient.extend(gb)
+        
+    return np.array(flat_gradient)
+
 
 def extract_and_print_metrics(result, df, orders):
     """
@@ -135,10 +209,10 @@ def extract_and_print_metrics(result, df, orders):
             print(f"{beta_labels[b_idx]:<12} | {estimate:>10.4f} | {error:>10.4f} | {p_val:>10.4f}")
         print()
         
-def run_autotraj(df, max_groups=2, max_order=2):
+def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05):
     """
-    Exhaustively searches for the best trajectory model.
-    Now outputs BIC, Min Group Size, and Highest-Order Significance on a single line!
+    Exhaustively searches for the mathematically optimal trajectory model.
+    Enforces Group Size and Highest-Order Significance rules dynamically.
     """
     best_bic = np.inf
     best_orders = None
@@ -150,39 +224,46 @@ def run_autotraj(df, max_groups=2, max_order=2):
     print("STARTING AUTOTRAJ EXHAUSTIVE SEARCH")
     print("*"*80)
     
-    for k in range(1, max_groups + 1):
-        order_combinations = list(itertools.product(range(1, max_order + 1), repeat=k))
+    # 1. Outer Loop: Number of Groups
+    for k in range(min_groups, max_groups + 1):
+        
+        # 2. Inner Loop: Every polynomial combination (e.g., [0,1], [1,1], [2,1]...)
+        order_combinations = list(itertools.product(range(min_order, max_order + 1), repeat=k))
         
         for orders in order_combinations:
             orders_list = list(orders)
             
-            # Format the print statement so it stays on one line while computing
-            print(f"Testing {k}-Group {orders_list}...".ljust(25), end=" ", flush=True)
+            # Visual feedback in the terminal
+            print(f"Testing {k}-Group {orders_list}...".ljust(30), end=" ", flush=True)
             
+            # Calculate total parameters: (k-1 thetas) + (betas for each group)
             num_params = (k - 1) + sum([order + 1 for order in orders_list])
             initial_guess = np.zeros(num_params)
             
+            # 3. Optimization using the Analytical Jacobian (Speed Upgrade)
             result = minimize(
                 calc_dynamic_nll, 
                 initial_guess, 
                 args=(df, orders_list),
-                method='BFGS'
+                method='BFGS',
+                jac=calc_dynamic_jacobian
             )
             
             if result.success or result.status == 2:
-                # 1. Calculate BIC
+                # Calculate BIC (Subject-level N)
                 max_ll = -1 * result.fun
                 bic = (-2 * max_ll) + (num_params * np.log(n_subjects))
                 
-                # 2. Check Group Sizes
+                # Check Group Sizes (The 5% Rule)
                 thetas = np.zeros(k)
                 if k > 1:
                     thetas[1:] = result.x[0 : k-1]
                 pis = np.exp(thetas - logsumexp(thetas))
                 min_group_size = np.min(pis) * 100
                 
-                # 3. Check P-values for highest orders
+                # Check P-values for highest orders
                 try:
+                    # Use the Hessian to get Standard Errors
                     se = np.sqrt(np.diag(result.hess_inv))
                 except:
                     se = np.full(num_params, np.nan)
@@ -197,52 +278,92 @@ def run_autotraj(df, max_groups=2, max_order=2):
                     group_se = se[current_idx : current_idx + n_betas]
                     current_idx += n_betas
                     
-                    # The highest order is always the LAST beta in the group's array
+                    # Identify the p-value of the highest order term (the last beta)
                     highest_est = group_betas[-1]
                     highest_se = group_se[-1]
-                    
                     z_score = highest_est / highest_se if highest_se > 0 else 0
                     p_val = 2 * (1 - norm.cdf(abs(z_score)))
                     highest_order_pvals.append(p_val)
                     
-                    if p_val >= 0.05:
+                    # Flag if the highest term fails the user-defined threshold
+                    if p_val >= p_val_thresh:
                         all_significant = False
                 
-                # Format the output for easy reading
-                p_val_str = "[" + ", ".join([f"{p:.3f}" for p in highest_order_pvals]) + "]"
-                
-                if min_group_size < 5.0:
+                # Logic Gate: Model must meet size and significance requirements to be considered
+                if min_group_size < min_group_pct:
                     print(f"REJECTED: Small Group ({min_group_size:.1f}%)")
+                elif not all_significant:
+                    p_str = "[" + ", ".join([f"{p:.3f}" for p in highest_order_pvals]) + "]"
+                    print(f"REJECTED: Non-Sig Order {p_str}")
                 else:
-                    sig_flag = "SIG" if all_significant else "NOT SIG"
-                    print(f"BIC: {bic:.2f} | Min %: {min_group_size:.1f}% | P-vals: {p_val_str} | {sig_flag}")
-                
-                # Save the best model that passes the 5% rule and is fully significant
-                if bic < best_bic and min_group_size >= 5.0 and all_significant:
-                    best_bic = bic
-                    best_orders = orders_list
-                    best_result = result
+                    print(f"VALID! BIC: {bic:.2f} | Min %: {min_group_size:.1f}%")
+                    
+                    # Update the global winner if this is the lowest BIC found so far
+                    if bic < best_bic:
+                        best_bic = bic
+                        best_orders = orders_list
+                        best_result = result
             else:
-                print("FAILED to converge.")
+                print("FAILED: Did not converge.")
                 
     return best_orders, best_result
 
 
 
 # ==========================================
-# EXECUTION BLOCK
+# EXECUTION BLOCK & CLI
 # ==========================================
 if __name__ == "__main__":
+    # 1. Set up the terminal parser
+    parser = argparse.ArgumentParser(description="GBTM Python Engine")
+    parser.add_argument('--mode', choices=['single', 'auto'], default='single', 
+                        help="Run a 'single' model or 'auto' exhaustive search.")
+    parser.add_argument('--orders', type=int, nargs='+', default=[1, 1], 
+                        help="Polynomial orders for a single model (e.g., --orders 1 2)")
+    
+    args = parser.parse_args()
+
+    # 2. Load and prep data
     raw_wide = load_cambridge_data()
     long_data = prep_trajectory_data(raw_wide).dropna(subset=['Time', 'Outcome'])
 
-    # Let autotraj find the best model! (Max 2 groups, Max Order 2)
-    winning_orders, winning_result = run_autotraj(long_data, max_groups=2, max_order=2)
-    
-    print("\n" + "*"*50)
-    print("AUTOTRAJ SEARCH COMPLETE")
-    print(f"THE WINNER IS: {len(winning_orders)}-Group Model with orders {winning_orders}")
-    print("*"*50)
-    
-    # Print the full metrics for the winning model
-    extract_and_print_metrics(winning_result, long_data, winning_orders)
+    # 3. Route the command
+    if args.mode == 'auto':
+        # Run the exhaustive loop
+        winning_orders, winning_result = run_autotraj(long_data, max_groups=3, max_order=2)
+        print("\n" + "*"*50)
+        print(f"THE WINNER IS: {len(winning_orders)}-Group Model with orders {winning_orders}")
+        print("*"*50)
+        if winning_result:
+            extract_and_print_metrics(winning_result, long_data, winning_orders)
+
+    elif args.mode == 'single':
+        # Run just the specific model requested
+        model_orders = args.orders
+        k = len(model_orders)
+        num_params = (k - 1) + sum([order + 1 for order in model_orders])
+        initial_guess = np.zeros(num_params)
+
+        print(f"Running SINGLE {k}-Group model with orders {model_orders}...")
+        
+        result = minimize(
+            calc_dynamic_nll, 
+            initial_guess, 
+            args=(long_data, model_orders),
+            method='BFGS',
+            jac=calc_dynamic_jacobian  # <--- THE SPEED UPGRADE
+        )
+        
+        if result.success or result.status == 2:
+            extract_and_print_metrics(result, long_data, model_orders)
+        else:
+            print("Failed to converge.")
+
+# ==========================================
+    # CLI COMMAND REFERENCE
+    # ==========================================
+    # To run a single specific model (e.g., 2 groups, Linear and Linear):
+    # python main.py --mode single --orders 1 1
+    #
+    # To run the automated exhaustive search loop:
+    # python main.py --mode auto
