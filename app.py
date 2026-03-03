@@ -229,7 +229,6 @@ else:
                     categorical_vars = st.multiselect("Which of these are categorical?", selected_vars)
                     if selected_vars and st.button("Generate Table 1"):
                         merged_df = pd.merge(raw_df, assignments_df[['ID', 'Assigned_Group']], left_on=id_col, right_on='ID')
-                        # Map numeric Assigned_Group to Custom Names for the Table
                         group_map = {i+1: name for i, name in enumerate(group_names)}
                         merged_df['Assigned_Group'] = merged_df['Assigned_Group'].map(group_map)
                         
