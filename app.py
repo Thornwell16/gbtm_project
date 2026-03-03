@@ -133,7 +133,6 @@ else:
     raw_df = None
     if uploaded_file is not None:
         try:
-            # FIX: Safely parse CSVs versus TXTs
             if uploaded_file.name.lower().endswith('.csv'):
                 raw_df = pd.read_csv(uploaded_file)
             else:
