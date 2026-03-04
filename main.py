@@ -285,7 +285,6 @@ def calculate_fit_stats(result, n_params, n_subjects, n_obs):
     return ll, aic, bic_subj, bic_obs
 
 def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor):
-    """Calculates High-Precision Observed Information Matrix for Standard Errors."""
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
     orders_arr = np.array(orders_list, dtype=np.int32)
@@ -309,7 +308,6 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     D = np.diag(D_diag)
     
     try:
-        # 1. Exact Numerical Hessian (Observed Information Matrix)
         times_scaled = times / scale_factor
         args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
         
@@ -327,7 +325,6 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
         H_scaled = (H_scaled + H_scaled.T) / 2.0 
         H_inv_scaled = np.linalg.pinv(H_scaled) 
         
-        # 2. Robust (Sandwich/BHHH) Estimator
         grad_subj_scaled = calc_subject_gradients_jit(result.x, *args)
         G_scaled = grad_subj_scaled.T @ grad_subj_scaled
         V_robust_scaled = H_inv_scaled @ G_scaled @ H_inv_scaled
@@ -335,7 +332,6 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
         H_inv_scaled = np.eye(num_params)
         V_robust_scaled = np.eye(num_params)
         
-    # 3. Mathematically Unscale the Covariance Matrices to real-world scale
     params_unscaled = D @ result.x
     V_model_unscaled = D @ H_inv_scaled @ D
     V_robust_unscaled = D @ V_robust_scaled @ D
@@ -463,7 +459,6 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                     highest_est = result.x[current_beta_idx + n_betas - 1]
                     highest_se = se_model[current_beta_idx + n_betas - 1]
                     
-                    # Compute Exact SAS T-Test
                     t_stat = highest_est / highest_se if highest_se > 0 else 0
                     p_value_t = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
                     
@@ -576,3 +571,78 @@ def get_subject_assignments(model_dict, df):
         assignments.append(row)
         
     return pd.DataFrame(assignments)
+
+def get_parameter_estimates(model_dict, group_names=None):
+    orders = model_dict['orders']
+    params = model_dict['result'].x
+    se_model = model_dict['se_model']
+    se_robust = model_dict['se_robust']
+    use_dropout = model_dict['use_dropout']
+    dof = model_dict['dof']
+    
+    k = len(orders)
+    if group_names is None or len(group_names) != k:
+        group_names = [f"Group {g+1}" for g in range(k)]
+        
+    data = []
+    current_beta_idx = k - 1
+    current_gamma_idx = (k - 1) + sum([o + 1 for o in orders])
+    labels = ["Intercept", "Linear", "Quadratic", "Cubic", "Quartic", "Quintic"]
+    gamma_labels = ["Dropout: Intercept", "Dropout: Time", "Dropout: Prev Outcome"]
+    
+    for g in range(k):
+        n_betas = orders[g] + 1
+        for b_idx in range(n_betas):
+            est = params[current_beta_idx + b_idx]
+            err_m = se_model[current_beta_idx + b_idx]
+            err_r = se_robust[current_beta_idx + b_idx]
+            
+            t_stat = est / err_m if err_m > 0 else 0
+            p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+            
+            data.append({
+                "Component": "Trajectory", "Group": str(group_names[g]), "Parameter": labels[b_idx],
+                "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
+                "T for H0: Param=0": round(t_stat, 3),
+                "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
+            })
+        current_beta_idx += n_betas
+        
+        if use_dropout:
+            for gam_idx in range(3):
+                est = params[current_gamma_idx + gam_idx]
+                err_m = se_model[current_gamma_idx + gam_idx]
+                err_r = se_robust[current_gamma_idx + gam_idx]
+                
+                t_stat = est / err_m if err_m > 0 else 0
+                p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+                
+                data.append({
+                    "Component": "Dropout", "Group": str(group_names[g]), "Parameter": gamma_labels[gam_idx],
+                    "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
+                    "T for H0: Param=0": round(t_stat, 3),
+                    "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
+                })
+            current_gamma_idx += 3
+    return pd.DataFrame(data)
+
+def calc_model_adequacy(assignments_df, pis, group_names=None):
+    if group_names is None or len(group_names) != len(pis):
+        group_names = [f"Group {g+1}" for g in range(len(pis))]
+        
+    adequacy_data = []
+    for g in range(1, len(pis) + 1):
+        group_subjects = assignments_df[assignments_df['Assigned_Group'] == g]
+        if len(group_subjects) == 0: continue
+        ave_pp = np.clip(group_subjects[f'Group_{g}_Prob'].mean(), 0.0001, 0.9999)
+        pi_safe = np.clip(pis[g-1], 0.0001, 0.9999)
+        occ = (ave_pp / (1 - ave_pp)) / (pi_safe / (1 - pi_safe))
+        adequacy_data.append({
+            "Group": str(group_names[g-1]), "N Assigned": len(group_subjects),
+            "Est. Population %": f"{pis[g-1] * 100:.1f}%",
+            "AvePP": round(ave_pp, 3), "OCC": round(occ, 2)
+        })
+    return pd.DataFrame(adequacy_data)
+
+if __name__ == "__main__":
+    pass
