@@ -468,7 +468,6 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
             is_valid = True
             dof = n_obs - num_params
             
-            # Mathematical Exclusion Criteria
             if cond_num > 1e10:
                 status = "Rejected (Singular Matrix / Unidentifiable)"
                 is_valid = False
@@ -479,7 +478,6 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                 status = f"Rejected (Group Size < {min_group_pct}%)"
                 is_valid = False
             else:
-                # Significance Check
                 all_significant = True
                 current_beta_idx = k - 1
                 for g in range(k):
@@ -611,6 +609,14 @@ def calc_model_adequacy(assignments_df, pis, group_names):
     k = len(pis)
     adequacy_data = []
     
+    if k > 1:
+        prob_cols = [col for col in assignments_df.columns if 'Prob' in col]
+        probs = assignments_df[prob_cols].values
+        entropy_sum = np.sum(probs * np.log(np.clip(probs, 1e-15, 1.0)))
+        relative_entropy = 1.0 + (entropy_sum / (len(assignments_df) * np.log(k)))
+    else:
+        relative_entropy = 1.0
+    
     for g in range(k):
         group_num = g + 1
         group_data = assignments_df[assignments_df['Assigned_Group'] == group_num]
@@ -636,4 +642,4 @@ def calc_model_adequacy(assignments_df, pis, group_names):
             "OCC": round(occ, 2) if pd.notnull(occ) else "N/A"
         })
         
-    return pd.DataFrame(adequacy_data)
+    return pd.DataFrame(adequacy_data), relative_entropy
