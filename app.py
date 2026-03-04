@@ -171,7 +171,7 @@ if app_mode == "About & Docs":
 else:
     st.title(f"GBTM Engine: {app_mode}")
     
-    uploaded_file = st.file_uploader("Upload Dataset (.csv or .txt)", type=["csv", "txt"])
+    uploaded_file = st.file_uploader("Upload Dataset (.csv, .txt, .xlsx, .sas7bdat)", type=["csv", "txt", "xlsx", "sas7bdat"])
     st.markdown("*Or, just here to try out the engine? Click below to load sample data (Nagin, 1999).*")
     
     if st.button("Load Cambridge Sample Data", use_container_width=False):
@@ -183,21 +183,20 @@ else:
     raw_df = None
     if uploaded_file is not None:
         try:
-            if uploaded_file.name.lower().endswith('.csv'):
+            file_name = uploaded_file.name.lower()
+            if file_name.endswith('.csv'):
                 raw_df = pd.read_csv(uploaded_file, encoding='utf-8-sig')
-            else:
+            elif file_name.endswith('.txt'):
                 raw_df = pd.read_csv(uploaded_file, sep=r'\s+', encoding='utf-8-sig')
+            elif file_name.endswith('.xlsx'):
+                raw_df = pd.read_excel(uploaded_file, engine='openpyxl')
+            elif file_name.endswith('.sas7bdat'):
+                raw_df = pd.read_sas(uploaded_file, format='sas7bdat', encoding='utf-8')
+                
             raw_df.columns = [str(c).strip() for c in raw_df.columns]
             st.success("Custom file uploaded successfully!")
         except Exception as e:
-            st.error(f"Error loading file: {e}")
-    elif st.session_state.use_sample_data:
-        try:
-            raw_df = pd.read_csv("cambridge.txt", sep=r'\s+', encoding='utf-8-sig')
-            raw_df.columns = [str(c).strip() for c in raw_df.columns]
-            st.success("Cambridge sample dataset loaded! (Note: Sample data is in Wide format. Use ID='ID', Out='C', Time='T')")
-        except Exception as e:
-            st.error("Could not locate cambridge.txt in the repository.")
+            st.error(f"Error loading file: {e}. If uploading SAS or Excel files, ensure 'pyreadstat' and 'openpyxl' are installed.")
 
     if raw_df is not None:
         button_label = "Run AutoTraj Search" if app_mode == "AutoTraj Search" else "Run Single Model"
