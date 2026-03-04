@@ -6,8 +6,10 @@ authors:
     orcid: "https://orcid.org/0009-0007-7844-7821"
 title: "AutoTraj: Automated Group-Based Trajectory Modeling Engine"
 version: 1.0.0
+doi: 10.5281/zenodo.1886667
 date-released: 2026-03-03
 url: "https://github.com/Thornwell16/gbtm_project"
+repository-code: "https://github.com/Thornwell16/gbtm_project"
 description: "A high-performance, C-compiled Python engine for exhaustive search and selection of finite mixture models in longitudinal epidemiology."
 keywords:
   - epidemiology
@@ -15,3 +17,4 @@ keywords:
   - group-based trajectory modeling
   - finite mixture modeling
   - longitudinal data
+license: MIT
