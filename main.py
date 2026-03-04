@@ -285,6 +285,7 @@ def calculate_fit_stats(result, n_params, n_subjects, n_obs):
     return ll, aic, bic_subj, bic_obs
 
 def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor):
+    """Calculates High-Precision Observed Information Matrix with Dynamic Epsilon."""
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
     orders_arr = np.array(orders_list, dtype=np.int32)
@@ -308,19 +309,22 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     D = np.diag(D_diag)
     
     try:
+        # 1. Exact Numerical Hessian with dynamically scaling epsilon for multicollinearity
         times_scaled = times / scale_factor
         args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
         
         H_scaled = np.zeros((num_params, num_params))
-        eps = 1e-5
         for i in range(num_params):
+            eps_i = 1e-5 * max(1.0, abs(result.x[i]))
+            if eps_i < 1e-8: eps_i = 1e-8
+            
             p_plus = np.copy(result.x)
             p_minus = np.copy(result.x)
-            p_plus[i] += eps
-            p_minus[i] -= eps
+            p_plus[i] += eps_i
+            p_minus[i] -= eps_i
             g_plus = calc_dynamic_jacobian_jit(p_plus, *args)
             g_minus = calc_dynamic_jacobian_jit(p_minus, *args)
-            H_scaled[i, :] = (g_plus - g_minus) / (2.0 * eps)
+            H_scaled[i, :] = (g_plus - g_minus) / (2.0 * eps_i)
             
         H_scaled = (H_scaled + H_scaled.T) / 2.0 
         H_inv_scaled = np.linalg.pinv(H_scaled) 
@@ -332,6 +336,7 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
         H_inv_scaled = np.eye(num_params)
         V_robust_scaled = np.eye(num_params)
         
+    # 3. Mathematically Unscale the Covariance Matrices to real-world scale
     params_unscaled = D @ result.x
     V_model_unscaled = D @ H_inv_scaled @ D
     V_robust_unscaled = D @ V_robust_scaled @ D
@@ -393,7 +398,7 @@ def run_single_model(df, orders_list, use_dropout=False):
         'bic': bic_subj, 'bic_obs': bic_obs, 'aic': aic, 'll': ll, 
         'orders': orders_list, 'result': result, 'min_pct': min_group_size, 
         'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust,
-        'dof': n_subjects - num_params
+        'dof': n_obs - num_params # SAS exact Degrees of Freedom calculation
     }
 
 def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False):
@@ -446,7 +451,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
             status = ""
             is_valid = True
             
-            dof = n_subjects - num_params
+            dof = n_obs - num_params
             
             if min_group_size < min_group_pct: 
                 status = f"Rejected (Group Size < {min_group_pct}%)"

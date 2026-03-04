@@ -155,7 +155,6 @@ else:
         
         if st.button(button_label, type="primary", use_container_width=True):
             
-            # --- UI VALIDATION GUARDS (Prevents traceback crashes) ---
             if data_format == "Wide Format" or st.session_state.use_sample_data:
                 if id_col not in raw_df.columns:
                     st.error(f"🚨 **Data Mapping Error:** The ID column '{id_col}' was not found. Please update the 'ID' text box in the sidebar. Available columns: {', '.join(raw_df.columns[:5])}...")
@@ -226,7 +225,6 @@ else:
             winning_result = winning_model['result']
             winning_pis_raw = winning_model['pis'] 
             
-            # FIT STATS DASHBOARD
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("BIC (N=Subj)", f"{winning_model['bic']:.2f}")
             col2.metric("BIC (N=Obs)", f"{winning_model['bic_obs']:.2f}")
