@@ -18,65 +18,14 @@ from main import (
     run_single_model,
     calc_logit_prob_jit, 
     create_design_matrix_jit, 
-    get_subject_assignments
+    get_subject_assignments, 
+    get_parameter_estimates,
+    calc_model_adequacy
 )
-
-def get_parameter_estimates_for_ui(model_dict, group_names=None):
-    orders = model_dict['orders']
-    params = model_dict['result'].x
-    se_model = model_dict['se_model']
-    se_robust = model_dict['se_robust']
-    use_dropout = model_dict['use_dropout']
-    dof = model_dict['dof']
-    
-    k = len(orders)
-    if group_names is None or len(group_names) != k:
-        group_names = [f"Group {g+1}" for g in range(k)]
-        
-    data = []
-    current_beta_idx = k - 1
-    current_gamma_idx = (k - 1) + sum([o + 1 for o in orders])
-    labels = ["Intercept", "Linear", "Quadratic", "Cubic", "Quartic", "Quintic"]
-    gamma_labels = ["Dropout: Intercept", "Dropout: Time", "Dropout: Prev Outcome"]
-    
-    for g in range(k):
-        n_betas = orders[g] + 1
-        for b_idx in range(n_betas):
-            est = params[current_beta_idx + b_idx]
-            err_m = se_model[current_beta_idx + b_idx]
-            err_r = se_robust[current_beta_idx + b_idx]
-            
-            t_stat = est / err_m if err_m > 0 else 0
-            p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
-            
-            data.append({
-                "Component": "Trajectory", "Group": str(group_names[g]), "Parameter": labels[b_idx],
-                "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
-                "T for H0: Param=0": round(t_stat, 3),
-                "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
-            })
-        current_beta_idx += n_betas
-        
-        if use_dropout:
-            for gam_idx in range(3):
-                est = params[current_gamma_idx + gam_idx]
-                err_m = se_model[current_gamma_idx + gam_idx]
-                err_r = se_robust[current_gamma_idx + gam_idx]
-                
-                t_stat = est / err_m if err_m > 0 else 0
-                p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
-                
-                data.append({
-                    "Component": "Dropout", "Group": str(group_names[g]), "Parameter": gamma_labels[gam_idx],
-                    "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
-                    "T for H0: Param=0": round(t_stat, 3),
-                    "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
-                })
-            current_gamma_idx += 3
-    return pd.DataFrame(data)
 
 st.set_page_config(page_title="AutoTraj | GBTM Engine", layout="wide")
 
+# --- INITIALIZE SESSION STATE ---
 if 'run_complete' not in st.session_state:
     st.session_state.run_complete = False
     st.session_state.top_models = None
@@ -86,6 +35,9 @@ if 'run_complete' not in st.session_state:
     st.session_state.raw_df = None
     st.session_state.use_sample_data = False
 
+# ==========================================
+# SIDEBAR NAVIGATION & SETTINGS
+# ==========================================
 with st.sidebar:
     st.title("AutoTraj")
     app_mode = st.radio("Navigation", ["AutoTraj Search", "Single Model Mode", "About & Docs"])
@@ -108,7 +60,7 @@ with st.sidebar:
             with col_time: time_col = st.text_input("Time Col", value="Time")
         
         st.markdown("**3. Engine Options**")
-        use_dropout = st.checkbox("Include MNAR Dropout Model", value=False)
+        use_dropout = st.checkbox("Include MNAR Dropout Model", value=False, help="Adds logistic survival equations conditional on previous outcomes.")
         
         if app_mode == "AutoTraj Search":
             st.markdown("**4. Search Grid**")
@@ -129,11 +81,40 @@ with st.sidebar:
                     o = st.number_input(f"Group {i+1} Order", min_value=0, max_value=5, value=1)
                     orders_single.append(o)
 
+# ==========================================
+# PAGE ROUTING
+# ==========================================
 if app_mode == "About & Docs":
     st.header("About AutoTraj")
     st.markdown(r"""
     **Overview**
-    AutoTraj is a high-performance engine for Group-Based Trajectory Modeling (GBTM), a specialized application of finite mixture modeling utilized to identify latent subpopulations following distinct developmental trajectories over time.
+    AutoTraj is a high-performance engine for Group-Based Trajectory Modeling (GBTM), a specialized application of finite mixture modeling utilized to identify latent subpopulations following distinct developmental trajectories over time. It automates the exhaustive search, selection, and visualization of these models by leveraging a fully vectorized, C-compiled analytical Jacobian engine to rapidly evaluate combinatorial polynomial grids.
+    
+    **Methodology & Missing Data**
+    By default, the engine utilizes Full Information Maximum Likelihood (FIML), which provides unbiased parameter estimates under the assumption that missing data is Missing At Random (MAR). 
+    
+    To account for informative attrition (Missing Not At Random - MNAR), users can toggle the **Dropout Model**. This fits a joint likelihood model integrating a logistic survival equation conditioned on the subject's previous health state:
+    """)
+    
+    st.latex(r"P(Dropout_{it} = 1 | g) = \frac{1}{1 + e^{-(\gamma_{0g} + \gamma_{1g} t + \gamma_{2g} y_{i, t-1})}}")
+    
+    st.markdown(r"""
+    **Robust Standard Errors**
+    In addition to model-based standard errors derived from the exact numerical Hessian (Observed Information Matrix), AutoTraj natively computes Huber-White sandwich estimators. This is achieved by cross-multiplying the analytical subject-level gradient vectors against the inverse Hessian, providing standard errors robust to minor model misspecifications and heteroskedasticity.
+    
+    **Fit Statistics & Optimization**
+    Calculations align precisely with standard epidemiological conventions. Significance is calculated using the Student's T-distribution ($DF = N_{obs} - p$). Models are optimized and selected using the Bayesian Information Criterion (BIC), defined below:
+    * **AIC:** $LL - p$
+    * **BIC:** $LL - 0.5 \cdot p \cdot \ln(N)$
+    
+    ---
+    **Suggested Citation**
+    Warden, D. E. (2026). AutoTraj: Automated Group-Based Trajectory Modeling Engine [Software]. GitHub. https://github.com/Thornwell16/gbtm_project
+    
+    **References**
+    * Haviland, A. M., Jones, B. L., & Nagin, D. S. (2011). Group-based trajectory modeling: extended statistical and survival analysis capabilities. *Sociological Methods & Research*, 40(3), 485-492.
+    * Jones, B. L., Nagin, D. S., & Roeder, K. (2001). A SAS procedure based on mixture models for estimating developmental trajectories. *Sociological Methods & Research*, 29(3), 374-393.
+    * Nagin, D. S. (1999). Analyzing developmental trajectories: a semiparametric, group-based approach. *Psychological Methods*, 4(2), 139-157.
     """)
     st.markdown("---")
     st.markdown("© 2026 Donald E. Warden, PhD, MPH. Licensed under the MIT License.")
@@ -165,7 +146,7 @@ else:
         try:
             raw_df = pd.read_csv("cambridge.txt", sep=r'\s+', encoding='utf-8-sig')
             raw_df.columns = [str(c).strip() for c in raw_df.columns]
-            st.success("Cambridge sample dataset loaded! (Note: Sample data is in Wide format)")
+            st.success("Cambridge sample dataset loaded! (Note: Sample data is in Wide format. Use ID='ID', Out='C', Time='T')")
         except Exception as e:
             st.error("Could not locate cambridge.txt in the repository.")
 
@@ -173,6 +154,23 @@ else:
         button_label = "Run AutoTraj Search" if app_mode == "AutoTraj Search" else "Run Single Model"
         
         if st.button(button_label, type="primary", use_container_width=True):
+            
+            # --- UI VALIDATION GUARDS (Prevents traceback crashes) ---
+            if data_format == "Wide Format" or st.session_state.use_sample_data:
+                if id_col not in raw_df.columns:
+                    st.error(f"🚨 **Data Mapping Error:** The ID column '{id_col}' was not found. Please update the 'ID' text box in the sidebar. Available columns: {', '.join(raw_df.columns[:5])}...")
+                    st.stop()
+                if not any(str(c).startswith(outcome_col) for c in raw_df.columns):
+                    st.error(f"🚨 **Data Mapping Error:** No columns found starting with Outcome Prefix '{outcome_col}'. Please update the sidebar.")
+                    st.stop()
+                if not any(str(c).startswith(time_col) for c in raw_df.columns):
+                    st.error(f"🚨 **Data Mapping Error:** No columns found starting with Time Prefix '{time_col}'. Please update the sidebar.")
+                    st.stop()
+            else:
+                if id_col not in raw_df.columns or outcome_col not in raw_df.columns or time_col not in raw_df.columns:
+                    st.error(f"🚨 **Data Mapping Error:** One or more specified columns ({id_col}, {outcome_col}, {time_col}) were not found. Please check your sidebar inputs.")
+                    st.stop()
+
             start_time = time.time()
             with st.spinner("Executing C-Compiled Math Engine..."):
                 
@@ -228,6 +226,7 @@ else:
             winning_result = winning_model['result']
             winning_pis_raw = winning_model['pis'] 
             
+            # FIT STATS DASHBOARD
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("BIC (N=Subj)", f"{winning_model['bic']:.2f}")
             col2.metric("BIC (N=Obs)", f"{winning_model['bic_obs']:.2f}")
@@ -332,13 +331,29 @@ else:
                 st.download_button(label="📥 Download Observed Averages (CSV)", data=obs_means.to_csv(index=False).encode('utf-8'), file_name='trajectory_observed_averages.csv', mime='text/csv')
                     
             with tab_est:
-                estimates_df = get_parameter_estimates_for_ui(winning_model, group_names)
+                estimates_df = get_parameter_estimates(winning_model, group_names)
                 st.dataframe(estimates_df, use_container_width=True, hide_index=True)
                 csv_est = estimates_df.to_csv(index=False).encode('utf-8')
                 st.download_button(label="📥 Download Parameter Estimates Table", data=csv_est, file_name='trajectory_parameters.csv', mime='text/csv')
                 
             with tab_adq:
                 st.dataframe(calc_model_adequacy(assignments_df, winning_pis_raw, group_names), use_container_width=True, hide_index=True)
+
+            with tab_char:
+                if HAS_TABLEONE:
+                    if data_format == "Wide Format" or st.session_state.use_sample_data:
+                        potential_covariates = [col for col in raw_df.columns.tolist() if not col.startswith((outcome_col, time_col))]
+                        selected_vars = st.multiselect("Variables to include:", potential_covariates)
+                        categorical_vars = st.multiselect("Which of these are categorical?", selected_vars)
+                        if selected_vars and st.button("Generate Table 1"):
+                            merged_df = pd.merge(raw_df, assignments_df[['ID', 'Assigned_Group']], left_on=id_col, right_on='ID')
+                            group_map = {i+1: name for i, name in enumerate(group_names)}
+                            merged_df['Assigned_Group'] = merged_df['Assigned_Group'].map(group_map)
+                            mytable = TableOne(merged_df, columns=selected_vars, categorical=categorical_vars, groupby="Assigned_Group", pval=True)
+                            st.markdown(mytable.to_html(), unsafe_allow_html=True)
+                    else:
+                        st.info("Baseline characteristics table generation requires wide-format data to prevent duplicating subjects across timepoints. Please join the exported posterior assignments CSV to your baseline demographics dataset.")
+                else: st.warning("Please run `pip install tableone` in your terminal to enable this feature.")
 
             with tab_comp:
                 if app_mode == "AutoTraj Search" and all_evaluated:
