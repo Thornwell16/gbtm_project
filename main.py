@@ -299,7 +299,7 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     k = len(orders_list)
     
     if not (result.success or result.status == 2):
-        return False, np.nan, np.nan, np.nan, np.nan, None, None, None
+        return False, np.nan, np.nan, np.nan, np.nan, None, None, None, np.nan
         
     D_diag = np.ones(num_params)
     current_beta_idx = k - 1
@@ -333,6 +333,12 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
             H_scaled[i, :] = (g_plus - g_minus) / (2.0 * eps_i)
             
         H_scaled = (H_scaled + H_scaled.T) / 2.0 
+        
+        try:
+            cond_num = np.linalg.cond(H_scaled)
+        except np.linalg.LinAlgError:
+            cond_num = np.inf
+            
         H_inv_scaled = np.linalg.pinv(H_scaled, rcond=1e-10) 
         
         grad_subj_scaled = calc_subject_gradients_jit(result.x, *args)
@@ -341,6 +347,7 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     except Exception:
         H_inv_scaled = np.eye(num_params)
         V_robust_scaled = np.eye(num_params)
+        cond_num = np.inf
         
     params_unscaled = D @ result.x
     V_model_unscaled = D @ H_inv_scaled @ D
@@ -359,7 +366,7 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     pis = np.exp(thetas - logsumexp(thetas))
     
     result.x = params_unscaled
-    return True, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis
+    return True, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis, cond_num
 
 def run_single_model(df, orders_list, use_dropout=False):
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
@@ -396,7 +403,7 @@ def run_single_model(df, orders_list, use_dropout=False):
         method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 3000, 'gtol': 1e-6}
     )
     
-    is_valid, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis = process_optimization_result(
+    is_valid, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis, cond_num = process_optimization_result(
         result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor
     )
     
@@ -405,7 +412,7 @@ def run_single_model(df, orders_list, use_dropout=False):
         'bic': bic_subj, 'bic_obs': bic_obs, 'aic': aic, 'll': ll, 
         'orders': orders_list, 'result': result, 'min_pct': min_group_size, 
         'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust,
-        'dof': n_obs - num_params
+        'dof': n_obs - num_params, 'cond_num': cond_num
     }
 
 def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False):
@@ -451,7 +458,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
             method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 3000, 'gtol': 1e-6}
         )
         
-        is_converged, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis = process_optimization_result(
+        is_converged, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis, cond_num = process_optimization_result(
             result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor
         )
         
@@ -461,10 +468,18 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
             is_valid = True
             dof = n_obs - num_params
             
-            if min_group_size < min_group_pct: 
+            # Mathematical Exclusion Criteria
+            if cond_num > 1e10:
+                status = "Rejected (Singular Matrix / Unidentifiable)"
+                is_valid = False
+            elif np.any(se_model < 1e-3) or np.any(se_model > 50):
+                status = "Rejected (Degenerate SE / Flat Likelihood)"
+                is_valid = False
+            elif min_group_size < min_group_pct: 
                 status = f"Rejected (Group Size < {min_group_pct}%)"
                 is_valid = False
             else:
+                # Significance Check
                 all_significant = True
                 current_beta_idx = k - 1
                 for g in range(k):
@@ -493,7 +508,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                 valid_models.append({
                     'bic': bic_subj, 'bic_obs': bic_obs, 'aic': aic, 'll': ll,
                     'orders': orders_list, 'result': result, 'min_pct': min_group_size, 
-                    'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust, 'dof': dof
+                    'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust, 'dof': dof, 'cond_num': cond_num
                 })
         else:
             all_evaluated_models.append({

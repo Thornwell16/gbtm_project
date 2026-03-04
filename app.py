@@ -276,6 +276,9 @@ else:
             winning_result = winning_model['result']
             winning_pis_raw = winning_model['pis'] 
             
+            if winning_model.get('cond_num', 0) > 1e10 or np.any(winning_model['se_model'] < 1e-3) or np.any(winning_model['se_model'] > 50):
+                st.warning("⚠️ **Warning: Unidentifiable Model Detected.** The information matrix is singular or standard errors are degenerate. The model has been overparameterized, making estimates and p-values unreliable. Consider reducing the number of groups.")
+            
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("BIC (N=Subj)", f"{winning_model['bic']:.2f}")
             col2.metric("BIC (N=Obs)", f"{winning_model['bic_obs']:.2f}")
