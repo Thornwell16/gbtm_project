@@ -289,7 +289,11 @@ else:
             col4.metric("Log-Likelihood", f"{winning_model['ll']:.2f}")
             col5.metric("Engine Time", f"{st.session_state.run_time:.2f}s")
             
-            st.markdown("##### ✏️ Customize Group Labels")
+            st.markdown("##### ✏️ Customize Plot Labels & Group Names")
+            col_lbl1, col_lbl2 = st.columns(2)
+            x_axis_label = col_lbl1.text_input("X-Axis Label", value="Time Period")
+            y_axis_label = col_lbl2.text_input("Y-Axis Label", value="Probability of Outcome")
+            
             cols = st.columns(len(winning_orders))
             group_names = []
             for g in range(len(winning_orders)):
@@ -350,7 +354,7 @@ else:
                                 g_obs = obs_means[obs_means['Assigned_Group'] == g+1]
                                 fig.add_trace(go.Scatter(x=g_obs['Time'], y=g_obs['Outcome'], mode='lines+markers+text', text=[f"{g+1}"]*len(g_obs), textposition="top center", line=dict(color=colors[g%len(colors)], width=2), name=f'{group_names[g]} (Obs.)'))
                                 
-                        fig.update_layout(yaxis_title="Probability", xaxis_title="Time", yaxis_range=[-0.1, 1.1], template="plotly_white")
+                        fig.update_layout(yaxis_title=y_axis_label, xaxis_title=x_axis_label, yaxis_range=[-0.1, 1.1], template="plotly_white")
                         st.plotly_chart(fig, use_container_width=True)
                     else:
                         fig, ax = plt.subplots(figsize=(8, 5))
@@ -379,8 +383,8 @@ else:
                                     ax.text(row['Time'], row['Outcome'] + 0.02, str(g+1), color=colors[g%len(colors)], ha='center')
                                     
                         ax.set_ylim(-0.1, 1.1)
-                        ax.set_ylabel("Probability of Outcome")
-                        ax.set_xlabel("Time Period")
+                        ax.set_ylabel(y_axis_label)
+                        ax.set_xlabel(x_axis_label)
                         ax.legend(frameon=False)
                         st.pyplot(fig)
                 
@@ -393,7 +397,9 @@ else:
                 st.download_button(label="📥 Download Parameter Estimates Table", data=csv_est, file_name='trajectory_parameters.csv', mime='text/csv')
                 
             with tab_adq:
-                st.dataframe(calc_model_adequacy(assignments_df, winning_pis_raw, group_names), use_container_width=True, hide_index=True)
+                adq_df, rel_entropy = calc_model_adequacy(assignments_df, winning_pis_raw, group_names)
+                st.metric(label="Relative Entropy (0-1)", value=f"{rel_entropy:.3f}", help="Measures how well the model separates the subpopulations. Values closer to 1 indicate better separation.")
+                st.dataframe(adq_df, use_container_width=True, hide_index=True)
 
             with tab_char:
                 if HAS_TABLEONE:
