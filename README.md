@@ -1,6 +1,8 @@
 # AutoTraj: Automated Group-Based Trajectory Modeling
 [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://YOUR_STREAMLIT_URL_HERE)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![DOI](https://zenodo.org/badge/1171103165.svg)](https://doi.org/10.5281/zenodo.18866776)
+
 
 AutoTraj is an open-source, high-performance Python engine for Group-Based Trajectory Modeling (GBTM). Designed for longitudinal epidemiology, it automates the exhaustive search, selection, and visualization of finite mixture models.
 
