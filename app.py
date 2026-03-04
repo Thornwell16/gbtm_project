@@ -197,6 +197,13 @@ else:
             st.success("Custom file uploaded successfully!")
         except Exception as e:
             st.error(f"Error loading file: {e}. If uploading SAS or Excel files, ensure 'pyreadstat' and 'openpyxl' are installed.")
+    elif st.session_state.use_sample_data:
+        try:
+            raw_df = pd.read_csv("cambridge.txt", sep=r'\s+', encoding='utf-8-sig')
+            raw_df.columns = [str(c).strip() for c in raw_df.columns]
+            st.success("Cambridge sample dataset loaded! (Note: Sample data is in Wide format. Use ID='ID', Out='C', Time='T')")
+        except Exception as e:
+            st.error("Could not locate cambridge.txt in the repository.")
 
     if raw_df is not None:
         button_label = "Run AutoTraj Search" if app_mode == "AutoTraj Search" else "Run Single Model"
@@ -260,6 +267,7 @@ else:
         long_df = st.session_state.long_df
         raw_df = st.session_state.raw_df
         use_dropout_state = st.session_state.use_dropout
+        run_time_val = st.session_state.run_time
         
         if top_models:
             st.divider()
@@ -281,12 +289,21 @@ else:
             if winning_model.get('cond_num', 0) > 1e10 or np.any(winning_model['se_model'] < 1e-3) or np.any(winning_model['se_model'] > 50):
                 st.warning("⚠️ **Warning: Unidentifiable Model Detected.** The information matrix is singular or standard errors are degenerate. The model has been overparameterized, making estimates and p-values unreliable. Consider reducing the number of groups.")
             
-            col1, col2, col3, col4, col5 = st.columns(5)
+            # Submetrics calculations
+            n_eval = len(all_evaluated) if all_evaluated else 1
+            mps = n_eval / run_time_val if run_time_val > 0 else 0
+            
+            # Assuming 5 minutes (300 seconds) manual work per model in SAS
+            manual_mins = n_eval * 5
+            manual_str = f"~{manual_mins} mins" if manual_mins < 60 else f"~{manual_mins/60:.1f} hrs"
+            
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
             col1.metric("BIC (N=Subj)", f"{winning_model['bic']:.2f}")
             col2.metric("BIC (N=Obs)", f"{winning_model['bic_obs']:.2f}")
             col3.metric("AIC", f"{winning_model['aic']:.2f}")
             col4.metric("Log-Likelihood", f"{winning_model['ll']:.2f}")
-            col5.metric("Engine Time", f"{st.session_state.run_time:.2f}s")
+            col5.metric("Engine Time", f"{run_time_val:.2f}s", f"{n_eval} models | {mps:.1f}/sec", delta_color="off")
+            col6.metric("Manual Proc Time", manual_str, "vs. SAS Syntax", delta_color="off")
             
             st.markdown("##### ✏️ Customize Plot Labels & Group Names")
             col_lbl1, col_lbl2 = st.columns(2)
