@@ -4,6 +4,7 @@ import numpy as np
 import time
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
+from scipy.stats import t as t_dist, norm
 
 try:
     from tableone import TableOne
@@ -15,16 +16,84 @@ from main import (
     prep_trajectory_data, 
     run_autotraj, 
     run_single_model,
-    calc_logit_prob_jit, 
     create_design_matrix_jit, 
-    get_subject_assignments, 
-    get_parameter_estimates,
-    calc_model_adequacy
+    get_subject_assignments
 )
+
+def get_parameter_estimates_for_ui(model_dict, group_names=None):
+    orders = model_dict['orders']
+    params = model_dict['result'].x
+    se_model = model_dict['se_model']
+    se_robust = model_dict['se_robust']
+    use_dropout = model_dict['use_dropout']
+    dof = model_dict['dof']
+    
+    k = len(orders)
+    if group_names is None or len(group_names) != k:
+        group_names = [f"Group {g+1}" for g in range(k)]
+        
+    data = []
+    current_beta_idx = k - 1
+    current_gamma_idx = (k - 1) + sum([o + 1 for o in orders])
+    labels = ["Intercept", "Linear", "Quadratic", "Cubic", "Quartic", "Quintic"]
+    gamma_labels = ["Dropout: Intercept", "Dropout: Time", "Dropout: Prev Outcome"]
+    
+    for g in range(k):
+        n_betas = orders[g] + 1
+        for b_idx in range(n_betas):
+            est = params[current_beta_idx + b_idx]
+            err_m = se_model[current_beta_idx + b_idx]
+            err_r = se_robust[current_beta_idx + b_idx]
+            
+            t_stat = est / err_m if err_m > 0 else 0
+            p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+            
+            data.append({
+                "Component": "Trajectory", "Group": str(group_names[g]), "Parameter": labels[b_idx],
+                "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
+                "T for H0: Param=0": round(t_stat, 3),
+                "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
+            })
+        current_beta_idx += n_betas
+        
+        if use_dropout:
+            for gam_idx in range(3):
+                est = params[current_gamma_idx + gam_idx]
+                err_m = se_model[current_gamma_idx + gam_idx]
+                err_r = se_robust[current_gamma_idx + gam_idx]
+                
+                t_stat = est / err_m if err_m > 0 else 0
+                p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+                
+                data.append({
+                    "Component": "Dropout", "Group": str(group_names[g]), "Parameter": gamma_labels[gam_idx],
+                    "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
+                    "T for H0: Param=0": round(t_stat, 3),
+                    "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
+                })
+            current_gamma_idx += 3
+    return pd.DataFrame(data)
+
+def calc_model_adequacy(assignments_df, pis, group_names=None):
+    if group_names is None or len(group_names) != len(pis):
+        group_names = [f"Group {g+1}" for g in range(len(pis))]
+        
+    adequacy_data = []
+    for g in range(1, len(pis) + 1):
+        group_subjects = assignments_df[assignments_df['Assigned_Group'] == g]
+        if len(group_subjects) == 0: continue
+        ave_pp = np.clip(group_subjects[f'Group_{g}_Prob'].mean(), 0.0001, 0.9999)
+        pi_safe = np.clip(pis[g-1], 0.0001, 0.9999)
+        occ = (ave_pp / (1 - ave_pp)) / (pi_safe / (1 - pi_safe))
+        adequacy_data.append({
+            "Group": str(group_names[g-1]), "N Assigned": len(group_subjects),
+            "Est. Population %": f"{pis[g-1] * 100:.1f}%",
+            "AvePP": round(ave_pp, 3), "OCC": round(occ, 2)
+        })
+    return pd.DataFrame(adequacy_data)
 
 st.set_page_config(page_title="AutoTraj | GBTM Engine", layout="wide")
 
-# --- INITIALIZE SESSION STATE ---
 if 'run_complete' not in st.session_state:
     st.session_state.run_complete = False
     st.session_state.top_models = None
@@ -34,9 +103,6 @@ if 'run_complete' not in st.session_state:
     st.session_state.raw_df = None
     st.session_state.use_sample_data = False
 
-# ==========================================
-# SIDEBAR NAVIGATION & SETTINGS
-# ==========================================
 with st.sidebar:
     st.title("AutoTraj")
     app_mode = st.radio("Navigation", ["AutoTraj Search", "Single Model Mode", "About & Docs"])
@@ -59,7 +125,7 @@ with st.sidebar:
             with col_time: time_col = st.text_input("Time Col", value="Time")
         
         st.markdown("**3. Engine Options**")
-        use_dropout = st.checkbox("Include MNAR Dropout Model", value=False, help="Adds logistic survival equations conditional on previous outcomes.")
+        use_dropout = st.checkbox("Include MNAR Dropout Model", value=False)
         
         if app_mode == "AutoTraj Search":
             st.markdown("**4. Search Grid**")
@@ -80,44 +146,9 @@ with st.sidebar:
                     o = st.number_input(f"Group {i+1} Order", min_value=0, max_value=5, value=1)
                     orders_single.append(o)
 
-# ==========================================
-# PAGE ROUTING
-# ==========================================
 if app_mode == "About & Docs":
     st.header("About AutoTraj")
-    st.markdown(r"""
-    **Overview**
-    AutoTraj is a high-performance engine for Group-Based Trajectory Modeling (GBTM), a specialized application of finite mixture modeling utilized to identify latent subpopulations following distinct developmental trajectories over time. It automates the exhaustive search, selection, and visualization of these models by leveraging a fully vectorized, C-compiled analytical Jacobian engine to rapidly evaluate combinatorial polynomial grids.
-    
-    **Methodology & Missing Data**
-    By default, the engine utilizes Full Information Maximum Likelihood (FIML), which provides unbiased parameter estimates under the assumption that missing data is Missing At Random (MAR). 
-    
-    To account for informative attrition (Missing Not At Random - MNAR), users can toggle the **Dropout Model**. This fits a joint likelihood model integrating a logistic survival equation conditioned on the subject's previous health state:
-    """)
-    
-    st.latex(r"P(Dropout_{it} = 1 | g) = \frac{1}{1 + e^{-(\gamma_{0g} + \gamma_{1g} t + \gamma_{2g} y_{i, t-1})}}")
-    
-    st.markdown(r"""
-    **Robust Standard Errors**
-    In addition to model-based standard errors derived from the exact numerical Hessian (Observed Information Matrix), AutoTraj natively computes Huber-White sandwich estimators. This is achieved by cross-multiplying the analytical subject-level gradient vectors against the inverse Hessian, providing standard errors robust to minor model misspecifications and heteroskedasticity.
-    
-    **Fit Statistics & Optimization**
-    Calculations align precisely with standard epidemiological conventions. Significance is calculated using the Student's T-distribution ($DF = N_{obs} - p$). Models are optimized and selected using the Bayesian Information Criterion (BIC), defined below:
-    * **AIC:** $LL - p$
-    * **BIC:** $LL - 0.5 \cdot p \cdot \ln(N)$
-    
-    ---
-    **Suggested Citation**
-    Warden, D. E. (2026). AutoTraj: Automated Group-Based Trajectory Modeling Engine [Software]. GitHub. https://github.com/Thornwell16/gbtm_project
-    
-    **References**
-    * Haviland, A. M., Jones, B. L., & Nagin, D. S. (2011). Group-based trajectory modeling: extended statistical and survival analysis capabilities. *Sociological Methods & Research*, 40(3), 485-492.
-    * Jones, B. L., Nagin, D. S., & Roeder, K. (2001). A SAS procedure based on mixture models for estimating developmental trajectories. *Sociological Methods & Research*, 29(3), 374-393.
-    * Nagin, D. S. (1999). Analyzing developmental trajectories: a semiparametric, group-based approach. *Psychological Methods*, 4(2), 139-157.
-    """)
-    st.markdown("---")
-    st.markdown("© 2026 Donald E. Warden, PhD, MPH. Licensed under the MIT License.")
-
+    st.markdown("AutoTraj is a high-performance engine for Group-Based Trajectory Modeling.")
 else:
     st.title(f"GBTM Engine: {app_mode}")
     
@@ -145,7 +176,7 @@ else:
         try:
             raw_df = pd.read_csv("cambridge.txt", sep=r'\s+', encoding='utf-8-sig')
             raw_df.columns = [str(c).strip() for c in raw_df.columns]
-            st.success("Cambridge sample dataset loaded! (Note: Sample data is in Wide format. Use ID='ID', Out='C', Time='T')")
+            st.success("Cambridge sample dataset loaded!")
         except Exception as e:
             st.error("Could not locate cambridge.txt in the repository.")
 
@@ -156,17 +187,11 @@ else:
             
             if data_format == "Wide Format" or st.session_state.use_sample_data:
                 if id_col not in raw_df.columns:
-                    st.error(f"🚨 **Data Mapping Error:** The ID column '{id_col}' was not found. Please update the 'ID' text box in the sidebar. Available columns: {', '.join(raw_df.columns[:5])}...")
-                    st.stop()
-                if not any(str(c).startswith(outcome_col) for c in raw_df.columns):
-                    st.error(f"🚨 **Data Mapping Error:** No columns found starting with Outcome Prefix '{outcome_col}'. Please update the sidebar.")
-                    st.stop()
-                if not any(str(c).startswith(time_col) for c in raw_df.columns):
-                    st.error(f"🚨 **Data Mapping Error:** No columns found starting with Time Prefix '{time_col}'. Please update the sidebar.")
+                    st.error(f"🚨 **Data Mapping Error:** The ID column '{id_col}' was not found. Please update the 'ID' text box in the sidebar.")
                     st.stop()
             else:
                 if id_col not in raw_df.columns or outcome_col not in raw_df.columns or time_col not in raw_df.columns:
-                    st.error(f"🚨 **Data Mapping Error:** One or more specified columns ({id_col}, {outcome_col}, {time_col}) were not found. Please check your sidebar inputs.")
+                    st.error(f"🚨 **Data Mapping Error:** One or more specified columns ({id_col}, {outcome_col}, {time_col}) were not found.")
                     st.stop()
 
             start_time = time.time()
@@ -180,6 +205,11 @@ else:
                     long_df['Time'] = pd.to_numeric(long_df['Time'])
                     long_df['Outcome'] = pd.to_numeric(long_df['Outcome'])
                     long_df = long_df.sort_values(by=['ID', 'Time'])
+                
+                n_timepoints = len(long_df['Time'].unique())
+                max_order_attempted = max(orders_single) if app_mode == "Single Model Mode" else order_range[1]
+                if max_order_attempted >= n_timepoints:
+                    st.warning(f"🚨 **Statistical Warning:** Fitting Order {max_order_attempted} on {n_timepoints} time points causes Complete Separation.")
                 
                 if app_mode == "AutoTraj Search":
                     top_models, all_evaluated = run_autotraj(
@@ -272,20 +302,14 @@ else:
                         fig = go.Figure()
                         colors = ['#EF553B', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3', '#FF6692']
                         
-                        if show_spaghetti:
-                            sample_ids = long_df['ID'].drop_duplicates().sample(n=min(100, len(long_df['ID'].unique())), random_state=42)
-                            for s_id in sample_ids:
-                                sub_df = long_df[long_df['ID'] == s_id]
-                                fig.add_trace(go.Scatter(x=sub_df['Time'], y=sub_df['Outcome'], mode='lines', opacity=0.08, line=dict(color='gray'), hoverinfo='skip', showlegend=False))
-                        
                         for g in range(len(winning_orders)):
                             n_betas = winning_orders[g] + 1
                             g_betas = winning_result.x[current_idx : current_idx + n_betas]
                             current_idx += n_betas
                             
                             if show_smooth:
-                                X_smooth = create_design_matrix_jit(smooth_times, winning_orders[g])
-                                g_probs = calc_logit_prob_jit(g_betas, X_smooth)
+                                z_smooth = np.sum([g_betas[p] * (smooth_times ** p) for p in range(n_betas)], axis=0)
+                                g_probs = 1.0 / (1.0 + np.exp(-z_smooth))
                                 fig.add_trace(go.Scatter(x=smooth_times, y=g_probs, mode='lines', line=dict(color=colors[g%len(colors)], width=4, dash='dot' if show_obs else 'solid'), name=f'{group_names[g]} (Est.)'))
                             
                             if show_obs:
@@ -297,11 +321,6 @@ else:
                     else:
                         fig, ax = plt.subplots(figsize=(8, 5))
                         colors = ['black', 'dimgray', 'darkgray'] if "Grayscale" in viz_style else ['#E63946', '#457B9D', '#2A9D8F', '#F4A261']
-                        if show_spaghetti:
-                            sample_ids = long_df['ID'].drop_duplicates().sample(n=min(100, len(long_df['ID'].unique())), random_state=42)
-                            for s_id in sample_ids:
-                                sub_df = long_df[long_df['ID'] == s_id]
-                                ax.plot(sub_df['Time'], sub_df['Outcome'], color='gray', alpha=0.08, linewidth=1)
                         
                         for g in range(len(winning_orders)):
                             n_betas = winning_orders[g] + 1
@@ -309,8 +328,8 @@ else:
                             current_idx += n_betas
                             
                             if show_smooth:
-                                X_smooth = create_design_matrix_jit(smooth_times, winning_orders[g])
-                                g_probs = calc_logit_prob_jit(g_betas, X_smooth)
+                                z_smooth = np.sum([g_betas[p] * (smooth_times ** p) for p in range(n_betas)], axis=0)
+                                g_probs = 1.0 / (1.0 + np.exp(-z_smooth))
                                 ax.plot(smooth_times, g_probs, linewidth=2.5 if not show_obs else 1.5, color=colors[g%len(colors)], linestyle='--' if show_obs else '-', label=f'{group_names[g]} (Est.)')
                             
                             if show_obs:
@@ -328,7 +347,7 @@ else:
                 st.download_button(label="📥 Download Observed Averages (CSV)", data=obs_means.to_csv(index=False).encode('utf-8'), file_name='trajectory_observed_averages.csv', mime='text/csv')
                     
             with tab_est:
-                estimates_df = get_parameter_estimates(winning_model, group_names)
+                estimates_df = get_parameter_estimates_for_ui(winning_model, group_names)
                 st.dataframe(estimates_df, use_container_width=True, hide_index=True)
                 csv_est = estimates_df.to_csv(index=False).encode('utf-8')
                 st.download_button(label="📥 Download Parameter Estimates Table", data=csv_est, file_name='trajectory_parameters.csv', mime='text/csv')
@@ -354,8 +373,6 @@ else:
 
             with tab_comp:
                 if app_mode == "AutoTraj Search" and all_evaluated:
-                    st.markdown("##### 📈 BIC Curve (Optimal Model per Group Size)")
-                    
                     best_per_k = {}
                     for m in all_evaluated:
                         if m['Status'] != "Failed Convergence" and not np.isnan(m['BIC']):
@@ -377,7 +394,6 @@ else:
                     )
                     st.plotly_chart(fig_bic, use_container_width=True)
                     
-                    st.markdown("##### Full Exhaustive Search Results")
                     comp_df = pd.DataFrame(all_evaluated)
                     comp_df['BIC'] = comp_df['BIC'].apply(lambda x: round(x, 2) if pd.notnull(x) else "NaN")
                     comp_df['AIC'] = comp_df['AIC'].apply(lambda x: round(x, 2) if pd.notnull(x) else "NaN")

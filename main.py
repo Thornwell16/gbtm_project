@@ -2,9 +2,8 @@ import pandas as pd
 import numpy as np
 from scipy.optimize import minimize
 from scipy.special import logsumexp
-from scipy.stats import norm, t as t_dist
+from scipy.stats import t as t_dist
 import itertools
-import argparse
 from numba import njit
 
 def load_cambridge_data():
@@ -37,7 +36,7 @@ def extract_flat_arrays(df):
             dropouts[end_idx] = 1.0 
     return times, outcomes, dropouts, subj_breaks
 
-@njit(cache=True)
+@njit
 def create_design_matrix_jit(times, order):
     n = len(times)
     X = np.empty((n, order + 1))
@@ -45,7 +44,7 @@ def create_design_matrix_jit(times, order):
         for p in range(order + 1): X[i, p] = times[i] ** p
     return X
 
-@njit(cache=True)
+@njit
 def calc_logit_prob_jit(betas, X):
     z = X @ betas 
     probs = np.empty_like(z)
@@ -56,14 +55,14 @@ def calc_logit_prob_jit(betas, X):
             probs[i] = exp_z / (1.0 + exp_z)
     return probs
 
-@njit(cache=True)
+@njit
 def logsumexp_jit(a):
     max_val = np.max(a)
     sum_exp = 0.0
     for i in range(len(a)): sum_exp += np.exp(a[i] - max_val)
     return max_val + np.log(sum_exp)
 
-@njit(cache=True)
+@njit
 def calc_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout):
     k = len(orders)
     thetas = np.zeros(k)
@@ -109,16 +108,18 @@ def calc_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders,
                 
                 z = 0.0
                 for p in range(order + 1): z += group_betas[p] * (t_val ** p)
-                prob = 1.0 / (1.0 + np.exp(-z)) if z >= 0 else np.exp(z) / (1.0 + np.exp(z))
-                prob = max(1e-10, min(1.0 - 1e-10, prob))
-                ll_g += (y_val * np.log(prob)) + ((1.0 - y_val) * np.log(1.0 - prob))
+                
+                # Unconditionally stable log-likelihood formulation
+                if z >= 0:
+                    ll_g += y_val * z - (z + np.log(1.0 + np.exp(-z)))
+                else:
+                    ll_g += y_val * z - np.log(1.0 + np.exp(z))
                 
                 if use_dropout and obs > 0:
                     y_prev = outcomes[idx - 1]
                     z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
-                    p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
-                    p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
-                    ll_g += np.log(1.0 - p_drop) 
+                    if z_drop >= 0: ll_g += -z_drop - np.log(1.0 + np.exp(-z_drop))
+                    else: ll_g += -np.log(1.0 + np.exp(z_drop))
                     
             if use_dropout:
                 last_idx = end - 1
@@ -126,16 +127,20 @@ def calc_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders,
                     t_last = times[last_idx]
                     y_last = outcomes[last_idx]
                     z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
-                    p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
-                    p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
-                    ll_g += np.log(p_drop) 
+                    if z_drop >= 0: ll_g += -np.log(1.0 + np.exp(-z_drop))
+                    else: ll_g += z_drop - np.log(1.0 + np.exp(z_drop))
                 
             subject_group_lls[g] = log_pis[g] + ll_g
         total_ll += logsumexp_jit(subject_group_lls)
         
-    return -1.0 * total_ll
+    # SAS Ridge Penalty (L2) prevents parameters from wandering to -infinity
+    penalty = 0.0
+    for i in range(len(params)):
+        penalty += params[i] * params[i]
+        
+    return -1.0 * total_ll + 1e-5 * penalty
 
-@njit(cache=True)
+@njit
 def calc_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout):
     k = len(orders)
     thetas = np.zeros(k)
@@ -190,16 +195,16 @@ def calc_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, o
                 z = 0.0
                 for p in range(order + 1): z += group_betas[p] * (t_val ** p)
                 prob = 1.0 / (1.0 + np.exp(-z)) if z >= 0 else np.exp(z) / (1.0 + np.exp(z))
-                prob = max(1e-10, min(1.0 - 1e-10, prob))
                 p_ig[g, obs] = prob
-                ll_g += (y_val * np.log(prob)) + ((1.0 - y_val) * np.log(1.0 - prob))
+                
+                if z >= 0: ll_g += y_val * z - (z + np.log(1.0 + np.exp(-z)))
+                else: ll_g += y_val * z - np.log(1.0 + np.exp(z))
                 
                 if use_dropout and obs > 0:
                     y_prev = outcomes[idx - 1]
                     z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
-                    p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
-                    p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
-                    ll_g += np.log(1.0 - p_drop)
+                    if z_drop >= 0: ll_g += -z_drop - np.log(1.0 + np.exp(-z_drop))
+                    else: ll_g += -np.log(1.0 + np.exp(z_drop))
                     
             if use_dropout:
                 last_idx = end - 1
@@ -207,9 +212,8 @@ def calc_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, o
                     t_last = times[last_idx]
                     y_last = outcomes[last_idx]
                     z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
-                    p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
-                    p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
-                    ll_g += np.log(p_drop)
+                    if z_drop >= 0: ll_g += -np.log(1.0 + np.exp(-z_drop))
+                    else: ll_g += z_drop - np.log(1.0 + np.exp(z_drop))
                 
             L_ig_log[g] = ll_g
             
@@ -268,23 +272,21 @@ def calc_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, o
             
     return grad_subj
 
-@njit(cache=True)
+@njit
 def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout):
     grad_subj = calc_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout)
     grad_flat = np.zeros(len(params))
     for i in range(grad_subj.shape[0]):
         for j in range(grad_subj.shape[1]):
             grad_flat[j] += grad_subj[i, j]
+    
+    # Derivative of SAS Ridge Penalty
+    for j in range(len(params)):
+        grad_flat[j] += 2.0 * 1e-5 * params[j]
+        
     return grad_flat
 
-def calculate_fit_stats(result, n_params, n_subjects, n_obs):
-    ll = -1 * result.fun
-    aic = ll - n_params
-    bic_subj = ll - 0.5 * n_params * np.log(n_subjects)
-    bic_obs = ll - 0.5 * n_params * np.log(n_obs)
-    return ll, aic, bic_subj, bic_obs
-
-def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout):
+def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor):
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
     orders_arr = np.array(orders_list, dtype=np.int32)
@@ -293,10 +295,26 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     if not (result.success or result.status == 2):
         return False, np.nan, np.nan, np.nan, np.nan, None, None, None
         
+    D_diag = np.ones(num_params)
+    current_beta_idx = k - 1
+    for g in range(k):
+        for p in range(orders_list[g] + 1):
+            D_diag[current_beta_idx + p] = 1.0 / (scale_factor ** p)
+        current_beta_idx += orders_list[g] + 1
+        
+    if use_dropout:
+        current_gamma_idx = current_beta_idx
+        for g in range(k):
+            D_diag[current_gamma_idx + 1] = 1.0 / scale_factor
+            current_gamma_idx += 3
+    D = np.diag(D_diag)
+    
     try:
-        args = (times, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
-        H = np.zeros((num_params, num_params))
-        eps = 1e-5
+        times_scaled = times / scale_factor
+        args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
+        
+        H_scaled = np.zeros((num_params, num_params))
+        eps = 1e-4
         for i in range(num_params):
             p_plus = np.copy(result.x)
             p_minus = np.copy(result.x)
@@ -304,32 +322,40 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
             p_minus[i] -= eps
             g_plus = calc_dynamic_jacobian_jit(p_plus, *args)
             g_minus = calc_dynamic_jacobian_jit(p_minus, *args)
-            H[i, :] = (g_plus - g_minus) / (2.0 * eps)
+            H_scaled[i, :] = (g_plus - g_minus) / (2.0 * eps)
             
-        H = (H + H.T) / 2.0 
-        H += np.eye(num_params) * 1e-5 
-        H_inv = np.linalg.pinv(H) 
+        H_scaled = (H_scaled + H_scaled.T) / 2.0 
+        H_scaled += np.eye(num_params) * 1e-5 # Final guarantee against complete separation
+        H_inv_scaled = np.linalg.pinv(H_scaled) 
         
-        grad_subj = calc_subject_gradients_jit(result.x, *args)
-        G = grad_subj.T @ grad_subj
-        V_robust = H_inv @ G @ H_inv
+        grad_subj_scaled = calc_subject_gradients_jit(result.x, *args)
+        G_scaled = grad_subj_scaled.T @ grad_subj_scaled
+        V_robust_scaled = H_inv_scaled @ G_scaled @ H_inv_scaled
     except Exception as e:
-        H_inv = np.eye(num_params)
-        V_robust = np.eye(num_params)
+        H_inv_scaled = np.eye(num_params)
+        V_robust_scaled = np.eye(num_params)
         
-    se_model = np.sqrt(np.abs(np.diag(H_inv)))
-    se_robust = np.sqrt(np.abs(np.diag(V_robust)))
+    params_unscaled = D @ result.x
+    V_model_unscaled = D @ H_inv_scaled @ D
+    V_robust_unscaled = D @ V_robust_scaled @ D
     
-    ll = -1 * result.fun
-    aic = ll - num_params
-    bic_subj = ll - 0.5 * num_params * np.log(n_subjects)
-    bic_obs = ll - 0.5 * num_params * np.log(n_obs)
+    se_model = np.sqrt(np.abs(np.diag(V_model_unscaled)))
+    se_robust = np.sqrt(np.abs(np.diag(V_robust_unscaled)))
+    
+    # Remove penalty from final reported statistics
+    penalty = sum([val * val for val in result.x])
+    true_ll = -1.0 * result.fun + 1e-5 * penalty
+    
+    aic = true_ll - num_params
+    bic_subj = true_ll - 0.5 * num_params * np.log(n_subjects)
+    bic_obs = true_ll - 0.5 * num_params * np.log(n_obs)
     
     thetas = np.zeros(k)
-    if k > 1: thetas[1:] = result.x[0 : k-1]
+    if k > 1: thetas[1:] = params_unscaled[0 : k-1]
     pis = np.exp(thetas - logsumexp(thetas))
     
-    return True, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis
+    result.x = params_unscaled
+    return True, true_ll, aic, bic_subj, bic_obs, se_model, se_robust, pis
 
 def run_single_model(df, orders_list, use_dropout=False):
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
@@ -337,14 +363,21 @@ def run_single_model(df, orders_list, use_dropout=False):
     n_obs = len(times)
     _ = create_design_matrix_jit(np.array([1.0]), 1)
     
+    max_t = np.max(np.abs(times))
+    scale_factor = max_t if max_t > 0 else 1.0
+    times_scaled = times / scale_factor
+    
     orders_arr = np.array(orders_list, dtype=np.int32)
     k = len(orders_list)
     num_params = (k - 1) + sum([order + 1 for order in orders_list])
     if use_dropout: num_params += (3 * k)
     initial_guess = np.zeros(num_params)
     
+    # SAS EXACT INITIALIZATION: Evenly spaces trajectories across probability space
+    p_init = np.linspace(1.0 / (k + 1.0), k * 1.0 / (k + 1.0), k) if k > 1 else [0.5]
+    staggered_intercepts = np.log(p_init / (1.0 - np.array(p_init)))
+    
     current_beta_idx = k - 1
-    staggered_intercepts = np.linspace(-3.0, 3.0, k) if k > 1 else [0.0]
     for g in range(k):
         initial_guess[current_beta_idx] = staggered_intercepts[g]
         current_beta_idx += orders_list[g] + 1
@@ -356,12 +389,12 @@ def run_single_model(df, orders_list, use_dropout=False):
             current_gamma_idx += 3
     
     result = minimize(
-        calc_dynamic_nll_jit, initial_guess, args=(times, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
-        method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 3000, 'gtol': 1e-5}
+        calc_dynamic_nll_jit, initial_guess, args=(times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
+        method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 3000, 'gtol': 1e-8}
     )
     
     is_valid, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis = process_optimization_result(
-        result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout
+        result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor
     )
     
     min_group_size = np.min(pis) * 100 if is_valid else np.nan
@@ -369,7 +402,7 @@ def run_single_model(df, orders_list, use_dropout=False):
         'bic': bic_subj, 'bic_obs': bic_obs, 'aic': aic, 'll': ll, 
         'orders': orders_list, 'result': result, 'min_pct': min_group_size, 
         'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust,
-        'dof': n_obs - num_params 
+        'dof': n_obs - num_params
     }
 
 def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False):
@@ -379,6 +412,10 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
     _ = create_design_matrix_jit(np.array([1.0]), 1)
+    
+    max_t = np.max(np.abs(times))
+    scale_factor = max_t if max_t > 0 else 1.0
+    times_scaled = times / scale_factor
     
     all_combinations = []
     for k in range(min_groups, max_groups + 1):
@@ -392,8 +429,10 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         if use_dropout: num_params += (3 * k)
         initial_guess = np.zeros(num_params)
         
+        p_init = np.linspace(1.0 / (k + 1.0), k * 1.0 / (k + 1.0), k) if k > 1 else [0.5]
+        staggered_intercepts = np.log(p_init / (1.0 - np.array(p_init)))
+        
         current_beta_idx = k - 1
-        staggered_intercepts = np.linspace(-3.0, 3.0, k) if k > 1 else [0.0]
         for g in range(k):
             initial_guess[current_beta_idx] = staggered_intercepts[g]
             current_beta_idx += orders_list[g] + 1
@@ -405,19 +444,18 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                 current_gamma_idx += 3
         
         result = minimize(
-            calc_dynamic_nll_jit, initial_guess, args=(times, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
-            method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 3000, 'gtol': 1e-5}
+            calc_dynamic_nll_jit, initial_guess, args=(times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
+            method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 3000, 'gtol': 1e-8}
         )
         
         is_converged, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis = process_optimization_result(
-            result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout
+            result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor
         )
         
         if is_converged:
             min_group_size = np.min(pis) * 100
             status = ""
             is_valid = True
-            
             dof = n_obs - num_params
             
             if min_group_size < min_group_pct: 
@@ -511,14 +549,14 @@ def get_subject_assignments(model_dict, df):
                 y_val = outcomes[idx]
                 z = sum(group_betas[p] * (t_val ** p) for p in range(orders[g] + 1))
                 prob = 1.0 / (1.0 + np.exp(-z)) if z >= 0 else np.exp(z) / (1.0 + np.exp(z))
-                prob = max(1e-10, min(1.0 - 1e-10, prob))
+                prob = max(1e-12, min(1.0 - 1e-12, prob))
                 ll_g += y_val * np.log(prob) + (1.0 - y_val) * np.log(1.0 - prob)
                 
                 if use_dropout and obs > 0:
                     y_prev = outcomes[idx - 1]
                     z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
                     p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
-                    p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
+                    p_drop = max(1e-12, min(1.0 - 1e-12, p_drop))
                     ll_g += np.log(1.0 - p_drop)
                     
             if use_dropout:
@@ -528,7 +566,7 @@ def get_subject_assignments(model_dict, df):
                     y_last = outcomes[last_idx]
                     z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
                     p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
-                    p_drop = max(1e-10, min(1.0 - 1e-10, p_drop))
+                    p_drop = max(1e-12, min(1.0 - 1e-12, p_drop))
                     ll_g += np.log(p_drop)
                 
             L_ig_log[g] = ll_g
@@ -543,78 +581,3 @@ def get_subject_assignments(model_dict, df):
         assignments.append(row)
         
     return pd.DataFrame(assignments)
-
-def get_parameter_estimates(model_dict, group_names=None):
-    orders = model_dict['orders']
-    params = model_dict['result'].x
-    se_model = model_dict['se_model']
-    se_robust = model_dict['se_robust']
-    use_dropout = model_dict['use_dropout']
-    dof = model_dict['dof']
-    
-    k = len(orders)
-    if group_names is None or len(group_names) != k:
-        group_names = [f"Group {g+1}" for g in range(k)]
-        
-    data = []
-    current_beta_idx = k - 1
-    current_gamma_idx = (k - 1) + sum([o + 1 for o in orders])
-    labels = ["Intercept", "Linear", "Quadratic", "Cubic", "Quartic", "Quintic"]
-    gamma_labels = ["Dropout: Intercept", "Dropout: Time", "Dropout: Prev Outcome"]
-    
-    for g in range(k):
-        n_betas = orders[g] + 1
-        for b_idx in range(n_betas):
-            est = params[current_beta_idx + b_idx]
-            err_m = se_model[current_beta_idx + b_idx]
-            err_r = se_robust[current_beta_idx + b_idx]
-            
-            t_stat = est / err_m if err_m > 0 else 0
-            p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
-            
-            data.append({
-                "Component": "Trajectory", "Group": str(group_names[g]), "Parameter": labels[b_idx],
-                "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
-                "T for H0: Param=0": round(t_stat, 3),
-                "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
-            })
-        current_beta_idx += n_betas
-        
-        if use_dropout:
-            for gam_idx in range(3):
-                est = params[current_gamma_idx + gam_idx]
-                err_m = se_model[current_gamma_idx + gam_idx]
-                err_r = se_robust[current_gamma_idx + gam_idx]
-                
-                t_stat = est / err_m if err_m > 0 else 0
-                p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
-                
-                data.append({
-                    "Component": "Dropout", "Group": str(group_names[g]), "Parameter": gamma_labels[gam_idx],
-                    "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
-                    "T for H0: Param=0": round(t_stat, 3),
-                    "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
-                })
-            current_gamma_idx += 3
-    return pd.DataFrame(data)
-
-def calc_model_adequacy(assignments_df, pis, group_names=None):
-    if group_names is None or len(group_names) != len(pis):
-        group_names = [f"Group {g+1}" for g in range(len(pis))]
-        
-    adequacy_data = []
-    for g in range(1, len(pis) + 1):
-        group_subjects = assignments_df[assignments_df['Assigned_Group'] == g]
-        if len(group_subjects) == 0: continue
-        ave_pp = np.clip(group_subjects[f'Group_{g}_Prob'].mean(), 0.0001, 0.9999)
-        pi_safe = np.clip(pis[g-1], 0.0001, 0.9999)
-        occ = (ave_pp / (1 - ave_pp)) / (pi_safe / (1 - pi_safe))
-        adequacy_data.append({
-            "Group": str(group_names[g-1]), "N Assigned": len(group_subjects),
-            "Est. Population %": f"{pis[g-1] * 100:.1f}%",
-            "AvePP": round(ave_pp, 3), "OCC": round(occ, 2)
-        })
-    return pd.DataFrame(adequacy_data)
-
-if __name__ == "__main__":
-    pass
