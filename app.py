@@ -145,6 +145,9 @@ if app_mode == "About & Docs":
     st.latex(r"P(Dropout_{it} = 1 | g) = \frac{1}{1 + e^{-(\gamma_{0g} + \gamma_{1g} t + \gamma_{2g} y_{i, t-1})}}")
     
     st.markdown(r"""
+    **Mathematical Safeguards & Model Identifiability**
+    Unlike standard statistical packages that may output estimates for overparameterized or unidentifiable models, AutoTraj utilizes strict mathematical exclusion criteria during the automated search phase. By actively calculating the condition number of the scaled Hessian matrix, the engine automatically rejects models that produce singular information matrices (flat likelihood surfaces) or degenerate standard errors, protecting against artificial significance caused by algorithmic bounds.
+
     **Robust Standard Errors**
     In addition to model-based standard errors derived from the exact numerical Hessian (Observed Information Matrix), AutoTraj natively computes Huber-White sandwich estimators. This is achieved by cross-multiplying the analytical subject-level gradient vectors against the inverse Hessian, providing standard errors robust to minor model misspecifications and heteroskedasticity.
     
