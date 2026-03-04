@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from scipy.optimize import minimize
 from scipy.special import logsumexp
-from scipy.stats import norm
+from scipy.stats import norm, t as t_dist
 import itertools
 import argparse
 from numba import njit
@@ -277,13 +277,6 @@ def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, or
             grad_flat[j] += grad_subj[i, j]
     return grad_flat
 
-def calculate_fit_stats(result, n_params, n_subjects, n_obs):
-    ll = -1 * result.fun
-    aic = ll - n_params
-    bic_subj = ll - 0.5 * n_params * np.log(n_subjects)
-    bic_obs = ll - 0.5 * n_params * np.log(n_obs)
-    return ll, aic, bic_subj, bic_obs
-
 def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor):
     """Handles High-Precision Hessian Computation, Unscaling, and Robust SE."""
     n_subjects = len(subj_breaks) - 1
@@ -309,7 +302,6 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     D = np.diag(D_diag)
     
     try:
-        # 1. HIGH-PRECISION NUMERICAL HESSIAN (Replaces BFGS Approximation)
         times_scaled = times / scale_factor
         args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
         H_scaled = np.zeros((num_params, num_params))
@@ -323,10 +315,9 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
             g_minus = calc_dynamic_jacobian_jit(p_minus, *args)
             H_scaled[i, :] = (g_plus - g_minus) / (2.0 * eps)
             
-        H_scaled = (H_scaled + H_scaled.T) / 2.0 # Force symmetry
-        H_inv_scaled = np.linalg.pinv(H_scaled) # Pseudo-inverse for stability
+        H_scaled = (H_scaled + H_scaled.T) / 2.0 
+        H_inv_scaled = np.linalg.pinv(H_scaled) 
         
-        # 2. ROBUST SE (Sandwich)
         grad_subj_scaled = calc_subject_gradients_jit(result.x, *args)
         G_scaled = grad_subj_scaled.T @ grad_subj_scaled
         V_robust_scaled = H_inv_scaled @ G_scaled @ H_inv_scaled
@@ -334,7 +325,6 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
         H_inv_scaled = np.eye(num_params)
         V_robust_scaled = np.eye(num_params)
         
-    # 3. UNSCALE MATRICES
     params_unscaled = D @ result.x
     V_model_unscaled = D @ H_inv_scaled @ D
     V_robust_unscaled = D @ V_robust_scaled @ D
@@ -382,9 +372,10 @@ def run_single_model(df, orders_list, use_dropout=False):
             initial_guess[current_gamma_idx] = -2.0
             current_gamma_idx += 3
     
+    # Tightened gtol from 1e-5 to 1e-8 to exactly match SAS convergence tolerances
     result = minimize(
         calc_dynamic_nll_jit, initial_guess, args=(times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
-        method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 2000, 'gtol': 1e-5}
+        method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 2500, 'gtol': 1e-8}
     )
     
     is_valid, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis = process_optimization_result(
@@ -395,7 +386,8 @@ def run_single_model(df, orders_list, use_dropout=False):
     return {
         'bic': bic_subj, 'bic_obs': bic_obs, 'aic': aic, 'll': ll, 
         'orders': orders_list, 'result': result, 'min_pct': min_group_size, 
-        'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust
+        'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust,
+        'dof': n_obs - num_params
     }
 
 def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False):
@@ -436,7 +428,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         
         result = minimize(
             calc_dynamic_nll_jit, initial_guess, args=(times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
-            method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 2000, 'gtol': 1e-5}
+            method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 2500, 'gtol': 1e-8}
         )
         
         is_converged, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis = process_optimization_result(
@@ -448,6 +440,8 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
             status = ""
             is_valid = True
             
+            dof = n_obs - num_params
+            
             if min_group_size < min_group_pct: 
                 status = f"Rejected (Group Size < {min_group_pct}%)"
                 is_valid = False
@@ -458,8 +452,11 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                     n_betas = orders_list[g] + 1
                     highest_est = result.x[current_beta_idx + n_betas - 1]
                     highest_se = se_model[current_beta_idx + n_betas - 1]
-                    z_score = highest_est / highest_se if highest_se > 0 else 0
-                    if 2 * (1 - norm.cdf(abs(z_score))) >= p_val_thresh: all_significant = False
+                    t_stat = highest_est / highest_se if highest_se > 0 else 0
+                    
+                    # SAS-Matched T-Test Check
+                    p_value_t = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+                    if p_value_t >= p_val_thresh: all_significant = False
                     current_beta_idx += n_betas
                         
                 if not all_significant:
@@ -477,7 +474,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                 valid_models.append({
                     'bic': bic_subj, 'bic_obs': bic_obs, 'aic': aic, 'll': ll,
                     'orders': orders_list, 'result': result, 'min_pct': min_group_size, 
-                    'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust
+                    'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust, 'dof': dof
                 })
         else:
             all_evaluated_models.append({
@@ -575,6 +572,7 @@ def get_parameter_estimates(model_dict, group_names=None):
     se_model = model_dict['se_model']
     se_robust = model_dict['se_robust']
     use_dropout = model_dict['use_dropout']
+    dof = model_dict['dof']
     
     k = len(orders)
     if group_names is None or len(group_names) != k:
@@ -592,12 +590,16 @@ def get_parameter_estimates(model_dict, group_names=None):
             est = params[current_beta_idx + b_idx]
             err_m = se_model[current_beta_idx + b_idx]
             err_r = se_robust[current_beta_idx + b_idx]
-            z_score = est / err_m if err_m > 0 else 0
-            p_val = 2 * (1 - norm.cdf(abs(z_score)))
+            
+            # SAS-Matched T-Test
+            t_stat = est / err_m if err_m > 0 else 0
+            p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+            
             data.append({
                 "Component": "Trajectory", "Group": str(group_names[g]), "Parameter": labels[b_idx],
-                "Estimate": round(est, 5), "SE (Model)": round(err_m, 5), "SE (Robust)": round(err_r, 5),
-                "P-Value": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
+                "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
+                "T for H0: Param=0": round(t_stat, 3),
+                "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
             })
         current_beta_idx += n_betas
         
@@ -606,12 +608,16 @@ def get_parameter_estimates(model_dict, group_names=None):
                 est = params[current_gamma_idx + gam_idx]
                 err_m = se_model[current_gamma_idx + gam_idx]
                 err_r = se_robust[current_gamma_idx + gam_idx]
-                z_score = est / err_m if err_m > 0 else 0
-                p_val = 2 * (1 - norm.cdf(abs(z_score)))
+                
+                # SAS-Matched T-Test
+                t_stat = est / err_m if err_m > 0 else 0
+                p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+                
                 data.append({
                     "Component": "Dropout", "Group": str(group_names[g]), "Parameter": gamma_labels[gam_idx],
-                    "Estimate": round(est, 5), "SE (Model)": round(err_m, 5), "SE (Robust)": round(err_r, 5),
-                    "P-Value": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
+                    "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
+                    "T for H0: Param=0": round(t_stat, 3),
+                    "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
                 })
             current_gamma_idx += 3
     return pd.DataFrame(data)
