@@ -284,8 +284,8 @@ def calculate_fit_stats(result, n_params, n_subjects, n_obs):
     bic_obs = ll - 0.5 * n_params * np.log(n_obs)
     return ll, aic, bic_subj, bic_obs
 
-def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor):
-    """Calculates High-Precision Observed Information Matrix with Dynamic Epsilon."""
+def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout):
+    """Calculates Information Matrix with SAS Ridge Constant for Complete Separation."""
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
     orders_arr = np.array(orders_list, dtype=np.int32)
@@ -294,55 +294,36 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     if not (result.success or result.status == 2):
         return False, np.nan, np.nan, np.nan, np.nan, None, None, None
         
-    D_diag = np.ones(num_params)
-    current_beta_idx = k - 1
-    for g in range(k):
-        for p in range(orders_list[g] + 1):
-            D_diag[current_beta_idx + p] = 1.0 / (scale_factor ** p)
-        current_beta_idx += orders_list[g] + 1
-        
-    if use_dropout:
-        current_gamma_idx = current_beta_idx
-        for g in range(k):
-            D_diag[current_gamma_idx + 1] = 1.0 / scale_factor
-            current_gamma_idx += 3
-    D = np.diag(D_diag)
-    
     try:
-        # 1. Exact Numerical Hessian with dynamically scaling epsilon for multicollinearity
-        times_scaled = times / scale_factor
-        args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
-        
-        H_scaled = np.zeros((num_params, num_params))
+        # EXACT NUMERICAL HESSIAN
+        args = (times, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
+        H = np.zeros((num_params, num_params))
+        eps = 1e-5
         for i in range(num_params):
-            eps_i = 1e-5 * max(1.0, abs(result.x[i]))
-            if eps_i < 1e-8: eps_i = 1e-8
-            
             p_plus = np.copy(result.x)
             p_minus = np.copy(result.x)
-            p_plus[i] += eps_i
-            p_minus[i] -= eps_i
+            p_plus[i] += eps
+            p_minus[i] -= eps
             g_plus = calc_dynamic_jacobian_jit(p_plus, *args)
             g_minus = calc_dynamic_jacobian_jit(p_minus, *args)
-            H_scaled[i, :] = (g_plus - g_minus) / (2.0 * eps_i)
+            H[i, :] = (g_plus - g_minus) / (2.0 * eps)
             
-        H_scaled = (H_scaled + H_scaled.T) / 2.0 
-        H_inv_scaled = np.linalg.pinv(H_scaled) 
+        H = (H + H.T) / 2.0 
         
-        grad_subj_scaled = calc_subject_gradients_jit(result.x, *args)
-        G_scaled = grad_subj_scaled.T @ grad_subj_scaled
-        V_robust_scaled = H_inv_scaled @ G_scaled @ H_inv_scaled
+        # SAS RIDGE CONSTANT: Stops SEs from exploding to 1777 on separated groups
+        H += np.eye(num_params) * 1e-5 
+        H_inv = np.linalg.pinv(H) 
+        
+        # ROBUST ESTIMATOR
+        grad_subj = calc_subject_gradients_jit(result.x, *args)
+        G = grad_subj.T @ grad_subj
+        V_robust = H_inv @ G @ H_inv
     except Exception as e:
-        H_inv_scaled = np.eye(num_params)
-        V_robust_scaled = np.eye(num_params)
+        H_inv = np.eye(num_params)
+        V_robust = np.eye(num_params)
         
-    # 3. Mathematically Unscale the Covariance Matrices to real-world scale
-    params_unscaled = D @ result.x
-    V_model_unscaled = D @ H_inv_scaled @ D
-    V_robust_unscaled = D @ V_robust_scaled @ D
-    
-    se_model = np.sqrt(np.abs(np.diag(V_model_unscaled)))
-    se_robust = np.sqrt(np.abs(np.diag(V_robust_unscaled)))
+    se_model = np.sqrt(np.abs(np.diag(H_inv)))
+    se_robust = np.sqrt(np.abs(np.diag(V_robust)))
     
     ll = -1 * result.fun
     aic = ll - num_params
@@ -350,10 +331,9 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     bic_obs = ll - 0.5 * num_params * np.log(n_obs)
     
     thetas = np.zeros(k)
-    if k > 1: thetas[1:] = params_unscaled[0 : k-1]
+    if k > 1: thetas[1:] = result.x[0 : k-1]
     pis = np.exp(thetas - logsumexp(thetas))
     
-    result.x = params_unscaled
     return True, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis
 
 def run_single_model(df, orders_list, use_dropout=False):
@@ -361,10 +341,6 @@ def run_single_model(df, orders_list, use_dropout=False):
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
     _ = create_design_matrix_jit(np.array([1.0]), 1)
-    
-    max_t = np.max(np.abs(times))
-    scale_factor = max_t if max_t > 0 else 1.0
-    times_scaled = times / scale_factor
     
     orders_arr = np.array(orders_list, dtype=np.int32)
     k = len(orders_list)
@@ -385,12 +361,12 @@ def run_single_model(df, orders_list, use_dropout=False):
             current_gamma_idx += 3
     
     result = minimize(
-        calc_dynamic_nll_jit, initial_guess, args=(times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
-        method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 3000, 'gtol': 1e-8}
+        calc_dynamic_nll_jit, initial_guess, args=(times, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
+        method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 3000, 'gtol': 1e-5}
     )
     
     is_valid, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis = process_optimization_result(
-        result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor
+        result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout
     )
     
     min_group_size = np.min(pis) * 100 if is_valid else np.nan
@@ -408,10 +384,6 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
     _ = create_design_matrix_jit(np.array([1.0]), 1)
-    
-    max_t = np.max(np.abs(times))
-    scale_factor = max_t if max_t > 0 else 1.0
-    times_scaled = times / scale_factor
     
     all_combinations = []
     for k in range(min_groups, max_groups + 1):
@@ -438,12 +410,12 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                 current_gamma_idx += 3
         
         result = minimize(
-            calc_dynamic_nll_jit, initial_guess, args=(times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
-            method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 3000, 'gtol': 1e-8}
+            calc_dynamic_nll_jit, initial_guess, args=(times, outcomes, dropouts, subj_breaks, orders_arr, use_dropout),
+            method='BFGS', jac=calc_dynamic_jacobian_jit, options={'maxiter': 3000, 'gtol': 1e-5}
         )
         
         is_converged, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis = process_optimization_result(
-            result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor
+            result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout
         )
         
         if is_converged:
@@ -576,78 +548,3 @@ def get_subject_assignments(model_dict, df):
         assignments.append(row)
         
     return pd.DataFrame(assignments)
-
-def get_parameter_estimates(model_dict, group_names=None):
-    orders = model_dict['orders']
-    params = model_dict['result'].x
-    se_model = model_dict['se_model']
-    se_robust = model_dict['se_robust']
-    use_dropout = model_dict['use_dropout']
-    dof = model_dict['dof']
-    
-    k = len(orders)
-    if group_names is None or len(group_names) != k:
-        group_names = [f"Group {g+1}" for g in range(k)]
-        
-    data = []
-    current_beta_idx = k - 1
-    current_gamma_idx = (k - 1) + sum([o + 1 for o in orders])
-    labels = ["Intercept", "Linear", "Quadratic", "Cubic", "Quartic", "Quintic"]
-    gamma_labels = ["Dropout: Intercept", "Dropout: Time", "Dropout: Prev Outcome"]
-    
-    for g in range(k):
-        n_betas = orders[g] + 1
-        for b_idx in range(n_betas):
-            est = params[current_beta_idx + b_idx]
-            err_m = se_model[current_beta_idx + b_idx]
-            err_r = se_robust[current_beta_idx + b_idx]
-            
-            t_stat = est / err_m if err_m > 0 else 0
-            p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
-            
-            data.append({
-                "Component": "Trajectory", "Group": str(group_names[g]), "Parameter": labels[b_idx],
-                "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
-                "T for H0: Param=0": round(t_stat, 3),
-                "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
-            })
-        current_beta_idx += n_betas
-        
-        if use_dropout:
-            for gam_idx in range(3):
-                est = params[current_gamma_idx + gam_idx]
-                err_m = se_model[current_gamma_idx + gam_idx]
-                err_r = se_robust[current_gamma_idx + gam_idx]
-                
-                t_stat = est / err_m if err_m > 0 else 0
-                p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
-                
-                data.append({
-                    "Component": "Dropout", "Group": str(group_names[g]), "Parameter": gamma_labels[gam_idx],
-                    "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
-                    "T for H0: Param=0": round(t_stat, 3),
-                    "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
-                })
-            current_gamma_idx += 3
-    return pd.DataFrame(data)
-
-def calc_model_adequacy(assignments_df, pis, group_names=None):
-    if group_names is None or len(group_names) != len(pis):
-        group_names = [f"Group {g+1}" for g in range(len(pis))]
-        
-    adequacy_data = []
-    for g in range(1, len(pis) + 1):
-        group_subjects = assignments_df[assignments_df['Assigned_Group'] == g]
-        if len(group_subjects) == 0: continue
-        ave_pp = np.clip(group_subjects[f'Group_{g}_Prob'].mean(), 0.0001, 0.9999)
-        pi_safe = np.clip(pis[g-1], 0.0001, 0.9999)
-        occ = (ave_pp / (1 - ave_pp)) / (pi_safe / (1 - pi_safe))
-        adequacy_data.append({
-            "Group": str(group_names[g-1]), "N Assigned": len(group_subjects),
-            "Est. Population %": f"{pis[g-1] * 100:.1f}%",
-            "AvePP": round(ave_pp, 3), "OCC": round(occ, 2)
-        })
-    return pd.DataFrame(adequacy_data)
-
-if __name__ == "__main__":
-    pass
