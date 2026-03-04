@@ -4,7 +4,7 @@ import numpy as np
 import time
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
-from scipy.stats import t as t_dist, norm
+from scipy.stats import t as t_dist
 
 try:
     from tableone import TableOne
@@ -149,7 +149,7 @@ if app_mode == "About & Docs":
     In addition to model-based standard errors derived from the exact numerical Hessian (Observed Information Matrix), AutoTraj natively computes Huber-White sandwich estimators. This is achieved by cross-multiplying the analytical subject-level gradient vectors against the inverse Hessian, providing standard errors robust to minor model misspecifications and heteroskedasticity.
     
     **Fit Statistics & Optimization**
-    Calculations align precisely with standard epidemiological conventions. Significance is calculated using the Student's T-distribution ($DF = N_{obs} - p$). Models are optimized and selected using the Bayesian Information Criterion (BIC), defined below:
+    Calculations align precisely with standard epidemiological conventions. Significance is calculated using the Student's T-distribution ($DF = N_{obs} - p$) to match standard statistical reporting in developmental models. Models are optimized and selected using the Bayesian Information Criterion (BIC), defined below:
     * **AIC:** $LL - p$
     * **BIC:** $LL - 0.5 \cdot p \cdot \ln(N)$
     

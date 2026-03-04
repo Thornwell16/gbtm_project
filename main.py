@@ -591,3 +591,34 @@ def get_subject_assignments(model_dict, df):
         assignments.append(row)
         
     return pd.DataFrame(assignments)
+
+def calc_model_adequacy(assignments_df, pis, group_names):
+    k = len(pis)
+    adequacy_data = []
+    
+    for g in range(k):
+        group_num = g + 1
+        group_data = assignments_df[assignments_df['Assigned_Group'] == group_num]
+        n_assigned = len(group_data)
+        
+        if n_assigned > 0:
+            ave_pp = group_data[f'Group_{group_num}_Prob'].mean()
+        else:
+            ave_pp = np.nan
+            
+        pi_g = pis[g]
+        
+        if pd.notnull(ave_pp) and ave_pp < 1.0 and pi_g < 1.0 and pi_g > 0:
+            occ = (ave_pp / (1.0 - ave_pp)) / (pi_g / (1.0 - pi_g))
+        else:
+            occ = np.nan
+            
+        adequacy_data.append({
+            "Group": group_names[g],
+            "Assigned N": n_assigned,
+            "Estimated Pi (%)": round(pi_g * 100, 2),
+            "AvePP": round(ave_pp, 4) if pd.notnull(ave_pp) else "N/A",
+            "OCC": round(occ, 2) if pd.notnull(occ) else "N/A"
+        })
+        
+    return pd.DataFrame(adequacy_data)
