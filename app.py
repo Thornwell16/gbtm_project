@@ -18,8 +18,7 @@ from main import (
     run_single_model,
     calc_logit_prob_jit, 
     create_design_matrix_jit, 
-    get_subject_assignments, 
-    calc_model_adequacy
+    get_subject_assignments
 )
 
 def get_parameter_estimates_for_ui(model_dict, group_names=None):
