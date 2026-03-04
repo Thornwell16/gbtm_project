@@ -19,13 +19,65 @@ from main import (
     calc_logit_prob_jit, 
     create_design_matrix_jit, 
     get_subject_assignments, 
-    get_parameter_estimates,
     calc_model_adequacy
 )
 
+def get_parameter_estimates_for_ui(model_dict, group_names=None):
+    orders = model_dict['orders']
+    params = model_dict['result'].x
+    se_model = model_dict['se_model']
+    se_robust = model_dict['se_robust']
+    use_dropout = model_dict['use_dropout']
+    dof = model_dict['dof']
+    
+    k = len(orders)
+    if group_names is None or len(group_names) != k:
+        group_names = [f"Group {g+1}" for g in range(k)]
+        
+    data = []
+    current_beta_idx = k - 1
+    current_gamma_idx = (k - 1) + sum([o + 1 for o in orders])
+    labels = ["Intercept", "Linear", "Quadratic", "Cubic", "Quartic", "Quintic"]
+    gamma_labels = ["Dropout: Intercept", "Dropout: Time", "Dropout: Prev Outcome"]
+    
+    for g in range(k):
+        n_betas = orders[g] + 1
+        for b_idx in range(n_betas):
+            est = params[current_beta_idx + b_idx]
+            err_m = se_model[current_beta_idx + b_idx]
+            err_r = se_robust[current_beta_idx + b_idx]
+            
+            t_stat = est / err_m if err_m > 0 else 0
+            p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+            
+            data.append({
+                "Component": "Trajectory", "Group": str(group_names[g]), "Parameter": labels[b_idx],
+                "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
+                "T for H0: Param=0": round(t_stat, 3),
+                "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
+            })
+        current_beta_idx += n_betas
+        
+        if use_dropout:
+            for gam_idx in range(3):
+                est = params[current_gamma_idx + gam_idx]
+                err_m = se_model[current_gamma_idx + gam_idx]
+                err_r = se_robust[current_gamma_idx + gam_idx]
+                
+                t_stat = est / err_m if err_m > 0 else 0
+                p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+                
+                data.append({
+                    "Component": "Dropout", "Group": str(group_names[g]), "Parameter": gamma_labels[gam_idx],
+                    "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
+                    "T for H0: Param=0": round(t_stat, 3),
+                    "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
+                })
+            current_gamma_idx += 3
+    return pd.DataFrame(data)
+
 st.set_page_config(page_title="AutoTraj | GBTM Engine", layout="wide")
 
-# --- INITIALIZE SESSION STATE ---
 if 'run_complete' not in st.session_state:
     st.session_state.run_complete = False
     st.session_state.top_models = None
@@ -35,9 +87,6 @@ if 'run_complete' not in st.session_state:
     st.session_state.raw_df = None
     st.session_state.use_sample_data = False
 
-# ==========================================
-# SIDEBAR NAVIGATION & SETTINGS
-# ==========================================
 with st.sidebar:
     st.title("AutoTraj")
     app_mode = st.radio("Navigation", ["AutoTraj Search", "Single Model Mode", "About & Docs"])
@@ -60,7 +109,7 @@ with st.sidebar:
             with col_time: time_col = st.text_input("Time Col", value="Time")
         
         st.markdown("**3. Engine Options**")
-        use_dropout = st.checkbox("Include MNAR Dropout Model", value=False, help="Adds logistic survival equations conditional on previous outcomes.")
+        use_dropout = st.checkbox("Include MNAR Dropout Model", value=False)
         
         if app_mode == "AutoTraj Search":
             st.markdown("**4. Search Grid**")
@@ -81,9 +130,6 @@ with st.sidebar:
                     o = st.number_input(f"Group {i+1} Order", min_value=0, max_value=5, value=1)
                     orders_single.append(o)
 
-# ==========================================
-# PAGE ROUTING
-# ==========================================
 if app_mode == "About & Docs":
     st.header("About AutoTraj")
     st.markdown(r"""
@@ -329,7 +375,7 @@ else:
                 st.download_button(label="📥 Download Observed Averages (CSV)", data=obs_means.to_csv(index=False).encode('utf-8'), file_name='trajectory_observed_averages.csv', mime='text/csv')
                     
             with tab_est:
-                estimates_df = get_parameter_estimates(winning_model, group_names)
+                estimates_df = get_parameter_estimates_for_ui(winning_model, group_names)
                 st.dataframe(estimates_df, use_container_width=True, hide_index=True)
                 csv_est = estimates_df.to_csv(index=False).encode('utf-8')
                 st.download_button(label="📥 Download Parameter Estimates Table", data=csv_est, file_name='trajectory_parameters.csv', mime='text/csv')
