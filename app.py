@@ -29,6 +29,7 @@ def get_parameter_estimates_for_ui(model_dict, group_names=None):
     se_robust = model_dict['se_robust']
     use_dropout = model_dict['use_dropout']
     dof = model_dict['dof']
+    model_type = model_dict.get('dist', 'LOGIT')
     
     k = len(orders)
     if group_names is None or len(group_names) != k:
@@ -74,6 +75,23 @@ def get_parameter_estimates_for_ui(model_dict, group_names=None):
                     "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
                 })
             current_gamma_idx += 3
+            
+    if model_type == 'CNORM':
+        sigma_idx = len(params) - 1
+        est = np.exp(params[sigma_idx]) 
+        err_m = se_model[sigma_idx] * est 
+        err_r = se_robust[sigma_idx] * est
+        
+        t_stat = est / err_m if err_m > 0 else 0
+        p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+        
+        data.append({
+            "Component": "Variance", "Group": "All Groups", "Parameter": "Sigma (Standard Deviation)",
+            "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
+            "T for H0: Param=0": round(t_stat, 3),
+            "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
+        })
+            
     return pd.DataFrame(data)
 
 st.set_page_config(page_title="AutoTraj | GBTM Engine", layout="wide")
@@ -107,21 +125,36 @@ with st.sidebar:
             with col_id: id_col = st.text_input("ID Col", value="ID")
             with col_out: outcome_col = st.text_input("Out. Col", value="Outcome")
             with col_time: time_col = st.text_input("Time Col", value="Time")
+            
+        st.markdown("**3. Model Distribution**")
+        selected_dist = st.selectbox("Select Outcome Type:", ["LOGIT (Binary)", "CNORM (Continuous/Tobit)", "POISSON (Count - Coming V3.0)", "ZIP (Zero-Inflated - Coming V3.0)"])
+        dist_flag = selected_dist.split(" ")[0]
         
-        st.markdown("**3. Engine Options**")
+        cnorm_min = None
+        cnorm_max = None
+        if dist_flag == "CNORM":
+            st.markdown("*CNORM Scale Limits (Optional)*")
+            st.info("Leave blank to automatically use the dataset's observed min/max.")
+            col_c1, col_c2 = st.columns(2)
+            c_min_in = col_c1.text_input("Minimum", value="")
+            c_max_in = col_c2.text_input("Maximum", value="")
+            if c_min_in.strip() != "": cnorm_min = float(c_min_in)
+            if c_max_in.strip() != "": cnorm_max = float(c_max_in)
+        
+        st.markdown("**4. Engine Options**")
         use_dropout = st.checkbox("Include MNAR Dropout Model", value=False)
         
         if app_mode == "AutoTraj Search":
-            st.markdown("**4. Search Grid**")
+            st.markdown("**5. Search Grid**")
             group_range = st.slider("Min & Max Groups", 1, 8, (1, 3))
             order_range = st.slider("Min & Max Polynomial Order", 0, 5, (0, 2))
             
-            st.markdown("**5. Heuristic Rules**")
+            st.markdown("**6. Heuristic Rules**")
             min_pct = st.slider("Min Group Size (%)", 1.0, 15.0, 5.0, 0.5)
             p_val = st.number_input("P-Value Threshold", value=0.05, format="%.3f")
             
         elif app_mode == "Single Model Mode":
-            st.markdown("**4. Model Specifications**")
+            st.markdown("**5. Model Specifications**")
             k_single = st.number_input("Number of Groups", min_value=1, max_value=8, value=2)
             orders_single = []
             cols_ord = st.columns(2)
@@ -206,10 +239,15 @@ else:
             st.error("Could not locate cambridge.txt in the repository.")
 
     if raw_df is not None:
+        
         button_label = "Run AutoTraj Search" if app_mode == "AutoTraj Search" else "Run Single Model"
         
         if st.button(button_label, type="primary", use_container_width=True):
             
+            if dist_flag in ["POISSON", "ZIP"]:
+                st.error("🚨 **Distribution Not Yet Supported:** Poisson and ZIP models are currently in development for V3.0. Please select LOGIT or CNORM.")
+                st.stop()
+                
             if data_format == "Wide Format" or st.session_state.use_sample_data:
                 if id_col not in raw_df.columns:
                     st.error(f"🚨 **Data Mapping Error:** The ID column '{id_col}' was not found. Please update the 'ID' text box in the sidebar. Available columns: {', '.join(raw_df.columns[:5])}...")
@@ -246,10 +284,11 @@ else:
                     top_models, all_evaluated = run_autotraj(
                         long_df, min_groups=group_range[0], max_groups=group_range[1],
                         min_order=order_range[0], max_order=order_range[1],
-                        min_group_pct=min_pct, p_val_thresh=p_val, use_dropout=use_dropout
+                        min_group_pct=min_pct, p_val_thresh=p_val, use_dropout=use_dropout, 
+                        dist=dist_flag, cnorm_min=cnorm_min, cnorm_max=cnorm_max
                     )
                 else:
-                    single_res = run_single_model(long_df, orders_single, use_dropout=use_dropout)
+                    single_res = run_single_model(long_df, orders_single, use_dropout=use_dropout, dist=dist_flag, cnorm_min=cnorm_min, cnorm_max=cnorm_max)
                     top_models = [single_res] if single_res['result'].success or single_res['result'].status == 2 else []
                     all_evaluated = []
             
@@ -285,15 +324,14 @@ else:
             winning_orders = winning_model['orders']
             winning_result = winning_model['result']
             winning_pis_raw = winning_model['pis'] 
+            dist_type = winning_model.get('dist', 'LOGIT')
             
             if winning_model.get('cond_num', 0) > 1e10 or np.any(winning_model['se_model'] < 1e-3) or np.any(winning_model['se_model'] > 50):
                 st.warning("⚠️ **Warning: Unidentifiable Model Detected.** The information matrix is singular or standard errors are degenerate. The model has been overparameterized, making estimates and p-values unreliable. Consider reducing the number of groups.")
             
-            # Submetrics calculations
             n_eval = len(all_evaluated) if all_evaluated else 1
             mps = n_eval / run_time_val if run_time_val > 0 else 0
             
-            # Assuming 5 minutes (300 seconds) manual work per model in SAS
             manual_mins = n_eval * 5
             manual_str = f"~{manual_mins} mins" if manual_mins < 60 else f"~{manual_mins/60:.1f} hrs"
             
@@ -308,7 +346,8 @@ else:
             st.markdown("##### ✏️ Customize Plot Labels & Group Names")
             col_lbl1, col_lbl2 = st.columns(2)
             x_axis_label = col_lbl1.text_input("X-Axis Label", value="Time Period")
-            y_axis_label = col_lbl2.text_input("Y-Axis Label", value="Probability of Outcome")
+            default_y_label = "Probability of Outcome" if dist_type == 'LOGIT' else "Outcome Score"
+            y_axis_label = col_lbl2.text_input("Y-Axis Label", value=default_y_label)
             
             cols = st.columns(len(winning_orders))
             group_names = []
@@ -363,14 +402,18 @@ else:
                             
                             if show_smooth:
                                 X_smooth = create_design_matrix_jit(smooth_times, winning_orders[g])
-                                g_probs = calc_logit_prob_jit(g_betas, X_smooth)
+                                if dist_type == 'LOGIT':
+                                    g_probs = calc_logit_prob_jit(g_betas, X_smooth)
+                                else:
+                                    g_probs = X_smooth @ g_betas # Raw linear prediction for CNORM
                                 fig.add_trace(go.Scatter(x=smooth_times, y=g_probs, mode='lines', line=dict(color=colors[g%len(colors)], width=4, dash='dot' if show_obs else 'solid'), name=f'{group_names[g]} (Est.)'))
                             
                             if show_obs:
                                 g_obs = obs_means[obs_means['Assigned_Group'] == g+1]
                                 fig.add_trace(go.Scatter(x=g_obs['Time'], y=g_obs['Outcome'], mode='lines+markers+text', text=[f"{g+1}"]*len(g_obs), textposition="top center", line=dict(color=colors[g%len(colors)], width=2), name=f'{group_names[g]} (Obs.)'))
-                                
-                        fig.update_layout(yaxis_title=y_axis_label, xaxis_title=x_axis_label, yaxis_range=[-0.1, 1.1], template="plotly_white")
+                        
+                        y_range_val = [-0.1, 1.1] if dist_type == 'LOGIT' else None
+                        fig.update_layout(yaxis_title=y_axis_label, xaxis_title=x_axis_label, yaxis_range=y_range_val, template="plotly_white")
                         st.plotly_chart(fig, use_container_width=True)
                     else:
                         fig, ax = plt.subplots(figsize=(8, 5))
@@ -389,7 +432,10 @@ else:
                             
                             if show_smooth:
                                 X_smooth = create_design_matrix_jit(smooth_times, winning_orders[g])
-                                g_probs = calc_logit_prob_jit(g_betas, X_smooth)
+                                if dist_type == 'LOGIT':
+                                    g_probs = calc_logit_prob_jit(g_betas, X_smooth)
+                                else:
+                                    g_probs = X_smooth @ g_betas
                                 ax.plot(smooth_times, g_probs, linewidth=2.5 if not show_obs else 1.5, color=colors[g%len(colors)], linestyle='--' if show_obs else '-', label=f'{group_names[g]} (Est.)')
                             
                             if show_obs:
@@ -398,7 +444,7 @@ else:
                                 for _, row in g_obs.iterrows():
                                     ax.text(row['Time'], row['Outcome'] + 0.02, str(g+1), color=colors[g%len(colors)], ha='center')
                                     
-                        ax.set_ylim(-0.1, 1.1)
+                        if dist_type == 'LOGIT': ax.set_ylim(-0.1, 1.1)
                         ax.set_ylabel(y_axis_label)
                         ax.set_xlabel(x_axis_label)
                         ax.legend(frameon=False)
