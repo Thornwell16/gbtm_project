@@ -1,0 +1,10 @@
+Component,Group,Parameter,Estimate,Standard Error,Robust SE,T for H0: Param=0,Prob > |T|
+Trajectory,Group 1,Intercept,-5.66879,1.15748,1.84352,-4.898,< 0.0001
+Trajectory,Group 2,Intercept,-1.92938,0.29939,0.46719,-6.444,< 0.0001
+Trajectory,Group 2,Linear,-2.21429,0.58355,0.85907,-3.795,0.0001
+Trajectory,Group 2,Quadratic,-1.92808,0.39819,0.45115,-4.842,< 0.0001
+Trajectory,Group 2,Cubic,2.57261,0.73303,0.86201,3.51,0.0005
+Trajectory,Group 3,Intercept,-0.2631,0.33414,0.52856,-0.787,0.4311
+Trajectory,Group 3,Linear,-1.74654,0.65762,0.89253,-2.656,0.0079
+Trajectory,Group 3,Quadratic,-1.61349,0.42156,0.32871,-3.827,0.0001
+Trajectory,Group 3,Cubic,1.96487,0.79089,0.95528,2.484,0.0130

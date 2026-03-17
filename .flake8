@@ -37,5 +37,5 @@ per-file-ignores =
     # app.py: streamlit requires st.set_page_config() before other imports (E402);
     # E241/E128/F841/E261 are pre-existing style patterns in UI layout code
     app.py: E402, E241, E128, F841, E261
-    # main.py: F841 unused vars in JIT kernels are intentional dead-code guards
-    main.py: F841
+    # main.py: F841, C901 unused vars in JIT kernels are intentional dead-code guards
+    main.py: F841, C901

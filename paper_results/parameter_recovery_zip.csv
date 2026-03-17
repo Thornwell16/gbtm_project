@@ -1,0 +1,7 @@
+Distribution,Group,Parameter,True_Value,Estimate,SE,CI_Lower,CI_Upper,Bias,Recovered_95CI,Scenario
+ZIP,1,Intercept,1.0,1.0025,0.0144,0.9743,1.0308,0.0025,Yes,"2-group, 30%/10% zero-inflation (N=500)"
+ZIP,1,Linear,0.3,0.305,0.0227,0.2606,0.3495,0.005,Yes,"2-group, 30%/10% zero-inflation (N=500)"
+ZIP,2,Intercept,2.5,2.5048,0.0058,2.4935,2.5161,0.0048,Yes,"2-group, 30%/10% zero-inflation (N=500)"
+ZIP,2,Linear,-0.2,-0.1969,0.0092,-0.2149,-0.1789,0.0031,Yes,"2-group, 30%/10% zero-inflation (N=500)"
+ZIP,1,Pi (proportion),0.55,0.544,NA,NA,NA,-0.006,Yes,"2-group, 30%/10% zero-inflation (N=500)"
+ZIP,2,Pi (proportion),0.45,0.456,NA,NA,NA,0.006,Yes,"2-group, 30%/10% zero-inflation (N=500)"

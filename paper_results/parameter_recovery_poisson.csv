@@ -1,0 +1,7 @@
+Distribution,Group,Parameter,True_Value,Estimate,SE,CI_Lower,CI_Upper,Bias,Recovered_95CI,Scenario
+POISSON,1,Intercept,0.5,0.5105,0.0127,0.4856,0.5353,0.0105,Yes,2-group linear (N=500)
+POISSON,1,Linear,0.4,0.4126,0.02,0.3735,0.4517,0.0126,Yes,2-group linear (N=500)
+POISSON,2,Intercept,2.2,2.2073,0.0072,2.1932,2.2214,0.0073,Yes,2-group linear (N=500)
+POISSON,2,Linear,-0.3,-0.2777,0.0114,-0.3001,-0.2553,0.0223,Yes,2-group linear (N=500)
+POISSON,1,Pi (proportion),0.6,0.642,NA,NA,NA,0.042,Yes,2-group linear (N=500)
+POISSON,2,Pi (proportion),0.4,0.358,NA,NA,NA,-0.042,Yes,2-group linear (N=500)

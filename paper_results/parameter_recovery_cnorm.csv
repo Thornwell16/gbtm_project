@@ -1,0 +1,8 @@
+Distribution,Group,Parameter,True_Value,Estimate,SE,CI_Lower,CI_Upper,Bias,Recovered_95CI,Scenario
+CNORM,1,Intercept,2.0,1.9903,0.0235,1.9442,2.0364,-0.0097,Yes,"2-group linear, sigma=1.5 (N=500)"
+CNORM,1,Linear,0.8,0.8034,0.0381,0.7286,0.8781,0.0034,Yes,"2-group linear, sigma=1.5 (N=500)"
+CNORM,2,Intercept,6.0,6.0321,0.0268,5.9796,6.0845,0.0321,Yes,"2-group linear, sigma=1.5 (N=500)"
+CNORM,2,Linear,-0.5,-0.534,0.0434,-0.619,-0.449,-0.034,Yes,"2-group linear, sigma=1.5 (N=500)"
+CNORM,1,Pi (proportion),0.55,0.57,NA,NA,NA,0.02,Yes,"2-group linear, sigma=1.5 (N=500)"
+CNORM,2,Pi (proportion),0.45,0.43,NA,NA,NA,-0.02,Yes,"2-group linear, sigma=1.5 (N=500)"
+CNORM,All,Sigma,1.5,1.52,0.013,1.4945,1.5455,0.02,Yes,"2-group linear, sigma=1.5 (N=500)"

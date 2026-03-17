@@ -1,0 +1,5 @@
+Nominal_Missing_Rate,Actual_Missing_Rate,N_Observations,Recovery_Rate,Assignment_Accuracy,LL,BIC,Converged
+0.0,0.0,11500,1.0,1.0,-5526.63,-5542.17,True
+0.1,0.099,10363,1.0,1.0,-4985.82,-5001.36,True
+0.25,0.255,8568,1.0,1.0,-4256.6,-4272.14,True
+0.4,0.398,6926,0.667,1.0,-3587.13,-3602.67,True

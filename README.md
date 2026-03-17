@@ -1,5 +1,5 @@
 # AutoTraj: Automated Group-Based Trajectory Modeling
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://YOUR_STREAMLIT_URL_HERE)
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://autotraj.streamlit.app/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![DOI](https://zenodo.org/badge/1171103165.svg)](https://doi.org/10.5281/zenodo.18866776)
 [![Tests](https://github.com/Thornwell16/gbtm_project/actions/workflows/test.yml/badge.svg)](https://github.com/Thornwell16/gbtm_project/actions/workflows/test.yml)
