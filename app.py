@@ -91,6 +91,26 @@ def get_parameter_estimates_for_ui(model_dict, group_names=None):
             "T for H0: Param=0": round(t_stat, 3),
             "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
         })
+        
+    if model_type == 'ZIP':
+        zip_iorder = model_dict.get('zip_iorder', 0)
+        tau_start_idx = len(params) - (zip_iorder + 1)
+        tau_labels = ["Alpha 0 (Intercept)", "Alpha 1 (Linear)", "Alpha 2 (Quadratic)", "Alpha 3 (Cubic)", "Alpha 4", "Alpha 5"]
+        
+        for p in range(zip_iorder + 1):
+            est = params[tau_start_idx + p]
+            err_m = se_model[tau_start_idx + p]
+            err_r = se_robust[tau_start_idx + p]
+            
+            t_stat = est / err_m if err_m > 0 else 0
+            p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+            
+            data.append({
+                "Component": "Zero Inflation", "Group": "All Groups (Global)", "Parameter": tau_labels[p] if p < len(tau_labels) else f"Alpha {p}",
+                "Estimate": round(est, 5), "Standard Error": round(err_m, 5), "Robust SE": round(err_r, 5),
+                "T for H0: Param=0": round(t_stat, 3),
+                "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
+            })
             
     return pd.DataFrame(data)
 
@@ -127,11 +147,11 @@ with st.sidebar:
             with col_time: time_col = st.text_input("Time Col", value="Time")
             
         st.markdown("**3. Model Distribution**")
-        selected_dist = st.selectbox("Select Outcome Type:", ["LOGIT (Binary)", "CNORM (Continuous/Tobit)", "POISSON (Count - Coming V3.0)", "ZIP (Zero-Inflated - Coming V3.0)"])
+        selected_dist = st.selectbox("Select Outcome Type:", ["LOGIT (Binary)", "CNORM (Continuous/Tobit)", "ZIP (Zero-Inflated Poisson)"])
         dist_flag = selected_dist.split(" ")[0]
         
-        cnorm_min = None
-        cnorm_max = None
+        cnorm_min = 0.0
+        cnorm_max = 0.0
         if dist_flag == "CNORM":
             st.markdown("*CNORM Scale Limits (Optional)*")
             st.info("Leave blank to automatically use the dataset's observed min/max.")
@@ -149,6 +169,11 @@ with st.sidebar:
             group_range = st.slider("Min & Max Groups", 1, 8, (1, 3))
             order_range = st.slider("Min & Max Polynomial Order", 0, 5, (0, 2))
             
+            zip_iorder = 0
+            if dist_flag == "ZIP":
+                st.markdown("**Zero-Inflation (Global)**")
+                zip_iorder = st.number_input("I-Order (Applies to all groups)", min_value=0, max_value=5, value=0)
+            
             st.markdown("**6. Heuristic Rules**")
             min_pct = st.slider("Min Group Size (%)", 1.0, 15.0, 5.0, 0.5)
             p_val = st.number_input("P-Value Threshold", value=0.05, format="%.3f")
@@ -156,11 +181,18 @@ with st.sidebar:
         elif app_mode == "Single Model Mode":
             st.markdown("**5. Model Specifications**")
             k_single = st.number_input("Number of Groups", min_value=1, max_value=8, value=2)
+            
+            zip_iorder = 0
+            if dist_flag == "ZIP":
+                st.markdown("**Zero-Inflation (Global)**")
+                zip_iorder = st.number_input("I-Order (Applies to all groups)", min_value=0, max_value=5, value=0)
+                st.markdown("**Trajectory Orders ($\mu$)**")
+                
             orders_single = []
             cols_ord = st.columns(2)
             for i in range(k_single):
                 with cols_ord[i % 2]:
-                    o = st.number_input(f"Group {i+1} Order", min_value=0, max_value=5, value=1)
+                    o = st.number_input(f"Group {i+1} Order", min_value=0, max_value=5, value=1, key=f"o_{i}")
                     orders_single.append(o)
 
 if app_mode == "About & Docs":
@@ -185,9 +217,15 @@ if app_mode == "About & Docs":
     In addition to model-based standard errors derived from the exact numerical Hessian (Observed Information Matrix), AutoTraj natively computes Huber-White sandwich estimators. This is achieved by cross-multiplying the analytical subject-level gradient vectors against the inverse Hessian, providing standard errors robust to minor model misspecifications and heteroskedasticity.
     
     **Fit Statistics & Optimization**
-    Calculations align precisely with standard epidemiological conventions. Significance is calculated using the Student's T-distribution ($DF = N_{obs} - p$) to match standard statistical reporting in developmental models. Models are optimized and selected using the Bayesian Information Criterion (BIC), defined below:
-    * **AIC:** $LL - p$
-    * **BIC:** $LL - 0.5 \cdot p \cdot \ln(N)$
+    Calculations align precisely with standard epidemiological conventions. Significance is calculated using the Student's T-distribution ($DF = N_{obs} - p$) to match standard statistical reporting in developmental models. Models are optimized and selected using the Bayesian Information Criterion (BIC). Two conventions are reported:
+
+    *Nagin / Proc Traj convention (Jones & Nagin, 2001) — higher (less negative) = better fit:*
+    * **AIC (Nagin):** $LL - p$
+    * **BIC (Nagin):** $LL - 0.5 \cdot p \cdot \ln(N)$
+
+    *Standard convention — lower = better fit:*
+    * **AIC (Standard):** $-2 \cdot LL + 2p$
+    * **BIC (Standard):** $-2 \cdot LL + p \cdot \ln(N)$
     
     ---
     **Suggested Citation**
@@ -243,10 +281,6 @@ else:
         button_label = "Run AutoTraj Search" if app_mode == "AutoTraj Search" else "Run Single Model"
         
         if st.button(button_label, type="primary", use_container_width=True):
-            
-            if dist_flag in ["POISSON", "ZIP"]:
-                st.error("🚨 **Distribution Not Yet Supported:** Poisson and ZIP models are currently in development for V3.0. Please select LOGIT or CNORM.")
-                st.stop()
                 
             if data_format == "Wide Format" or st.session_state.use_sample_data:
                 if id_col not in raw_df.columns:
@@ -285,10 +319,10 @@ else:
                         long_df, min_groups=group_range[0], max_groups=group_range[1],
                         min_order=order_range[0], max_order=order_range[1],
                         min_group_pct=min_pct, p_val_thresh=p_val, use_dropout=use_dropout, 
-                        dist=dist_flag, cnorm_min=cnorm_min, cnorm_max=cnorm_max
+                        dist=dist_flag, cnorm_min=cnorm_min, cnorm_max=cnorm_max, zip_iorder=zip_iorder
                     )
                 else:
-                    single_res = run_single_model(long_df, orders_single, use_dropout=use_dropout, dist=dist_flag, cnorm_min=cnorm_min, cnorm_max=cnorm_max)
+                    single_res = run_single_model(long_df, orders_single, zip_iorder=zip_iorder, use_dropout=use_dropout, dist=dist_flag, cnorm_min=cnorm_min, cnorm_max=cnorm_max)
                     top_models = [single_res] if single_res['result'].success or single_res['result'].status == 2 else []
                     all_evaluated = []
             
@@ -335,18 +369,28 @@ else:
             manual_mins = n_eval * 5
             manual_str = f"~{manual_mins} mins" if manual_mins < 60 else f"~{manual_mins/60:.1f} hrs"
             
-            col1, col2, col3, col4, col5, col6 = st.columns(6)
-            col1.metric("BIC (N=Subj)", f"{winning_model['bic']:.2f}")
-            col2.metric("BIC (N=Obs)", f"{winning_model['bic_obs']:.2f}")
-            col3.metric("AIC", f"{winning_model['aic']:.2f}")
-            col4.metric("Log-Likelihood", f"{winning_model['ll']:.2f}")
-            col5.metric("Engine Time", f"{run_time_val:.2f}s", f"{n_eval} models | {mps:.1f}/sec", delta_color="off")
-            col6.metric("Manual Proc Time", manual_str, "vs. SAS Syntax", delta_color="off")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("BIC (Nagin)", f"{winning_model['bic_nagin']:.2f}")
+            col2.metric("BIC (Standard)", f"{winning_model['bic_standard']:.2f}")
+            col3.metric("AIC (Nagin)", f"{winning_model['aic_nagin']:.2f}")
+            col4.metric("AIC (Standard)", f"{winning_model['aic_standard']:.2f}")
+            st.caption("Nagin convention: higher (less negative) = better fit. Standard convention: lower = better.")
+            col5, col6, col7 = st.columns(3)
+            col5.metric("Log-Likelihood", f"{winning_model['ll']:.2f}")
+            col6.metric("Engine Time", f"{run_time_val:.2f}s", f"{n_eval} models | {mps:.1f}/sec", delta_color="off")
+            col7.metric("Manual Proc Time", manual_str, "vs. SAS Syntax", delta_color="off")
             
             st.markdown("##### ✏️ Customize Plot Labels & Group Names")
             col_lbl1, col_lbl2 = st.columns(2)
             x_axis_label = col_lbl1.text_input("X-Axis Label", value="Time Period")
-            default_y_label = "Probability of Outcome" if dist_type == 'LOGIT' else "Outcome Score"
+            
+            if dist_type == 'LOGIT':
+                default_y_label = "Probability of Outcome"
+            elif dist_type == 'ZIP':
+                default_y_label = "Expected Count"
+            else:
+                default_y_label = "Outcome Score"
+                
             y_axis_label = col_lbl2.text_input("Y-Axis Label", value=default_y_label)
             
             cols = st.columns(len(winning_orders))
@@ -404,8 +448,15 @@ else:
                                 X_smooth = create_design_matrix_jit(smooth_times, winning_orders[g])
                                 if dist_type == 'LOGIT':
                                     g_probs = calc_logit_prob_jit(g_betas, X_smooth)
+                                elif dist_type == 'ZIP':
+                                    lam = np.exp(X_smooth @ g_betas) 
+                                    zip_i = winning_model.get('zip_iorder', 0)
+                                    alphas = winning_result.x[-(zip_i + 1):]
+                                    tau = create_design_matrix_jit(smooth_times, zip_i) @ alphas
+                                    rho = 1.0 / (1.0 + np.exp(-tau))
+                                    g_probs = lam * (1.0 - rho) # Expected count
                                 else:
-                                    g_probs = X_smooth @ g_betas # Raw linear prediction for CNORM
+                                    g_probs = X_smooth @ g_betas 
                                 fig.add_trace(go.Scatter(x=smooth_times, y=g_probs, mode='lines', line=dict(color=colors[g%len(colors)], width=4, dash='dot' if show_obs else 'solid'), name=f'{group_names[g]} (Est.)'))
                             
                             if show_obs:
@@ -434,6 +485,13 @@ else:
                                 X_smooth = create_design_matrix_jit(smooth_times, winning_orders[g])
                                 if dist_type == 'LOGIT':
                                     g_probs = calc_logit_prob_jit(g_betas, X_smooth)
+                                elif dist_type == 'ZIP':
+                                    lam = np.exp(X_smooth @ g_betas)
+                                    zip_i = winning_model.get('zip_iorder', 0)
+                                    alphas = winning_result.x[-(zip_i + 1):]
+                                    tau = create_design_matrix_jit(smooth_times, zip_i) @ alphas
+                                    rho = 1.0 / (1.0 + np.exp(-tau))
+                                    g_probs = lam * (1.0 - rho)
                                 else:
                                     g_probs = X_smooth @ g_betas
                                 ax.plot(smooth_times, g_probs, linewidth=2.5 if not show_obs else 1.5, color=colors[g%len(colors)], linestyle='--' if show_obs else '-', label=f'{group_names[g]} (Est.)')
@@ -483,13 +541,13 @@ else:
                 if app_mode == "AutoTraj Search" and all_evaluated:
                     best_per_k = {}
                     for m in all_evaluated:
-                        if m['Status'] != "Failed Convergence" and not np.isnan(m['BIC']):
+                        if m['Status'] != "Failed Convergence" and not np.isnan(m['BIC (Nagin)']):
                             k = m['Groups']
-                            if k not in best_per_k or m['BIC'] > best_per_k[k]['BIC']:
+                            if k not in best_per_k or m['BIC (Nagin)'] > best_per_k[k]['BIC (Nagin)']:
                                 best_per_k[k] = m
-                    
+
                     ks = sorted(list(best_per_k.keys()))
-                    bics = [best_per_k[k]['BIC'] for k in ks]
+                    bics = [best_per_k[k]['BIC (Nagin)'] for k in ks]
                     
                     fig_bic = go.Figure()
                     fig_bic.add_trace(go.Scatter(x=ks, y=bics, mode='lines+markers', marker=dict(size=10, color='#1f77b4'), line=dict(width=3)))
@@ -503,8 +561,8 @@ else:
                     st.plotly_chart(fig_bic, use_container_width=True)
                     
                     comp_df = pd.DataFrame(all_evaluated)
-                    comp_df['BIC'] = comp_df['BIC'].apply(lambda x: round(x, 2) if pd.notnull(x) else "NaN")
-                    comp_df['AIC'] = comp_df['AIC'].apply(lambda x: round(x, 2) if pd.notnull(x) else "NaN")
+                    for col in ['BIC (Nagin)', 'BIC (Standard)', 'AIC (Nagin)', 'AIC (Standard)']:
+                        comp_df[col] = comp_df[col].apply(lambda x: round(x, 2) if pd.notnull(x) else "NaN")
                     comp_df['Min_Group_%'] = comp_df['Min_Group_%'].apply(lambda x: round(x, 1) if pd.notnull(x) else "NaN")
                     st.dataframe(comp_df, hide_index=True)
 
