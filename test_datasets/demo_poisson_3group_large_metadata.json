@@ -1,0 +1,8 @@
+{
+  "distribution": "POISSON",
+  "n_subjects": 2000,
+  "n_timepoints": 15,
+  "true_groups": 3,
+  "description": "Large 3-group Poisson dataset (N=2000). For speed benchmarking and demonstrating scalability.",
+  "seed": 555
+}

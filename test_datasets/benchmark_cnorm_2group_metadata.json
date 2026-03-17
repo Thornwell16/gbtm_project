@@ -1,0 +1,25 @@
+{
+  "distribution": "CNORM",
+  "n_subjects": 500,
+  "n_timepoints": 15,
+  "true_groups": 2,
+  "true_proportions": [
+    0.55,
+    0.45
+  ],
+  "true_params": [
+    [
+      2.0,
+      0.8
+    ],
+    [
+      6.0,
+      -0.5
+    ]
+  ],
+  "true_sigma": 1.2,
+  "cnorm_min": 0.0,
+  "cnorm_max": 10.0,
+  "description": "2-group CNORM benchmark. Continuous outcome censored at 0-10. Group 1 (55%): rising from 2. Group 2 (45%): falling from 6.",
+  "seed": 123
+}

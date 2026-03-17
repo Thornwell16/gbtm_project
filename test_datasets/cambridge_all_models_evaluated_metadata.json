@@ -1,0 +1,12 @@
+{
+  "description": "All models evaluated on Cambridge data by AutoTraj autosearch. Groups 1-4, Orders 0-3. For validation paper model comparison table.",
+  "n_evaluated": 340,
+  "n_valid": 10,
+  "best_model_groups": 3,
+  "best_model_orders": [
+    0,
+    3,
+    3
+  ],
+  "best_bic": -793.8272982501647
+}
