@@ -122,6 +122,37 @@ def logsumexp_jit(a):
 @njit(cache=True)
 def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max):
     # dist_code: 0=LOGIT, 1=CNORM, 3=ZIP
+    #
+    # CNORM SIGMA PARAMETERIZATION & CHAIN RULE
+    # -----------------------------------------
+    # sigma is constrained positive via the log transform:
+    #   raw_sigma = log(sigma)  →  sigma = exp(raw_sigma)
+    # The optimizer works in raw_sigma space. err_aux_ig[g, obs] accumulates
+    # d(LL_g)/d(raw_sigma) — already the gradient w.r.t. the unconstrained
+    # parameter — NOT d(LL_g)/d(sigma). The chain rule factor (sigma) is
+    # already absorbed into each expression:
+    #
+    #   Case 1 — Uncensored (cnorm_min < y < cnorm_max), z = (y-mu)/sigma:
+    #     log_pdf = -log(sigma) - 0.5*log(2π) - z²/2
+    #     d(log_pdf)/d(sigma)     = (1/sigma)(-1 + z²)
+    #     d(log_pdf)/d(raw_sigma) = (-1 + z²)              ← stored as err_aux_ig ✓
+    #
+    #   Case 2 — Left-censored (y <= cnorm_min), z = (cnorm_min-mu)/sigma,
+    #             IMR = φ(z)/Φ(z):
+    #     LL = log Φ(z)
+    #     d(LL)/d(sigma)     = -z·IMR / sigma
+    #     d(LL)/d(raw_sigma) = -z·IMR                      ← stored as err_aux_ig ✓
+    #
+    #   Case 3 — Right-censored (y >= cnorm_max), z = (cnorm_max-mu)/sigma,
+    #             IMR = φ(z)/(1-Φ(z)):
+    #     LL = log(1 - Φ(z))
+    #     d(LL)/d(sigma)     = z·IMR / sigma
+    #     d(LL)/d(raw_sigma) = z·IMR                       ← stored as err_aux_ig ✓
+    #
+    # Therefore the accumulation line:
+    #   grad_subj[i, sigma_idx] += -1.0 * err_aux_ig[g, obs] * posterior_ig[g]
+    # is correct as written — NO additional sigma factor is needed.
+    # (Verified by finite-difference check against all three cases.)
     k = len(orders)
     thetas = np.zeros(k)
     if k > 1: thetas[1:] = params[0 : k-1]
