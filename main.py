@@ -453,6 +453,103 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     result.x = params_unscaled
     return True, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num
 
+def sort_groups_by_intercept(result, orders_list, se_model, se_robust, pis, use_dropout, dist):
+    """
+    Sort groups by ascending intercept (beta_0) to eliminate label switching.
+
+    After optimization the labelling of Group 1 / Group 2 / … is arbitrary —
+    whichever local optimum the solver found determines which label goes where.
+    This function reorders all group-specific blocks in result.x (thetas, betas,
+    gammas) so that Group 1 always has the lowest intercept.
+
+    Returns
+    -------
+    new_orders_list : list  — polynomial orders in the new group ordering
+    new_se_model    : ndarray
+    new_se_robust   : ndarray
+    new_pis         : ndarray
+    result.x is mutated in place.
+
+    Notes
+    -----
+    • The theta re-normalisation (subtracting new_thetas[0]) is exact for the
+      likelihood; the theta SEs are rearranged but NOT re-derived — they are
+      approximate after a change of reference group.  Beta / gamma SEs are exact.
+    • CNORM log-sigma and ZIP alpha params sit at the tail and are not
+      group-specific, so they are left untouched.
+    """
+    k = len(orders_list)
+    if k == 1:
+        return orders_list, se_model, se_robust, pis
+
+    params = result.x.copy()
+    se_m   = se_model.copy()
+    se_r   = se_robust.copy()
+
+    # Recover full k-length theta vector (theta[0] = 0 is the implicit reference)
+    thetas = np.zeros(k)
+    thetas[1:] = params[0:k - 1]
+
+    # Locate the start index of each group's beta block
+    beta_starts = []
+    idx = k - 1
+    for g in range(k):
+        beta_starts.append(idx)
+        idx += orders_list[g] + 1
+    gamma_start = idx  # first index of gamma block (used only when use_dropout)
+
+    # Intercepts are the first beta of each group
+    intercepts   = np.array([params[beta_starts[g]] for g in range(k)])
+    sorted_idx   = np.argsort(intercepts)
+
+    if np.all(sorted_idx == np.arange(k)):
+        return orders_list, se_model, se_robust, pis  # already sorted
+
+    new_params = params.copy()
+    new_se_m   = se_m.copy()
+    new_se_r   = se_r.copy()
+
+    # --- Rearrange theta params (indices 0..k-2) ---
+    new_thetas = thetas[sorted_idx]
+    new_thetas -= new_thetas[0]           # re-normalise: new group 0 becomes reference
+    new_params[0:k - 1] = new_thetas[1:]
+
+    # Approximate SE rearrangement for thetas
+    old_tse_m = np.concatenate(([0.0], se_m[0:k - 1]))
+    old_tse_r = np.concatenate(([0.0], se_r[0:k - 1]))
+    new_params_tse_m = old_tse_m[sorted_idx]
+    new_params_tse_r = old_tse_r[sorted_idx]
+    new_se_m[0:k - 1] = new_params_tse_m[1:]
+    new_se_r[0:k - 1] = new_params_tse_r[1:]
+
+    # --- Rearrange beta blocks ---
+    new_orders = [orders_list[sorted_idx[g]] for g in range(k)]
+    write_idx  = k - 1
+    for new_g in range(k):
+        old_g   = sorted_idx[new_g]
+        n_betas = orders_list[old_g] + 1
+        src     = beta_starts[old_g]
+        new_params[write_idx:write_idx + n_betas] = params[src:src + n_betas]
+        new_se_m[write_idx:write_idx + n_betas]   = se_m[src:src + n_betas]
+        new_se_r[write_idx:write_idx + n_betas]   = se_r[src:src + n_betas]
+        write_idx += n_betas
+
+    # --- Rearrange gamma blocks (3 params per group, always) ---
+    if use_dropout:
+        for new_g in range(k):
+            old_g = sorted_idx[new_g]
+            src   = gamma_start + 3 * old_g
+            dst   = gamma_start + 3 * new_g
+            new_params[dst:dst + 3] = params[src:src + 3]
+            new_se_m[dst:dst + 3]   = se_m[src:src + 3]
+            new_se_r[dst:dst + 3]   = se_r[src:src + 3]
+
+    # CNORM log-sigma and ZIP alpha params are tail params, not group-specific — unchanged.
+
+    result.x = new_params
+    return new_orders, new_se_m, new_se_r, pis[sorted_idx]
+
+
 def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=10):
     """Return n_starts initial parameter vectors. Index 0 is deterministic; the rest add seeded random perturbations."""
     num_params = (k - 1) + sum([order + 1 for order in orders_list])
@@ -568,6 +665,11 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
         result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max
     )
 
+    if is_valid:
+        orders_list, se_model, se_robust, pis = sort_groups_by_intercept(
+            result, orders_list, se_model, se_robust, pis, use_dropout, dist
+        )
+
     min_group_size = np.min(pis) * 100 if is_valid else np.nan
     return {
         'bic': bic_nagin, 'bic_nagin': bic_nagin, 'bic_obs': bic_obs, 'bic_standard': bic_standard,
@@ -635,13 +737,16 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         is_converged, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num = process_optimization_result(
             result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max
         )
-        
+
         if is_converged:
+            orders_list, se_model, se_robust, pis = sort_groups_by_intercept(
+                result, orders_list, se_model, se_robust, pis, use_dropout, dist
+            )
             min_group_size = np.min(pis) * 100
             status = ""
             is_valid = True
             dof = n_obs - num_params
-            
+
             if cond_num > 1e10:
                 status = "Rejected (Singular Matrix / Unidentifiable)"
                 is_valid = False

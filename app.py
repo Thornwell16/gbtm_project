@@ -314,11 +314,59 @@ else:
                     long_df['Outcome'] = pd.to_numeric(long_df['Outcome'])
                     long_df = long_df.sort_values(by=['ID', 'Time'])
                 
+                # ------------------------------------------------------------------
+                # INPUT VALIDATION
+                # ------------------------------------------------------------------
+
+                # Check 4: remove subjects with fewer than 2 observations
+                obs_counts = long_df.groupby('ID').size()
+                single_obs_ids = obs_counts[obs_counts < 2].index.tolist()
+                if single_obs_ids:
+                    long_df = long_df[~long_df['ID'].isin(single_obs_ids)].copy()
+                    preview = single_obs_ids[:5]
+                    extra   = f" … and {len(single_obs_ids) - 5} more" if len(single_obs_ids) > 5 else ""
+                    st.info(f"Removed {len(single_obs_ids)} subject(s) with only 1 observation (IDs: {preview}{extra}). These subjects cannot contribute to trajectory estimation.")
+
+                # Check 3: minimum sample size
+                n_subjects_val = long_df['ID'].nunique()
+                if n_subjects_val < 30:
+                    st.warning(f"⚠️ Only {n_subjects_val} subjects remain after filtering. Results may be unreliable with very small samples (recommended n ≥ 30).")
+
+                # Check 1: LOGIT requires binary outcomes
+                if dist_flag == 'LOGIT':
+                    invalid_mask = ~long_df['Outcome'].isin([0.0, 1.0])
+                    if invalid_mask.any():
+                        bad_vals = sorted(long_df.loc[invalid_mask, 'Outcome'].unique().tolist())[:10]
+                        n_bad    = int(invalid_mask.sum())
+                        st.error(
+                            f"🚨 **LOGIT requires binary outcomes (0 or 1).** "
+                            f"Found {n_bad} row(s) with non-binary values: {bad_vals}. "
+                            f"Please select CNORM or ZIP, or recode your outcome as 0/1."
+                        )
+                        st.stop()
+
+                # Check 2: CNORM requires numeric outcomes; warn if all-integer
+                if dist_flag == 'CNORM':
+                    if not pd.api.types.is_numeric_dtype(long_df['Outcome']):
+                        st.error("🚨 **CNORM requires a numeric outcome.** The Outcome column contains non-numeric values. Please check your data mapping.")
+                        st.stop()
+                    elif long_df['Outcome'].dropna().apply(lambda x: float(x) == int(x)).all():
+                        st.warning("⚠️ All Outcome values appear to be whole numbers. If your outcome is binary (0/1), consider using LOGIT instead of CNORM.")
+
+                # Check 5: polynomial order vs. unique time points — hard stop
                 n_timepoints = len(long_df['Time'].unique())
                 max_order_attempted = max(orders_single) if app_mode == "Single Model Mode" else order_range[1]
                 if max_order_attempted >= n_timepoints:
-                    st.warning(f"🚨 **Statistical Warning:** You are attempting to fit a polynomial of Order {max_order_attempted} ({max_order_attempted + 1} parameters) on data with only {n_timepoints} unique time points. This leaves the group with 0 degrees of freedom, making the model mathematically unidentifiable. Standard Errors and P-values for this model will be invalid due to Complete Separation. It is recommended to decrease your maximum polynomial order.")
-                
+                    st.error(
+                        f"🚨 **Unidentifiable Model:** Polynomial order {max_order_attempted} "
+                        f"requires {max_order_attempted + 1} parameters per group but the data has only "
+                        f"{n_timepoints} unique time point(s), leaving 0 degrees of freedom. "
+                        f"Please reduce the maximum polynomial order to at most {n_timepoints - 1}."
+                    )
+                    st.stop()
+
+                # ------------------------------------------------------------------
+
                 if app_mode == "AutoTraj Search":
                     top_models, all_evaluated = run_autotraj(
                         long_df, min_groups=group_range[0], max_groups=group_range[1],
