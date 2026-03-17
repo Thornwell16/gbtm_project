@@ -422,58 +422,117 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     result.x = params_unscaled
     return True, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num
 
-def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0):
+def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=10):
+    """Return n_starts initial parameter vectors. Index 0 is deterministic; the rest add seeded random perturbations."""
+    num_params = (k - 1) + sum([order + 1 for order in orders_list])
+    if use_dropout: num_params += (3 * k)
+    if dist == 'CNORM': num_params += 1
+    if dist == 'ZIP': num_params += (zip_iorder + 1)
+
+    # --- deterministic base ---
+    base = np.zeros(num_params)
+    p_init = np.linspace(1.0 / (k + 1.0), k * 1.0 / (k + 1.0), k) if k > 1 else [0.5]
+    staggered_intercepts = np.log(p_init / (1.0 - np.array(p_init)))
+
+    current_beta_idx = k - 1
+    for g in range(k):
+        base[current_beta_idx] = staggered_intercepts[g]
+        current_beta_idx += orders_list[g] + 1
+
+    if use_dropout:
+        current_gamma_idx = current_beta_idx
+        for g in range(k):
+            base[current_gamma_idx] = -2.0
+            current_gamma_idx += 3
+
+    if dist == 'CNORM':
+        sd_guess = np.std(outcomes)
+        base[-1] = np.log(sd_guess) if sd_guess > 0 else np.log(1.0)
+    elif dist == 'ZIP':
+        tau_start_idx = num_params - (zip_iorder + 1)
+        base[tau_start_idx] = -2.2
+
+    starts = [base.copy()]
+
+    # --- perturbed starts ---
+    for s in range(1, n_starts):
+        np.random.seed(42 + s)
+        perturbed = base.copy()
+
+        # theta (group membership) params: indices 0..k-2
+        if k > 1:
+            perturbed[:k - 1] += np.random.normal(0, 0.5, k - 1)
+
+        # beta (trajectory) params
+        cb_idx = k - 1
+        for g in range(k):
+            n_betas = orders_list[g] + 1
+            perturbed[cb_idx:cb_idx + n_betas] += np.random.normal(0, 0.3, n_betas)
+            cb_idx += n_betas
+
+        # gamma (dropout) params
+        if use_dropout:
+            cg_idx = cb_idx
+            for g in range(k):
+                perturbed[cg_idx:cg_idx + 3] += np.random.normal(0, 0.2, 3)
+                cg_idx += 3
+
+        # log-sigma (CNORM)
+        if dist == 'CNORM':
+            perturbed[-1] += np.random.normal(0, 0.2)
+
+        starts.append(perturbed)
+
+    return starts
+
+
+def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, n_starts=5):
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
     dist_map = {'LOGIT': 0, 'CNORM': 1, 'ZIP': 3}
     dist_code = dist_map.get(dist, 0)
-    
+
     if dist == 'CNORM':
         if cnorm_min is None or np.isnan(cnorm_min): cnorm_min = np.min(outcomes)
         if cnorm_max is None or np.isnan(cnorm_max): cnorm_max = np.max(outcomes)
-    
+
     max_t = np.max(np.abs(times))
     scale_factor = max_t if max_t > 0 else 1.0
     times_scaled = times / scale_factor
-    
+
     orders_arr = np.array(orders_list, dtype=np.int32)
     k = len(orders_list)
-    
+
+    args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max))
     num_params = (k - 1) + sum([order + 1 for order in orders_list])
     if use_dropout: num_params += (3 * k)
     if dist == 'CNORM': num_params += 1
     if dist == 'ZIP': num_params += (zip_iorder + 1)
-    
-    initial_guess = np.zeros(num_params)
-    p_init = np.linspace(1.0 / (k + 1.0), k * 1.0 / (k + 1.0), k) if k > 1 else [0.5]
-    staggered_intercepts = np.log(p_init / (1.0 - np.array(p_init)))
-    
-    current_beta_idx = k - 1
-    for g in range(k):
-        initial_guess[current_beta_idx] = staggered_intercepts[g]
-        current_beta_idx += orders_list[g] + 1
-        
-    if use_dropout:
-        current_gamma_idx = current_beta_idx
-        for g in range(k):
-            initial_guess[current_gamma_idx] = -2.0
-            current_gamma_idx += 3
-            
-    if dist == 'CNORM':
-        sd_guess = np.std(outcomes)
-        initial_guess[-1] = np.log(sd_guess) if sd_guess > 0 else np.log(1.0)
-    elif dist == 'ZIP':
-        tau_start_idx = len(initial_guess) - (zip_iorder + 1)
-        initial_guess[tau_start_idx] = -2.2 # Global intercept initialized to ~10%
-            
-    args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max))
-    
-    result = minimize(
-        calc_nll_wrapper, initial_guess, args=args,
-        method='BFGS', jac=calc_jac_wrapper, options={'maxiter': 3000, 'gtol': 1e-6}
-    )
-    
+
+    starts = generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=n_starts)
+
+    best_result = None
+    best_nll = np.inf
+    best_start_idx = 0
+
+    for s_idx, initial_guess in enumerate(starts):
+        res = minimize(
+            calc_nll_wrapper, initial_guess, args=args,
+            method='BFGS', jac=calc_jac_wrapper, options={'maxiter': 3000, 'gtol': 1e-6}
+        )
+        if (res.success or res.status == 2) and res.fun < best_nll:
+            best_nll = res.fun
+            best_result = res
+            best_start_idx = s_idx
+
+    if best_result is None:
+        best_result = res  # fallback: last attempted result
+
+    if best_start_idx > 0:
+        print(f"  [multi-start] single model {orders_list}: best on start {best_start_idx + 1}/{n_starts} (NLL={best_nll:.4f})")
+
+    result = best_result
     is_valid, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num = process_optimization_result(
         result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max
     )
@@ -487,7 +546,7 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
         'dof': n_obs - num_params, 'cond_num': cond_num, 'dist': dist, 'cnorm_min': cnorm_min, 'cnorm_max': cnorm_max
     }
 
-def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, zip_iorder=0):
+def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, zip_iorder=0, n_starts=3):
     valid_models = []
     all_evaluated_models = []
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
@@ -495,58 +554,53 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
     n_obs = len(times)
     dist_map = {'LOGIT': 0, 'CNORM': 1, 'ZIP': 3}
     dist_code = dist_map.get(dist, 0)
-    
+
     if dist == 'CNORM':
         if cnorm_min is None or np.isnan(cnorm_min): cnorm_min = np.min(outcomes)
         if cnorm_max is None or np.isnan(cnorm_max): cnorm_max = np.max(outcomes)
-    
+
     max_t = np.max(np.abs(times))
     scale_factor = max_t if max_t > 0 else 1.0
     times_scaled = times / scale_factor
-    
+
     all_combinations = []
     for k in range(min_groups, max_groups + 1):
         order_combinations = list(itertools.product(range(min_order, max_order + 1), repeat=k))
         all_combinations.extend([list(orders) for orders in order_combinations])
-        
+
     for i, orders_list in enumerate(all_combinations):
         orders_arr = np.array(orders_list, dtype=np.int32)
         k = len(orders_list)
-        
+
         num_params = (k - 1) + sum([order + 1 for order in orders_list])
         if use_dropout: num_params += (3 * k)
         if dist == 'CNORM': num_params += 1
         if dist == 'ZIP': num_params += (zip_iorder + 1)
-        initial_guess = np.zeros(num_params)
-        
-        p_init = np.linspace(1.0 / (k + 1.0), k * 1.0 / (k + 1.0), k) if k > 1 else [0.5]
-        staggered_intercepts = np.log(p_init / (1.0 - np.array(p_init)))
-        
-        current_beta_idx = k - 1
-        for g in range(k):
-            initial_guess[current_beta_idx] = staggered_intercepts[g]
-            current_beta_idx += orders_list[g] + 1
-            
-        if use_dropout:
-            current_gamma_idx = current_beta_idx
-            for g in range(k):
-                initial_guess[current_gamma_idx] = -2.0
-                current_gamma_idx += 3
-                
-        if dist == 'CNORM':
-            sd_guess = np.std(outcomes)
-            initial_guess[-1] = np.log(sd_guess) if sd_guess > 0 else np.log(1.0)
-        elif dist == 'ZIP':
-            tau_start_idx = len(initial_guess) - (zip_iorder + 1)
-            initial_guess[tau_start_idx] = -2.2 
-            
+
         args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max))
-        
-        result = minimize(
-            calc_nll_wrapper, initial_guess, args=args,
-            method='BFGS', jac=calc_jac_wrapper, options={'maxiter': 3000, 'gtol': 1e-6}
-        )
-        
+        starts = generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=n_starts)
+
+        best_result = None
+        best_nll = np.inf
+        best_start_idx = 0
+
+        for s_idx, initial_guess in enumerate(starts):
+            res = minimize(
+                calc_nll_wrapper, initial_guess, args=args,
+                method='BFGS', jac=calc_jac_wrapper, options={'maxiter': 3000, 'gtol': 1e-6}
+            )
+            if (res.success or res.status == 2) and res.fun < best_nll:
+                best_nll = res.fun
+                best_result = res
+                best_start_idx = s_idx
+
+        if best_result is None:
+            best_result = res  # fallback: last attempted result
+
+        if best_start_idx > 0:
+            print(f"  [multi-start] autotraj {orders_list}: best on start {best_start_idx + 1}/{n_starts} (NLL={best_nll:.4f})")
+
+        result = best_result
         is_converged, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num = process_optimization_result(
             result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max
         )
