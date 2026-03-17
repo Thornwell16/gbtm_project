@@ -1,0 +1,8 @@
+{
+  "distribution": "LOGIT",
+  "n_subjects": 400,
+  "missing_rate": 0.25,
+  "actual_missing_pct": 0.25423913043478263,
+  "description": "2-group LOGIT with 25% MCAR missing data. For demonstrating FIML and dropout model.",
+  "seed": 999
+}

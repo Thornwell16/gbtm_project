@@ -1,0 +1,26 @@
+{
+  "distribution": "ZIP",
+  "n_subjects": 500,
+  "n_timepoints": 12,
+  "true_groups": 2,
+  "true_proportions": [
+    0.55,
+    0.45
+  ],
+  "true_params": [
+    [
+      1.0,
+      0.3
+    ],
+    [
+      2.5,
+      -0.2
+    ]
+  ],
+  "true_zero_inflation": [
+    0.3,
+    0.1
+  ],
+  "description": "2-group ZIP benchmark. Group 1 (55%): 30% zero inflation. Group 2 (45%): 10% zero inflation.",
+  "seed": 789
+}

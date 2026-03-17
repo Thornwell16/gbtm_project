@@ -1,0 +1,28 @@
+{
+  "distribution": "LOGIT",
+  "n_subjects": 800,
+  "n_timepoints": 23,
+  "true_groups": 3,
+  "true_proportions": [
+    0.55,
+    0.3,
+    0.15
+  ],
+  "true_params": [
+    [
+      -3.5,
+      0.1
+    ],
+    [
+      -0.5,
+      1.2,
+      -0.8
+    ],
+    [
+      0.5,
+      0.3
+    ]
+  ],
+  "description": "3-group LOGIT demo: Non-offender (55%), Adolescence-peaked quadratic (30%), Chronic (15%). Good for demonstrating automated model selection.",
+  "seed": 2026
+}
