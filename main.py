@@ -121,7 +121,7 @@ def logsumexp_jit(a):
 # --- CORE LIKELIHOOD/GRADIENT ENGINE (UNIVERSAL) ---
 @njit(cache=True)
 def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max):
-    # dist_code: 0=LOGIT, 1=CNORM, 3=ZIP
+    # dist_code: 0=LOGIT, 1=CNORM, 2=POISSON, 3=ZIP
     #
     # CNORM SIGMA PARAMETERIZATION & CHAIN RULE
     # -----------------------------------------
@@ -179,16 +179,17 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
     sigma = 1.0
     var = 1.0
     sigma_idx = -1
-    tau_start_idx = -1
-    
+    zeta_start_idx = -1  # first index of per-group zeta block when dist_code == 3
+
     if dist_code == 1: # CNORM
         sigma_idx = len(params) - 1
         raw_sigma = params[sigma_idx]
         sigma = np.exp(raw_sigma) if raw_sigma < 20 else np.exp(20)
         var = sigma ** 2
-    elif dist_code == 3: # ZIP
-        tau_start_idx = len(params) - (zip_iorder + 1)
-        group_alphas = params[tau_start_idx : tau_start_idx + zip_iorder + 1]
+    elif dist_code == 3: # ZIP — per-group zeta (logit of zero-inflation), last k params
+        zeta_start_idx = len(params) - k
+
+    zeta_g = 0.0  # per-group zero-inflation logit; set inside group loop when dist_code == 3
     
     total_ll = 0.0
     
@@ -215,14 +216,17 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
                 gamma_1 = params[current_gamma_idx + 1]
                 gamma_2 = params[current_gamma_idx + 2]
                 current_gamma_idx += 3
-            
+
+            if dist_code == 3:  # ZIP: extract per-group zeta constant
+                zeta_g = params[zeta_start_idx + g]
+
             ll_g = 0.0
-            
+
             for obs in range(n_obs):
                 idx = start + obs
                 t_val = times[idx]
                 y_val = outcomes[idx]
-                
+
                 mu = 0.0
                 for p in range(order + 1): mu += group_betas[p] * (t_val ** p)
                 
@@ -234,7 +238,17 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
                     if mu >= 0: ll_g += y_val * mu - (mu + np.log(1.0 + np.exp(-mu)))
                     else: ll_g += y_val * mu - np.log(1.0 + np.exp(mu))
                     err_mu_ig[g, obs] = y_val - prob
-                    
+
+                elif dist_code == 2: # POISSON (log-link: eta=X@beta, mu=exp(eta))
+                    # Clamp linear predictor to avoid overflow in exp()
+                    if mu > 20.0: mu = 20.0
+                    if mu < -20.0: mu = -20.0
+                    exp_eta = np.exp(mu)
+                    # log P(y|mu) = y*eta - exp(eta) - log(y!)
+                    ll_g += y_val * mu - exp_eta - math.lgamma(y_val + 1.0)
+                    # d(LL)/d(eta) = y - exp(eta)  [canonical link, clean gradient]
+                    err_mu_ig[g, obs] = y_val - exp_eta
+
                 elif dist_code == 1: # CNORM
                     if y_val <= cnorm_min:
                         z = (cnorm_min - mu) / sigma
@@ -256,14 +270,13 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
                         err_mu_ig[g, obs] = (y_val - mu) / var
                         err_aux_ig[g, obs] = -1.0 + (z ** 2)
                         
-                elif dist_code == 3: # ZIP
-                    tau_t = 0.0
-                    for p in range(zip_iorder + 1): 
-                        tau_t += group_alphas[p] * (t_val ** p)
-                    ll_val, err_m, err_t = fast_zip_logpmf_grad(y_val, mu, tau_t)
+                elif dist_code == 3: # ZIP (per-group zero-inflation zeta)
+                    if mu > 20.0: mu = 20.0
+                    if mu < -20.0: mu = -20.0
+                    ll_val, err_m, err_t = fast_zip_logpmf_grad(y_val, mu, zeta_g)
                     ll_g += ll_val
                     err_mu_ig[g, obs] = err_m
-                    err_aux_ig[g, obs] = err_t 
+                    err_aux_ig[g, obs] = err_t
                 
                 if use_dropout and obs > 0:
                     y_prev = outcomes[idx - 1]
@@ -321,10 +334,8 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
                 
                 if dist_code == 1: # CNORM Sigma Grad
                     grad_subj[i, sigma_idx] += -1.0 * err_aux_ig[g, obs] * posterior_ig[g]
-                elif dist_code == 3: # ZIP Global Alpha Grad
-                    weighted_err_tau = err_aux_ig[g, obs] * posterior_ig[g]
-                    for p in range(zip_iorder + 1):
-                        grad_subj[i, tau_start_idx + p] += -1.0 * weighted_err_tau * (t_val ** p)
+                elif dist_code == 3: # ZIP per-group zeta gradient
+                    grad_subj[i, zeta_start_idx + g] += -1.0 * err_aux_ig[g, obs] * posterior_ig[g]
                     
                 if use_dropout and obs > 0:
                     y_prev = outcomes[idx - 1]
@@ -364,17 +375,54 @@ def calc_jac_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip
     _, grad_flat, _ = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max)
     return grad_flat
 
+# --- DISTRIBUTION-SPECIFIC PUBLIC ALIASES ---
+# The universal engine (dist_code dispatch) handles all distributions.
+# These thin wrappers expose the expected function names for external consumers
+# (e.g. verification scripts, notebooks) without duplicating any math.
+
+def calc_poisson_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0):
+    """NLL for Poisson trajectories — delegates to universal engine (dist_code=2)."""
+    nll, _, _ = calc_universal_subject_gradients_jit(
+        params, times, outcomes, dropouts, subj_breaks, orders,
+        int(zip_iorder), use_dropout, 2, float(cnorm_min), float(cnorm_max)
+    )
+    return nll
+
+def calc_poisson_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0):
+    """Gradient for Poisson trajectories — delegates to universal engine (dist_code=2)."""
+    _, grad, _ = calc_universal_subject_gradients_jit(
+        params, times, outcomes, dropouts, subj_breaks, orders,
+        int(zip_iorder), use_dropout, 2, float(cnorm_min), float(cnorm_max)
+    )
+    return grad
+
+def calc_zip_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0):
+    """NLL for ZIP trajectories — delegates to universal engine (dist_code=3)."""
+    nll, _, _ = calc_universal_subject_gradients_jit(
+        params, times, outcomes, dropouts, subj_breaks, orders,
+        int(zip_iorder), use_dropout, 3, float(cnorm_min), float(cnorm_max)
+    )
+    return nll
+
+def calc_zip_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0):
+    """Gradient for ZIP trajectories — delegates to universal engine (dist_code=3)."""
+    _, grad, _ = calc_universal_subject_gradients_jit(
+        params, times, outcomes, dropouts, subj_breaks, orders,
+        int(zip_iorder), use_dropout, 3, float(cnorm_min), float(cnorm_max)
+    )
+    return grad
+
 # --- ENGINE WRAPPERS ---
 def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max):
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
     orders_arr = np.array(orders_list, dtype=np.int32)
     k = len(orders_list)
-    dist_map = {'LOGIT': 0, 'CNORM': 1, 'ZIP': 3}
+    dist_map = {'LOGIT': 0, 'CNORM': 1, 'POISSON': 2, 'ZIP': 3}
     dist_code = dist_map.get(dist, 0)
     
     if not (result.success or result.status == 2):
-        return False, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, None, None, None, np.nan
+        return False, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, None, None, None, np.nan, None
         
     D_diag = np.ones(num_params)
     current_beta_idx = k - 1
@@ -390,12 +438,9 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
             current_gamma_idx += 3
             
     if dist == 'CNORM':
-        D_diag[-1] = 1.0 
-    elif dist == 'ZIP':
-        tau_start_idx = num_params - (zip_iorder + 1)
-        for p in range(zip_iorder + 1):
-            D_diag[tau_start_idx + p] = 1.0 / (scale_factor ** p)
-        
+        D_diag[-1] = 1.0
+    # ZIP zeta params are dimensionless logits — no time-unit scaling needed
+
     D = np.diag(D_diag)
     
     try:
@@ -451,7 +496,7 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     pis = np.exp(thetas - logsumexp(thetas))
 
     result.x = params_unscaled
-    return True, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num
+    return True, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num, V_model_unscaled
 
 def sort_groups_by_intercept(result, orders_list, se_model, se_robust, pis, use_dropout, dist):
     """
@@ -544,7 +589,15 @@ def sort_groups_by_intercept(result, orders_list, se_model, se_robust, pis, use_
             new_se_m[dst:dst + 3]   = se_m[src:src + 3]
             new_se_r[dst:dst + 3]   = se_r[src:src + 3]
 
-    # CNORM log-sigma and ZIP alpha params are tail params, not group-specific — unchanged.
+    # CNORM log-sigma is a scalar tail param — not group-specific, left untouched.
+    # ZIP zeta params (last k entries) ARE group-specific — rearrange them.
+    if dist == 'ZIP':
+        zeta_start = len(params) - k
+        for new_g in range(k):
+            old_g = sorted_idx[new_g]
+            new_params[zeta_start + new_g] = params[zeta_start + old_g]
+            new_se_m[zeta_start + new_g]   = se_m[zeta_start + old_g]
+            new_se_r[zeta_start + new_g]   = se_r[zeta_start + old_g]
 
     result.x = new_params
     return new_orders, new_se_m, new_se_r, pis[sorted_idx]
@@ -555,12 +608,21 @@ def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outco
     num_params = (k - 1) + sum([order + 1 for order in orders_list])
     if use_dropout: num_params += (3 * k)
     if dist == 'CNORM': num_params += 1
-    if dist == 'ZIP': num_params += (zip_iorder + 1)
+    if dist == 'ZIP': num_params += k  # one zeta per group
 
     # --- deterministic base ---
     base = np.zeros(num_params)
-    p_init = np.linspace(1.0 / (k + 1.0), k * 1.0 / (k + 1.0), k) if k > 1 else [0.5]
-    staggered_intercepts = np.log(p_init / (1.0 - np.array(p_init)))
+
+    if dist == 'POISSON':
+        # For Poisson (log-link): initialise intercepts near log(mean_outcome),
+        # staggered across groups so each group starts at a distinct value.
+        mean_out = np.mean(outcomes[outcomes > 0]) if np.any(outcomes > 0) else 1.0
+        log_mean = np.log(mean_out)
+        offsets = np.linspace(-0.5 * (k - 1), 0.5 * (k - 1), k)
+        staggered_intercepts = log_mean + offsets * 0.5
+    else:
+        p_init = np.linspace(1.0 / (k + 1.0), k * 1.0 / (k + 1.0), k) if k > 1 else [0.5]
+        staggered_intercepts = np.log(p_init / (1.0 - np.array(p_init)))
 
     current_beta_idx = k - 1
     for g in range(k):
@@ -577,8 +639,7 @@ def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outco
         sd_guess = np.std(outcomes)
         base[-1] = np.log(sd_guess) if sd_guess > 0 else np.log(1.0)
     elif dist == 'ZIP':
-        tau_start_idx = num_params - (zip_iorder + 1)
-        base[tau_start_idx] = -2.2
+        base[num_params - k:] = -1.0  # k per-group zeta params (logit ~= -1 => ~27% ZI)
 
     starts = [base.copy()]
 
@@ -609,6 +670,10 @@ def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outco
         if dist == 'CNORM':
             perturbed[-1] += np.random.normal(0, 0.2)
 
+        # zeta (ZIP per-group zero-inflation logits)
+        if dist == 'ZIP':
+            perturbed[-k:] += np.random.normal(0, 0.3, k)
+
         starts.append(perturbed)
 
     return starts
@@ -618,7 +683,7 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
-    dist_map = {'LOGIT': 0, 'CNORM': 1, 'ZIP': 3}
+    dist_map = {'LOGIT': 0, 'CNORM': 1, 'POISSON': 2, 'ZIP': 3}
     dist_code = dist_map.get(dist, 0)
 
     if dist == 'CNORM':
@@ -636,7 +701,7 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
     num_params = (k - 1) + sum([order + 1 for order in orders_list])
     if use_dropout: num_params += (3 * k)
     if dist == 'CNORM': num_params += 1
-    if dist == 'ZIP': num_params += (zip_iorder + 1)
+    if dist == 'ZIP': num_params += k  # one zeta per group
 
     starts = generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=n_starts)
 
@@ -661,7 +726,7 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
         print(f"  [multi-start] single model {orders_list}: best on start {best_start_idx + 1}/{n_starts} (NLL={best_nll:.4f})")
 
     result = best_result
-    is_valid, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num = process_optimization_result(
+    is_valid, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num, v_model = process_optimization_result(
         result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max
     )
 
@@ -676,7 +741,8 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
         'aic': aic_nagin, 'aic_nagin': aic_nagin, 'aic_standard': aic_standard, 'll': ll,
         'orders': orders_list, 'zip_iorder': zip_iorder, 'result': result, 'min_pct': min_group_size,
         'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust,
-        'dof': n_obs - num_params, 'cond_num': cond_num, 'dist': dist, 'cnorm_min': cnorm_min, 'cnorm_max': cnorm_max
+        'dof': n_obs - num_params, 'cond_num': cond_num, 'dist': dist, 'cnorm_min': cnorm_min, 'cnorm_max': cnorm_max,
+        'v_model': v_model
     }
 
 def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, zip_iorder=0, n_starts=3):
@@ -685,7 +751,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
-    dist_map = {'LOGIT': 0, 'CNORM': 1, 'ZIP': 3}
+    dist_map = {'LOGIT': 0, 'CNORM': 1, 'POISSON': 2, 'ZIP': 3}
     dist_code = dist_map.get(dist, 0)
 
     if dist == 'CNORM':
@@ -708,7 +774,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         num_params = (k - 1) + sum([order + 1 for order in orders_list])
         if use_dropout: num_params += (3 * k)
         if dist == 'CNORM': num_params += 1
-        if dist == 'ZIP': num_params += (zip_iorder + 1)
+        if dist == 'ZIP': num_params += k  # one zeta per group
 
         args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max))
         starts = generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=n_starts)
@@ -734,7 +800,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
             print(f"  [multi-start] autotraj {orders_list}: best on start {best_start_idx + 1}/{n_starts} (NLL={best_nll:.4f})")
 
         result = best_result
-        is_converged, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num = process_optimization_result(
+        is_converged, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num, v_model = process_optimization_result(
             result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max
         )
 
@@ -788,7 +854,8 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                     'bic': bic_nagin, 'bic_nagin': bic_nagin, 'bic_obs': bic_obs, 'bic_standard': bic_standard,
                     'aic': aic_nagin, 'aic_nagin': aic_nagin, 'aic_standard': aic_standard, 'll': ll,
                     'orders': orders_list, 'zip_iorder': zip_iorder, 'result': result, 'min_pct': min_group_size,
-                    'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust, 'dof': dof, 'cond_num': cond_num, 'dist': dist, 'cnorm_min': cnorm_min, 'cnorm_max': cnorm_max
+                    'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust, 'dof': dof, 'cond_num': cond_num, 'dist': dist, 'cnorm_min': cnorm_min, 'cnorm_max': cnorm_max,
+                    'v_model': v_model
                 })
         else:
             all_evaluated_models.append({
@@ -808,7 +875,7 @@ def get_subject_assignments(model_dict, df):
     use_dropout = model_dict['use_dropout']
     params = model_dict['result'].x
     dist = model_dict.get('dist', 'LOGIT')
-    dist_map = {'LOGIT': 0, 'CNORM': 1, 'ZIP': 3}
+    dist_map = {'LOGIT': 0, 'CNORM': 1, 'POISSON': 2, 'ZIP': 3}
     dist_code = dist_map.get(dist, 0)
     min_val = float(model_dict.get('cnorm_min', 0.0))
     max_val = float(model_dict.get('cnorm_max', 0.0))
@@ -831,8 +898,7 @@ def get_subject_assignments(model_dict, df):
         raw_sigma = params[-1]
         sigma = np.exp(raw_sigma) if raw_sigma < 20 else np.exp(20)
     elif dist == 'ZIP':
-        tau_start_idx = len(params) - (zip_iorder + 1)
-        group_alphas = params[tau_start_idx : tau_start_idx + zip_iorder + 1]
+        zeta_start = len(params) - k
     
     assignments = []
     n_subjects = len(subj_breaks) - 1
@@ -854,21 +920,25 @@ def get_subject_assignments(model_dict, df):
                 gamma_1 = params[current_gamma_idx + 1]
                 gamma_2 = params[current_gamma_idx + 2]
                 current_gamma_idx += 3
-            
+
+            zeta_g_zip = params[zeta_start + g] if dist_code == 3 else 0.0
+
             ll_g = 0.0
-            
+
             for obs in range(n_obs):
                 idx = start + obs
                 t_val = times[idx]
                 y_val = outcomes[idx]
-                
+
                 mu = sum(group_betas[p] * (t_val ** p) for p in range(orders[g] + 1))
-                
-                tau_t = 0.0
-                if dist_code == 3:
-                    for p in range(zip_iorder + 1): tau_t += group_alphas[p] * (t_val ** p)
-                
-                if dist_code == 1: # CNORM
+
+                if dist_code == 2: # POISSON
+                    eta = mu
+                    if eta > 20.0: eta = 20.0
+                    if eta < -20.0: eta = -20.0
+                    exp_eta = np.exp(eta)
+                    ll_g += y_val * eta - exp_eta - math.lgamma(y_val + 1.0)
+                elif dist_code == 1: # CNORM
                     if y_val <= min_val:
                         z = (min_val - mu) / sigma
                         ll_g += fast_norm_logcdf(z)
@@ -877,8 +947,8 @@ def get_subject_assignments(model_dict, df):
                         ll_g += fast_norm_logsf(z)
                     else:
                         ll_g += fast_norm_logpdf(y_val, mu, sigma)
-                elif dist_code == 3: # ZIP
-                    ll_val, _, _ = fast_zip_logpmf_grad(y_val, mu, tau_t)
+                elif dist_code == 3: # ZIP (per-group zeta)
+                    ll_val, _, _ = fast_zip_logpmf_grad(y_val, mu, zeta_g_zip)
                     ll_g += ll_val
                 else: # LOGIT
                     z = mu
