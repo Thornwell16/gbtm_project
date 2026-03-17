@@ -1,3 +1,55 @@
+"""
+app.py — AutoTraj Streamlit Web Interface
+==========================================
+Interactive front-end for the AutoTraj GBTM engine (main.py).  Provides a
+point-and-click workflow covering data loading, model configuration, result
+visualisation, and export.
+
+Layout overview
+---------------
+The app is organised into a sidebar (configuration) and five result tabs:
+
+  tab_viz  — Trajectory Plot
+      Interactive Plotly or Matplotlib trajectory curves with optional 95%
+      delta-method confidence bands, individual-subject spaghetti overlays,
+      fitted model equations (LaTeX), and download buttons (SVG / PNG / CSV).
+
+  tab_est  — Parameter Estimates
+      Full coefficient table (Estimate, model SE, robust SE, T-stat, P-value)
+      for all trajectory betas, dropout gammas (if fitted), CNORM sigma, and
+      ZIP zeta parameters.
+
+  tab_adq  — Adequacy Diagnostics
+      Per-group AvePP bar chart, posterior probability heatmap, observed vs.
+      estimated overlay, residual histogram + Q-Q plot + outlier table, BIC
+      elbow plot, and per-group entropy decomposition.
+
+  tab_char — Group Characteristics
+      Posterior-weighted baseline demographic table (TableOne), sorted by
+      group assignment probability.
+
+  tab_comp — Model Comparison
+      Interactive BIC elbow plot (all evaluated models), per-group membership
+      statistics, and a full results ZIP export.
+
+Key helper functions
+--------------------
+  _beta_start_indices      : Index mapping from orders_list to params vector.
+  _compute_ci_band         : Diagonal delta-method 95% CI on response scale.
+  get_parameter_estimates_for_ui : Build parameter table DataFrame.
+  _build_equation_latex    : LaTeX string for one group's fitted equation.
+  _posterior_heatmap       : E[P(g'|i) | assigned group = g] heatmap.
+  _entropy_decomposition   : Per-group relative entropy contributions.
+  _obs_vs_est_figure       : Posterior-weighted observed vs. estimated plot.
+  _residual_analysis       : Histogram, Q-Q, and outlier detection.
+  _make_model_summary_txt  : Plain-text model summary for ZIP export.
+
+References
+----------
+See MATH.md for all formula derivations.  See main.py module docstring for
+the mathematical model and optimisation details.
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np

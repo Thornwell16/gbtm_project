@@ -1,0 +1,41 @@
+[flake8]
+max-line-length = 120
+ignore =
+    # E501: line too long — handled by max-line-length above
+    E501,
+    # W503: line break before binary operator — conflicts with black style
+    W503,
+    # E203: whitespace before ':' — conflicts with numpy slice notation
+    E203,
+    # E741: ambiguous variable name — 'l', 'O', 'I' appear in math code
+    E741,
+    # E221: multiple spaces before operator — used for visual alignment in math code
+    E221,
+    # E226: missing whitespace around arithmetic operator — dense math expressions
+    E226,
+    # E302: expected 2 blank lines — relaxed for compact scientific modules
+    E302,
+    # E701: multiple statements on one line — common in Numba JIT type-dispatch code
+    E701,
+    # E261: at least two spaces before inline comment — math inline annotations
+    E261,
+    # W291/W292/W293: trailing whitespace / missing newline — pre-existing in codebase
+    W291,
+    W292,
+    W293,
+exclude =
+    __pycache__,
+    .git,
+    .github,
+    *.egg-info,
+    build,
+    dist,
+    verify_phase*.py
+per-file-ignores =
+    # Test files: allow long lines, unused imports for fixtures, whitespace in arrays
+    tests/*.py: E402, F401, F841, F541, E201, E241, E127
+    # app.py: streamlit requires st.set_page_config() before other imports (E402);
+    # E241/E128/F841/E261 are pre-existing style patterns in UI layout code
+    app.py: E402, E241, E128, F841, E261
+    # main.py: F841 unused vars in JIT kernels are intentional dead-code guards
+    main.py: F841
