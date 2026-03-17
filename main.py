@@ -29,6 +29,37 @@ def fast_norm_logsf(x):
     if sf_val < 1e-15: sf_val = 1e-15
     return np.log(sf_val)
 
+# --- C-LEVEL MATH HELPERS FOR ZIP ---
+@njit(cache=True)
+def fast_zip_logpmf_grad(y, z, tau):
+    if z > 50.0: z = 50.0
+    if z < -50.0: z = -50.0
+    lam = np.exp(z)
+    
+    if tau > 25.0: tau = 25.0
+    if tau < -25.0: tau = -25.0
+    rho = 1.0 / (1.0 + np.exp(-tau))
+    
+    if y == 0.0:
+        exp_neg_lam = np.exp(-lam)
+        p0 = rho + (1.0 - rho) * exp_neg_lam
+        p0 = max(1e-15, p0)
+        ll = np.log(p0)
+        
+        dLL_dlam = -(1.0 - rho) * exp_neg_lam / p0
+        err_mu = dLL_dlam * lam
+        
+        dLL_drho = (1.0 - exp_neg_lam) / p0
+        err_tau = dLL_drho * rho * (1.0 - rho)
+    else:
+        one_minus_rho = max(1e-15, 1.0 - rho)
+        ll = np.log(one_minus_rho) + y * z - lam - math.lgamma(y + 1.0)
+        
+        err_mu = y - lam
+        err_tau = -rho
+        
+    return ll, err_mu, err_tau
+
 # --- DATA PREP ---
 def load_cambridge_data():
     df = pd.read_csv("cambridge.txt", sep=r'\s+')
@@ -39,7 +70,6 @@ def prep_trajectory_data(df, id_col='ID', outcome_prefix='C', time_prefix='T'):
     id_col = id_col.strip()
     outcome_prefix = outcome_prefix.strip()
     time_prefix = time_prefix.strip()
-    
     long_df = pd.wide_to_long(df, stubnames=[outcome_prefix, time_prefix], i=id_col, j='Measurement_Period', suffix=r'\d+').reset_index()
     long_df = long_df.rename(columns={outcome_prefix: 'Outcome', time_prefix: 'Time', id_col: 'ID'})
     long_df = long_df.sort_values(by=['ID', 'Measurement_Period'])
@@ -88,85 +118,10 @@ def logsumexp_jit(a):
     for i in range(len(a)): sum_exp += np.exp(a[i] - max_val)
     return max_val + np.log(sum_exp)
 
-# --- LOGIT ENGINE ---
+# --- CORE LIKELIHOOD/GRADIENT ENGINE (UNIVERSAL) ---
 @njit(cache=True)
-def calc_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout):
-    k = len(orders)
-    thetas = np.zeros(k)
-    if k > 1: thetas[1:] = params[0 : k-1]
-        
-    max_theta = np.max(thetas)
-    sum_exp_theta = 0.0
-    for i in range(k): sum_exp_theta += np.exp(thetas[i] - max_theta)
-    log_pis = thetas - (max_theta + np.log(sum_exp_theta))
-    
-    num_betas = 0
-    for g in range(k): num_betas += orders[g] + 1
-    gamma_start_idx = (k - 1) + num_betas
-    
-    total_ll = 0.0
-    n_subjects = len(subj_breaks) - 1
-    
-    for i in range(n_subjects):
-        start = subj_breaks[i]
-        end = subj_breaks[i+1]
-        n_obs = end - start
-        subject_group_lls = np.zeros(k)
-        current_beta_idx = k - 1
-        current_gamma_idx = gamma_start_idx
-        
-        for g in range(k):
-            order = orders[g]
-            n_betas = order + 1
-            group_betas = params[current_beta_idx : current_beta_idx + n_betas]
-            current_beta_idx += n_betas
-            
-            if use_dropout:
-                gamma_0 = params[current_gamma_idx]
-                gamma_1 = params[current_gamma_idx + 1]
-                gamma_2 = params[current_gamma_idx + 2]
-                current_gamma_idx += 3
-            
-            ll_g = 0.0
-            for obs in range(n_obs):
-                idx = start + obs
-                t_val = times[idx]
-                y_val = outcomes[idx]
-                
-                z = 0.0
-                for p in range(order + 1): z += group_betas[p] * (t_val ** p)
-                if z > 25.0: z = 25.0
-                if z < -25.0: z = -25.0
-                
-                if z >= 0: ll_g += y_val * z - (z + np.log(1.0 + np.exp(-z)))
-                else: ll_g += y_val * z - np.log(1.0 + np.exp(z))
-                
-                if use_dropout and obs > 0:
-                    y_prev = outcomes[idx - 1]
-                    z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
-                    if z_drop > 25.0: z_drop = 25.0
-                    if z_drop < -25.0: z_drop = -25.0
-                    if z_drop >= 0: ll_g += -z_drop - np.log(1.0 + np.exp(-z_drop))
-                    else: ll_g += -np.log(1.0 + np.exp(z_drop))
-                    
-            if use_dropout:
-                last_idx = end - 1
-                if dropouts[last_idx] == 1.0:
-                    t_last = times[last_idx]
-                    y_last = outcomes[last_idx]
-                    z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
-                    if z_drop > 25.0: z_drop = 25.0
-                    if z_drop < -25.0: z_drop = -25.0
-                    if z_drop >= 0: ll_g += -np.log(1.0 + np.exp(-z_drop))
-                    else: ll_g += z_drop - np.log(1.0 + np.exp(z_drop))
-                
-            subject_group_lls[g] = log_pis[g] + ll_g
-        total_ll += logsumexp_jit(subject_group_lls)
-        
-    return -1.0 * total_ll
-
-@njit(cache=True)
-def calc_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout):
+def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max):
+    # dist_code: 0=LOGIT, 1=CNORM, 3=ZIP
     k = len(orders)
     thetas = np.zeros(k)
     if k > 1: thetas[1:] = params[0 : k-1]
@@ -190,244 +145,21 @@ def calc_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, o
     for g in range(k): num_betas += orders[g] + 1
     gamma_start_idx = (k - 1) + num_betas
     
-    for i in range(n_subjects):
-        start = subj_breaks[i]
-        end = subj_breaks[i+1]
-        n_obs = end - start
-        L_ig_log = np.zeros(k)
-        p_ig = np.zeros((k, n_obs))
-        current_beta_idx = k - 1
-        current_gamma_idx = gamma_start_idx
-        
-        for g in range(k):
-            order = orders[g]
-            n_betas = order + 1
-            group_betas = params[current_beta_idx : current_beta_idx + n_betas]
-            current_beta_idx += n_betas
-            
-            if use_dropout:
-                gamma_0 = params[current_gamma_idx]
-                gamma_1 = params[current_gamma_idx + 1]
-                gamma_2 = params[current_gamma_idx + 2]
-                current_gamma_idx += 3
-            
-            ll_g = 0.0
-            for obs in range(n_obs):
-                idx = start + obs
-                t_val = times[idx]
-                y_val = outcomes[idx]
-                
-                z = 0.0
-                for p in range(order + 1): z += group_betas[p] * (t_val ** p)
-                if z > 25.0: z = 25.0
-                if z < -25.0: z = -25.0
-                
-                prob = 1.0 / (1.0 + np.exp(-z)) if z >= 0 else np.exp(z) / (1.0 + np.exp(z))
-                prob = max(1e-12, min(1.0 - 1e-12, prob))
-                p_ig[g, obs] = prob
-                
-                if z >= 0: ll_g += y_val * z - (z + np.log(1.0 + np.exp(-z)))
-                else: ll_g += y_val * z - np.log(1.0 + np.exp(z))
-                
-                if use_dropout and obs > 0:
-                    y_prev = outcomes[idx - 1]
-                    z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
-                    if z_drop > 25.0: z_drop = 25.0
-                    if z_drop < -25.0: z_drop = -25.0
-                    if z_drop >= 0: ll_g += -z_drop - np.log(1.0 + np.exp(-z_drop))
-                    else: ll_g += -np.log(1.0 + np.exp(z_drop))
-                    
-            if use_dropout:
-                last_idx = end - 1
-                if dropouts[last_idx] == 1.0:
-                    t_last = times[last_idx]
-                    y_last = outcomes[last_idx]
-                    z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
-                    if z_drop > 25.0: z_drop = 25.0
-                    if z_drop < -25.0: z_drop = -25.0
-                    if z_drop >= 0: ll_g += -np.log(1.0 + np.exp(-z_drop))
-                    else: ll_g += z_drop - np.log(1.0 + np.exp(z_drop))
-                
-            L_ig_log[g] = ll_g
-            
-        numerator_log = np.zeros(k)
-        for g in range(k): numerator_log[g] = np.log(pis_safe[g]) + L_ig_log[g]
-        post_max = np.max(numerator_log)
-        post_sum_exp = 0.0
-        for g in range(k): post_sum_exp += np.exp(numerator_log[g] - post_max)
-        
-        posterior_ig = np.zeros(k)
-        for g in range(k):
-            posterior_ig[g] = np.exp(numerator_log[g] - (post_max + np.log(post_sum_exp)))
-            if k > 1 and g > 0:
-                grad_subj[i, g - 1] = -1.0 * (posterior_ig[g] - pis[g])
-            
-        current_beta_idx = k - 1
-        current_gamma_idx = gamma_start_idx
-        
-        for g in range(k):
-            order = orders[g]
-            n_betas = order + 1
-            if use_dropout:
-                gamma_0 = params[current_gamma_idx]
-                gamma_1 = params[current_gamma_idx + 1]
-                gamma_2 = params[current_gamma_idx + 2]
-            
-            for obs in range(n_obs):
-                idx = start + obs
-                t_val = times[idx]
-                error_y = (outcomes[idx] - p_ig[g, obs]) * posterior_ig[g]
-                for p in range(order + 1):
-                    grad_subj[i, current_beta_idx + p] += -1.0 * error_y * (t_val ** p)
-                    
-                if use_dropout and obs > 0:
-                    y_prev = outcomes[idx - 1]
-                    z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
-                    p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
-                    err_drop = (0.0 - p_drop) * posterior_ig[g] 
-                    grad_subj[i, current_gamma_idx] += -1.0 * err_drop * 1.0
-                    grad_subj[i, current_gamma_idx + 1] += -1.0 * err_drop * t_val
-                    grad_subj[i, current_gamma_idx + 2] += -1.0 * err_drop * y_prev
-                    
-            if use_dropout:
-                last_idx = end - 1
-                if dropouts[last_idx] == 1.0:
-                    t_last = times[last_idx]
-                    y_last = outcomes[last_idx]
-                    z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
-                    p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
-                    err_drop = (1.0 - p_drop) * posterior_ig[g] 
-                    grad_subj[i, current_gamma_idx] += -1.0 * err_drop * 1.0
-                    grad_subj[i, current_gamma_idx + 1] += -1.0 * err_drop * t_last
-                    grad_subj[i, current_gamma_idx + 2] += -1.0 * err_drop * y_last
-                current_gamma_idx += 3
-            current_beta_idx += n_betas
-            
-    return grad_subj
-
-@njit(cache=True)
-def calc_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout):
-    grad_subj = calc_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout)
-    grad_flat = np.zeros(len(params))
-    for i in range(grad_subj.shape[0]):
-        for j in range(grad_subj.shape[1]):
-            grad_flat[j] += grad_subj[i, j]
-    return grad_flat
-
-# --- CNORM ENGINE ---
-@njit(cache=True)
-def calc_cnorm_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout, min_val, max_val):
-    k = len(orders)
-    thetas = np.zeros(k)
-    if k > 1: thetas[1:] = params[0 : k-1]
-        
-    max_theta = np.max(thetas)
-    sum_exp_theta = 0.0
-    for i in range(k): sum_exp_theta += np.exp(thetas[i] - max_theta)
-    log_pis = thetas - (max_theta + np.log(sum_exp_theta))
+    sigma = 1.0
+    var = 1.0
+    sigma_idx = -1
+    tau_start_idx = -1
     
-    num_betas = 0
-    for g in range(k): num_betas += orders[g] + 1
-    gamma_start_idx = (k - 1) + num_betas
-    
-    raw_sigma = params[-1]
-    sigma = np.exp(raw_sigma) if raw_sigma < 20 else np.exp(20) 
+    if dist_code == 1: # CNORM
+        sigma_idx = len(params) - 1
+        raw_sigma = params[sigma_idx]
+        sigma = np.exp(raw_sigma) if raw_sigma < 20 else np.exp(20)
+        var = sigma ** 2
+    elif dist_code == 3: # ZIP
+        tau_start_idx = len(params) - (zip_iorder + 1)
+        group_alphas = params[tau_start_idx : tau_start_idx + zip_iorder + 1]
     
     total_ll = 0.0
-    n_subjects = len(subj_breaks) - 1
-    
-    for i in range(n_subjects):
-        start = subj_breaks[i]
-        end = subj_breaks[i+1]
-        n_obs = end - start
-        subject_group_lls = np.zeros(k)
-        
-        current_beta_idx = k - 1
-        current_gamma_idx = gamma_start_idx
-        
-        for g in range(k):
-            order = orders[g]
-            n_betas = order + 1
-            group_betas = params[current_beta_idx : current_beta_idx + n_betas]
-            current_beta_idx += n_betas
-            
-            if use_dropout:
-                gamma_0 = params[current_gamma_idx]
-                gamma_1 = params[current_gamma_idx + 1]
-                gamma_2 = params[current_gamma_idx + 2]
-                current_gamma_idx += 3
-            
-            ll_g = 0.0
-            for obs in range(n_obs):
-                idx = start + obs
-                t_val = times[idx]
-                y_val = outcomes[idx]
-                
-                mu = 0.0
-                for p in range(order + 1): mu += group_betas[p] * (t_val ** p)
-                
-                if y_val <= min_val:
-                    z_val = (min_val - mu) / sigma
-                    ll_g += fast_norm_logcdf(z_val)
-                elif y_val >= max_val:
-                    z_val = (max_val - mu) / sigma
-                    ll_g += fast_norm_logsf(z_val)
-                else:
-                    ll_g += fast_norm_logpdf(y_val, mu, sigma)
-                
-                if use_dropout and obs > 0:
-                    y_prev = outcomes[idx - 1]
-                    z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
-                    if z_drop > 25.0: z_drop = 25.0
-                    if z_drop < -25.0: z_drop = -25.0
-                    if z_drop >= 0: ll_g += -z_drop - np.log(1.0 + np.exp(-z_drop))
-                    else: ll_g += -np.log(1.0 + np.exp(z_drop))
-                    
-            if use_dropout:
-                last_idx = end - 1
-                if dropouts[last_idx] == 1.0:
-                    t_last = times[last_idx]
-                    y_last = outcomes[last_idx]
-                    z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
-                    if z_drop > 25.0: z_drop = 25.0
-                    if z_drop < -25.0: z_drop = -25.0
-                    if z_drop >= 0: ll_g += -np.log(1.0 + np.exp(-z_drop))
-                    else: ll_g += z_drop - np.log(1.0 + np.exp(z_drop))
-                
-            subject_group_lls[g] = log_pis[g] + ll_g
-        total_ll += logsumexp_jit(subject_group_lls)
-        
-    return -1.0 * total_ll
-
-@njit(cache=True)
-def calc_cnorm_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout, min_val, max_val):
-    k = len(orders)
-    thetas = np.zeros(k)
-    if k > 1: thetas[1:] = params[0 : k-1]
-        
-    max_theta = np.max(thetas)
-    sum_exp_theta = 0.0
-    for i in range(k): sum_exp_theta += np.exp(thetas[i] - max_theta)
-    log_pis = thetas - (max_theta + np.log(sum_exp_theta))
-    
-    pis = np.empty(k)
-    pis_safe = np.empty(k)
-    for i in range(k):
-        p_val = np.exp(log_pis[i])
-        pis[i] = p_val
-        pis_safe[i] = 1e-15 if p_val < 1e-15 else p_val
-        
-    n_subjects = len(subj_breaks) - 1
-    grad_subj = np.zeros((n_subjects, len(params)))
-    
-    num_betas = 0
-    for g in range(k): num_betas += orders[g] + 1
-    gamma_start_idx = (k - 1) + num_betas
-    
-    sigma_idx = len(params) - 1
-    raw_sigma = params[sigma_idx]
-    sigma = np.exp(raw_sigma) if raw_sigma < 20 else np.exp(20)
-    var = sigma ** 2
     
     for i in range(n_subjects):
         start = subj_breaks[i]
@@ -436,7 +168,7 @@ def calc_cnorm_subject_gradients_jit(params, times, outcomes, dropouts, subj_bre
         
         L_ig_log = np.zeros(k)
         err_mu_ig = np.zeros((k, n_obs))
-        err_sigma_ig = np.zeros((k, n_obs))
+        err_aux_ig = np.zeros((k, n_obs)) # Used for sigma in CNORM or tau in ZIP
         
         current_beta_idx = k - 1
         current_gamma_idx = gamma_start_idx
@@ -454,6 +186,7 @@ def calc_cnorm_subject_gradients_jit(params, times, outcomes, dropouts, subj_bre
                 current_gamma_idx += 3
             
             ll_g = 0.0
+            
             for obs in range(n_obs):
                 idx = start + obs
                 t_val = times[idx]
@@ -462,33 +195,44 @@ def calc_cnorm_subject_gradients_jit(params, times, outcomes, dropouts, subj_bre
                 mu = 0.0
                 for p in range(order + 1): mu += group_betas[p] * (t_val ** p)
                 
-                if y_val <= min_val:
-                    z = (min_val - mu) / sigma
-                    cdf_val = 0.5 * math.erfc(-z / math.sqrt(2.0))
-                    cdf_val = max(1e-15, cdf_val)
-                    pdf_val = fast_norm_pdf(z)
-                    imr = pdf_val / cdf_val 
+                if dist_code == 0: # LOGIT
+                    if mu > 25.0: mu = 25.0
+                    if mu < -25.0: mu = -25.0
+                    prob = 1.0 / (1.0 + np.exp(-mu)) if mu >= 0 else np.exp(mu) / (1.0 + np.exp(mu))
+                    prob = max(1e-12, min(1.0 - 1e-12, prob))
+                    if mu >= 0: ll_g += y_val * mu - (mu + np.log(1.0 + np.exp(-mu)))
+                    else: ll_g += y_val * mu - np.log(1.0 + np.exp(mu))
+                    err_mu_ig[g, obs] = y_val - prob
                     
-                    ll_g += np.log(cdf_val)
-                    err_mu_ig[g, obs] = -(1.0 / sigma) * imr
-                    err_sigma_ig[g, obs] = -z * imr 
-                    
-                elif y_val >= max_val:
-                    z = (max_val - mu) / sigma
-                    sf_val = 0.5 * math.erfc(z / math.sqrt(2.0))
-                    sf_val = max(1e-15, sf_val)
-                    pdf_val = fast_norm_pdf(z)
-                    imr = pdf_val / sf_val
-                    
-                    ll_g += np.log(sf_val)
-                    err_mu_ig[g, obs] = (1.0 / sigma) * imr
-                    err_sigma_ig[g, obs] = z * imr
-                    
-                else:
-                    z = (y_val - mu) / sigma
-                    ll_g += fast_norm_logpdf(y_val, mu, sigma)
-                    err_mu_ig[g, obs] = (y_val - mu) / var
-                    err_sigma_ig[g, obs] = -1.0 + (z ** 2)
+                elif dist_code == 1: # CNORM
+                    if y_val <= cnorm_min:
+                        z = (cnorm_min - mu) / sigma
+                        cdf_val = max(1e-15, 0.5 * math.erfc(-z / math.sqrt(2.0)))
+                        imr = fast_norm_pdf(z) / cdf_val 
+                        ll_g += np.log(cdf_val)
+                        err_mu_ig[g, obs] = -(1.0 / sigma) * imr
+                        err_aux_ig[g, obs] = -z * imr 
+                    elif y_val >= cnorm_max:
+                        z = (cnorm_max - mu) / sigma
+                        sf_val = max(1e-15, 0.5 * math.erfc(z / math.sqrt(2.0)))
+                        imr = fast_norm_pdf(z) / sf_val
+                        ll_g += np.log(sf_val)
+                        err_mu_ig[g, obs] = (1.0 / sigma) * imr
+                        err_aux_ig[g, obs] = z * imr
+                    else:
+                        z = (y_val - mu) / sigma
+                        ll_g += fast_norm_logpdf(y_val, mu, sigma)
+                        err_mu_ig[g, obs] = (y_val - mu) / var
+                        err_aux_ig[g, obs] = -1.0 + (z ** 2)
+                        
+                elif dist_code == 3: # ZIP
+                    tau_t = 0.0
+                    for p in range(zip_iorder + 1): 
+                        tau_t += group_alphas[p] * (t_val ** p)
+                    ll_val, err_m, err_t = fast_zip_logpmf_grad(y_val, mu, tau_t)
+                    ll_g += ll_val
+                    err_mu_ig[g, obs] = err_m
+                    err_aux_ig[g, obs] = err_t 
                 
                 if use_dropout and obs > 0:
                     y_prev = outcomes[idx - 1]
@@ -522,6 +266,8 @@ def calc_cnorm_subject_gradients_jit(params, times, outcomes, dropouts, subj_bre
             posterior_ig[g] = np.exp(numerator_log[g] - (post_max + np.log(post_sum_exp)))
             if k > 1 and g > 0:
                 grad_subj[i, g - 1] = -1.0 * (posterior_ig[g] - pis[g])
+                
+        total_ll += (post_max + np.log(post_sum_exp))
             
         current_beta_idx = k - 1
         current_gamma_idx = gamma_start_idx
@@ -542,8 +288,12 @@ def calc_cnorm_subject_gradients_jit(params, times, outcomes, dropouts, subj_bre
                 for p in range(order + 1):
                     grad_subj[i, current_beta_idx + p] += -1.0 * weighted_err_mu * (t_val ** p)
                 
-                weighted_err_sigma = err_sigma_ig[g, obs] * posterior_ig[g]
-                grad_subj[i, sigma_idx] += -1.0 * weighted_err_sigma
+                if dist_code == 1: # CNORM Sigma Grad
+                    grad_subj[i, sigma_idx] += -1.0 * err_aux_ig[g, obs] * posterior_ig[g]
+                elif dist_code == 3: # ZIP Global Alpha Grad
+                    weighted_err_tau = err_aux_ig[g, obs] * posterior_ig[g]
+                    for p in range(zip_iorder + 1):
+                        grad_subj[i, tau_start_idx + p] += -1.0 * weighted_err_tau * (t_val ** p)
                     
                 if use_dropout and obs > 0:
                     y_prev = outcomes[idx - 1]
@@ -568,26 +318,32 @@ def calc_cnorm_subject_gradients_jit(params, times, outcomes, dropouts, subj_bre
                 current_gamma_idx += 3
             current_beta_idx += n_betas
             
-    return grad_subj
-
-@njit(cache=True)
-def calc_cnorm_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout, min_val, max_val):
-    grad_subj = calc_cnorm_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, use_dropout, min_val, max_val)
     grad_flat = np.zeros(len(params))
     for i in range(grad_subj.shape[0]):
         for j in range(grad_subj.shape[1]):
             grad_flat[j] += grad_subj[i, j]
+            
+    return -1.0 * total_ll, grad_flat, grad_subj
+
+def calc_nll_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max):
+    nll, _, _ = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max)
+    return nll
+
+def calc_jac_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max):
+    _, grad_flat, _ = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max)
     return grad_flat
 
 # --- ENGINE WRAPPERS ---
-def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor, dist, cnorm_min, cnorm_max):
+def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max):
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
     orders_arr = np.array(orders_list, dtype=np.int32)
     k = len(orders_list)
+    dist_map = {'LOGIT': 0, 'CNORM': 1, 'ZIP': 3}
+    dist_code = dist_map.get(dist, 0)
     
     if not (result.success or result.status == 2):
-        return False, np.nan, np.nan, np.nan, np.nan, None, None, None, np.nan
+        return False, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, None, None, None, np.nan
         
     D_diag = np.ones(num_params)
     current_beta_idx = k - 1
@@ -603,22 +359,18 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
             current_gamma_idx += 3
             
     if dist == 'CNORM':
-        D_diag[-1] = 1.0 # Sigma is not impacted by time scaling
+        D_diag[-1] = 1.0 
+    elif dist == 'ZIP':
+        tau_start_idx = num_params - (zip_iorder + 1)
+        for p in range(zip_iorder + 1):
+            D_diag[tau_start_idx + p] = 1.0 / (scale_factor ** p)
         
     D = np.diag(D_diag)
     
     try:
         times_scaled = times / scale_factor
+        args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max))
         
-        if dist == 'CNORM':
-            args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout, cnorm_min, cnorm_max)
-            jac_fun = calc_cnorm_dynamic_jacobian_jit
-            grad_subj_fun = calc_cnorm_subject_gradients_jit
-        else:
-            args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
-            jac_fun = calc_dynamic_jacobian_jit
-            grad_subj_fun = calc_subject_gradients_jit
-            
         H_scaled = np.zeros((num_params, num_params))
         for i in range(num_params):
             eps_i = 1e-5 * max(1.0, abs(result.x[i]))
@@ -628,8 +380,8 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
             p_minus = np.copy(result.x)
             p_plus[i] += eps_i
             p_minus[i] -= eps_i
-            g_plus = jac_fun(p_plus, *args)
-            g_minus = jac_fun(p_minus, *args)
+            g_plus = calc_jac_wrapper(p_plus, *args)
+            g_minus = calc_jac_wrapper(p_minus, *args)
             H_scaled[i, :] = (g_plus - g_minus) / (2.0 * eps_i)
             
         H_scaled = (H_scaled + H_scaled.T) / 2.0 
@@ -641,7 +393,7 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
             
         H_inv_scaled = np.linalg.pinv(H_scaled, rcond=1e-10) 
         
-        grad_subj_scaled = grad_subj_fun(result.x, *args)
+        _, _, grad_subj_scaled = calc_universal_subject_gradients_jit(result.x, *args)
         G_scaled = grad_subj_scaled.T @ grad_subj_scaled
         V_robust_scaled = H_inv_scaled @ G_scaled @ H_inv_scaled
     except Exception:
@@ -656,22 +408,26 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     se_model = np.sqrt(np.abs(np.diag(V_model_unscaled)))
     se_robust = np.sqrt(np.abs(np.diag(V_robust_unscaled)))
     
-    ll = -1.0 * result.fun 
-    aic = ll - num_params
-    bic_subj = ll - 0.5 * num_params * np.log(n_subjects)
+    ll = -1.0 * result.fun
+    aic_nagin = ll - num_params
+    bic_nagin = ll - 0.5 * num_params * np.log(n_subjects)
     bic_obs = ll - 0.5 * num_params * np.log(n_obs)
-    
+    aic_standard = -2.0 * ll + 2.0 * num_params
+    bic_standard = -2.0 * ll + num_params * np.log(n_subjects)
+
     thetas = np.zeros(k)
     if k > 1: thetas[1:] = params_unscaled[0 : k-1]
     pis = np.exp(thetas - logsumexp(thetas))
-    
-    result.x = params_unscaled
-    return True, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis, cond_num
 
-def run_single_model(df, orders_list, use_dropout=False, dist='LOGIT', cnorm_min=None, cnorm_max=None):
+    result.x = params_unscaled
+    return True, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num
+
+def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0):
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
+    dist_map = {'LOGIT': 0, 'CNORM': 1, 'ZIP': 3}
+    dist_code = dist_map.get(dist, 0)
     
     if dist == 'CNORM':
         if cnorm_min is None or np.isnan(cnorm_min): cnorm_min = np.min(outcomes)
@@ -683,11 +439,13 @@ def run_single_model(df, orders_list, use_dropout=False, dist='LOGIT', cnorm_min
     
     orders_arr = np.array(orders_list, dtype=np.int32)
     k = len(orders_list)
+    
     num_params = (k - 1) + sum([order + 1 for order in orders_list])
     if use_dropout: num_params += (3 * k)
     if dist == 'CNORM': num_params += 1
-    initial_guess = np.zeros(num_params)
+    if dist == 'ZIP': num_params += (zip_iorder + 1)
     
+    initial_guess = np.zeros(num_params)
     p_init = np.linspace(1.0 / (k + 1.0), k * 1.0 / (k + 1.0), k) if k > 1 else [0.5]
     staggered_intercepts = np.log(p_init / (1.0 - np.array(p_init)))
     
@@ -705,37 +463,38 @@ def run_single_model(df, orders_list, use_dropout=False, dist='LOGIT', cnorm_min
     if dist == 'CNORM':
         sd_guess = np.std(outcomes)
         initial_guess[-1] = np.log(sd_guess) if sd_guess > 0 else np.log(1.0)
-        args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout, cnorm_min, cnorm_max)
-        obj_fun = calc_cnorm_dynamic_nll_jit
-        jac_fun = calc_cnorm_dynamic_jacobian_jit
-    else:
-        args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
-        obj_fun = calc_dynamic_nll_jit
-        jac_fun = calc_dynamic_jacobian_jit
+    elif dist == 'ZIP':
+        tau_start_idx = len(initial_guess) - (zip_iorder + 1)
+        initial_guess[tau_start_idx] = -2.2 # Global intercept initialized to ~10%
+            
+    args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max))
     
     result = minimize(
-        obj_fun, initial_guess, args=args,
-        method='BFGS', jac=jac_fun, options={'maxiter': 3000, 'gtol': 1e-6}
+        calc_nll_wrapper, initial_guess, args=args,
+        method='BFGS', jac=calc_jac_wrapper, options={'maxiter': 3000, 'gtol': 1e-6}
     )
     
-    is_valid, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis, cond_num = process_optimization_result(
-        result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor, dist, cnorm_min, cnorm_max
+    is_valid, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num = process_optimization_result(
+        result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max
     )
-    
+
     min_group_size = np.min(pis) * 100 if is_valid else np.nan
     return {
-        'bic': bic_subj, 'bic_obs': bic_obs, 'aic': aic, 'll': ll, 
-        'orders': orders_list, 'result': result, 'min_pct': min_group_size, 
+        'bic': bic_nagin, 'bic_nagin': bic_nagin, 'bic_obs': bic_obs, 'bic_standard': bic_standard,
+        'aic': aic_nagin, 'aic_nagin': aic_nagin, 'aic_standard': aic_standard, 'll': ll,
+        'orders': orders_list, 'zip_iorder': zip_iorder, 'result': result, 'min_pct': min_group_size,
         'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust,
         'dof': n_obs - num_params, 'cond_num': cond_num, 'dist': dist, 'cnorm_min': cnorm_min, 'cnorm_max': cnorm_max
     }
 
-def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False, dist='LOGIT', cnorm_min=None, cnorm_max=None):
+def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, zip_iorder=0):
     valid_models = []
     all_evaluated_models = []
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
+    dist_map = {'LOGIT': 0, 'CNORM': 1, 'ZIP': 3}
+    dist_code = dist_map.get(dist, 0)
     
     if dist == 'CNORM':
         if cnorm_min is None or np.isnan(cnorm_min): cnorm_min = np.min(outcomes)
@@ -753,9 +512,11 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
     for i, orders_list in enumerate(all_combinations):
         orders_arr = np.array(orders_list, dtype=np.int32)
         k = len(orders_list)
+        
         num_params = (k - 1) + sum([order + 1 for order in orders_list])
         if use_dropout: num_params += (3 * k)
         if dist == 'CNORM': num_params += 1
+        if dist == 'ZIP': num_params += (zip_iorder + 1)
         initial_guess = np.zeros(num_params)
         
         p_init = np.linspace(1.0 / (k + 1.0), k * 1.0 / (k + 1.0), k) if k > 1 else [0.5]
@@ -775,21 +536,19 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         if dist == 'CNORM':
             sd_guess = np.std(outcomes)
             initial_guess[-1] = np.log(sd_guess) if sd_guess > 0 else np.log(1.0)
-            args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout, cnorm_min, cnorm_max)
-            obj_fun = calc_cnorm_dynamic_nll_jit
-            jac_fun = calc_cnorm_dynamic_jacobian_jit
-        else:
-            args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, use_dropout)
-            obj_fun = calc_dynamic_nll_jit
-            jac_fun = calc_dynamic_jacobian_jit
+        elif dist == 'ZIP':
+            tau_start_idx = len(initial_guess) - (zip_iorder + 1)
+            initial_guess[tau_start_idx] = -2.2 
+            
+        args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max))
         
         result = minimize(
-            obj_fun, initial_guess, args=args,
-            method='BFGS', jac=jac_fun, options={'maxiter': 3000, 'gtol': 1e-6}
+            calc_nll_wrapper, initial_guess, args=args,
+            method='BFGS', jac=calc_jac_wrapper, options={'maxiter': 3000, 'gtol': 1e-6}
         )
         
-        is_converged, ll, aic, bic_subj, bic_obs, se_model, se_robust, pis, cond_num = process_optimization_result(
-            result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, use_dropout, scale_factor, dist, cnorm_min, cnorm_max
+        is_converged, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num = process_optimization_result(
+            result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max
         )
         
         if is_converged:
@@ -829,32 +588,40 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
             
             all_evaluated_models.append({
                 'Groups': k, 'Orders': str(orders_list), 'Status': status,
-                'BIC': bic_subj, 'AIC': aic, 'LL': ll, 'Min_Group_%': min_group_size
+                'BIC (Nagin)': bic_nagin, 'BIC (Standard)': bic_standard,
+                'AIC (Nagin)': aic_nagin, 'AIC (Standard)': aic_standard,
+                'LL': ll, 'Min_Group_%': min_group_size
             })
-            
+
             if is_valid:
                 valid_models.append({
-                    'bic': bic_subj, 'bic_obs': bic_obs, 'aic': aic, 'll': ll,
-                    'orders': orders_list, 'result': result, 'min_pct': min_group_size, 
+                    'bic': bic_nagin, 'bic_nagin': bic_nagin, 'bic_obs': bic_obs, 'bic_standard': bic_standard,
+                    'aic': aic_nagin, 'aic_nagin': aic_nagin, 'aic_standard': aic_standard, 'll': ll,
+                    'orders': orders_list, 'zip_iorder': zip_iorder, 'result': result, 'min_pct': min_group_size,
                     'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust, 'dof': dof, 'cond_num': cond_num, 'dist': dist, 'cnorm_min': cnorm_min, 'cnorm_max': cnorm_max
                 })
         else:
             all_evaluated_models.append({
                 'Groups': k, 'Orders': str(orders_list), 'Status': "Failed Convergence",
-                'BIC': np.nan, 'AIC': np.nan, 'LL': np.nan, 'Min_Group_%': np.nan
+                'BIC (Nagin)': np.nan, 'BIC (Standard)': np.nan,
+                'AIC (Nagin)': np.nan, 'AIC (Standard)': np.nan,
+                'LL': np.nan, 'Min_Group_%': np.nan
             })
-                
-    valid_models = sorted(valid_models, key=lambda x: x['bic'], reverse=True) 
-    all_evaluated_models = sorted(all_evaluated_models, key=lambda x: x['BIC'] if pd.notnull(x['BIC']) else -np.inf, reverse=True)
+
+    valid_models = sorted(valid_models, key=lambda x: x['bic_nagin'], reverse=True)
+    all_evaluated_models = sorted(all_evaluated_models, key=lambda x: x['BIC (Nagin)'] if pd.notnull(x['BIC (Nagin)']) else -np.inf, reverse=True)
     return valid_models, all_evaluated_models
 
 def get_subject_assignments(model_dict, df):
     orders = model_dict['orders']
+    zip_iorder = model_dict.get('zip_iorder', 0)
     use_dropout = model_dict['use_dropout']
     params = model_dict['result'].x
     dist = model_dict.get('dist', 'LOGIT')
-    min_val = model_dict.get('cnorm_min', 0)
-    max_val = model_dict.get('cnorm_max', 0)
+    dist_map = {'LOGIT': 0, 'CNORM': 1, 'ZIP': 3}
+    dist_code = dist_map.get(dist, 0)
+    min_val = float(model_dict.get('cnorm_min', 0.0))
+    max_val = float(model_dict.get('cnorm_max', 0.0))
     
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     ids = df['ID'].values
@@ -873,6 +640,9 @@ def get_subject_assignments(model_dict, df):
     if dist == 'CNORM':
         raw_sigma = params[-1]
         sigma = np.exp(raw_sigma) if raw_sigma < 20 else np.exp(20)
+    elif dist == 'ZIP':
+        tau_start_idx = len(params) - (zip_iorder + 1)
+        group_alphas = params[tau_start_idx : tau_start_idx + zip_iorder + 1]
     
     assignments = []
     n_subjects = len(subj_breaks) - 1
@@ -896,6 +666,7 @@ def get_subject_assignments(model_dict, df):
                 current_gamma_idx += 3
             
             ll_g = 0.0
+            
             for obs in range(n_obs):
                 idx = start + obs
                 t_val = times[idx]
@@ -903,7 +674,11 @@ def get_subject_assignments(model_dict, df):
                 
                 mu = sum(group_betas[p] * (t_val ** p) for p in range(orders[g] + 1))
                 
-                if dist == 'CNORM':
+                tau_t = 0.0
+                if dist_code == 3:
+                    for p in range(zip_iorder + 1): tau_t += group_alphas[p] * (t_val ** p)
+                
+                if dist_code == 1: # CNORM
                     if y_val <= min_val:
                         z = (min_val - mu) / sigma
                         ll_g += fast_norm_logcdf(z)
@@ -912,7 +687,10 @@ def get_subject_assignments(model_dict, df):
                         ll_g += fast_norm_logsf(z)
                     else:
                         ll_g += fast_norm_logpdf(y_val, mu, sigma)
-                else:
+                elif dist_code == 3: # ZIP
+                    ll_val, _, _ = fast_zip_logpmf_grad(y_val, mu, tau_t)
+                    ll_g += ll_val
+                else: # LOGIT
                     z = mu
                     if z > 25.0: z = 25.0
                     if z < -25.0: z = -25.0
