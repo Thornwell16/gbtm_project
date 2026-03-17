@@ -368,7 +368,7 @@ def _obs_vs_est_figure(long_df, assignments_df, winning_model, group_names, dist
     beta_info      = _beta_start_indices(orders)
     k              = len(orders)
     prob_cols      = [f'Group_{g+1}_Prob' for g in range(k)]
-    colors         = ['#EF553B', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3', '#FF6692']
+    colors         = ['#2B6083', '#B5373A', '#D4A843', '#2E7D52', '#7B4F8A', '#C97B2A']
 
     # Merge posterior weights onto long_df
     merged = pd.merge(long_df, assignments_df[['ID'] + prob_cols], on='ID', how='left')
@@ -471,7 +471,7 @@ def _residual_analysis(long_df, assignments_df, winning_model, group_names, dist
     colors_map = {r['Assigned_Group']: f"Group {r['Assigned_Group']}"
                   for r in subj_records}
     fig_hist = go.Figure()
-    palette  = ['#EF553B', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3', '#FF6692']
+    palette  = ['#2B6083', '#B5373A', '#D4A843', '#2E7D52', '#7B4F8A', '#C97B2A']
     for g_num in sorted(resid_df['Assigned_Group'].unique()):
         sub = resid_df[resid_df['Assigned_Group'] == g_num]['Mean_Residual']
         gname = group_names[g_num - 1] if g_num - 1 < len(group_names) else f"Group {g_num}"
@@ -490,6 +490,8 @@ def _residual_analysis(long_df, assignments_df, winning_model, group_names, dist
     fig_qq = None
     if dist_type == 'CNORM':
         fig_qq, ax_qq = plt.subplots(figsize=(5, 4))
+        fig_qq.patch.set_facecolor('none')
+        ax_qq.patch.set_facecolor('none')
         res_pp = probplot(np.array(all_obs_resid), dist="norm")
         ax_qq.plot(res_pp[0][0], res_pp[0][1], 'o', alpha=0.4, color='steelblue',
                    markersize=3, label='Residuals')
@@ -508,6 +510,313 @@ def _residual_analysis(long_df, assignments_df, winning_model, group_names, dist
 
 st.set_page_config(page_title="AutoTraj | GBTM Engine", layout="wide")
 
+# ── Brand Theme CSS ────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* ===== CSS Design Tokens ===== */
+/* All theme-sensitive colors are defined here as custom properties.
+   Brand accents (gold, blue, red, green) are the same in both themes.
+   Backgrounds, text, and borders flip between light and dark.          */
+:root {
+    /* Backgrounds */
+    --at-bg-page:    #FEFCF9;
+    --at-bg-cream:   #FAF6F0;
+    --at-bg-card:    #E8F1F5;
+    --at-bg-surface: #FFFFFF;
+    --at-bg-sidebar: #1B3A4B;
+    --at-bg-input:   #243F52;
+    /* Text */
+    --at-text-pri:   #1A1A2E;
+    --at-text-mut:   #5A6977;
+    --at-text-deep:  #1B3A4B;
+    /* Borders */
+    --at-border:     #E0E0E0;
+    --at-border-sub: #E8F1F5;
+    /* Message tints (low-opacity backgrounds) */
+    --at-msg-ok:     rgba(46, 125, 82,  0.07);
+    --at-msg-warn:   rgba(212, 168, 67, 0.08);
+    --at-msg-err:    rgba(181, 55,  58, 0.07);
+    --at-msg-info:   rgba(43,  96,  131,0.07);
+    /* Brand accents — identical in light and dark */
+    --at-gold:       #D4A843;
+    --at-gold-warm:  #C49A2E;
+    --at-gold-dim:   #C8B87A;
+    --at-blue:       #2B6083;
+    --at-navy:       #1B3A4B;
+    --at-red:        #B5373A;
+    --at-green:      #2E7D52;
+}
+
+/* ===== Dark Mode — system media query ===== */
+@media (prefers-color-scheme: dark) {
+    :root {
+        --at-bg-page:    #0E1117;
+        --at-bg-cream:   #1A1D23;
+        --at-bg-card:    #1B2838;
+        --at-bg-surface: #151920;
+        --at-bg-sidebar: #0A1929;
+        --at-bg-input:   #1A2535;
+        --at-text-pri:   #E0E0E0;
+        --at-text-mut:   #8899AA;
+        --at-text-deep:  #C5D5E5;
+        --at-border:     #2A3040;
+        --at-border-sub: #252B35;
+        /* Richer tints so messages read against dark bg */
+        --at-msg-ok:     rgba(46, 125, 82,  0.20);
+        --at-msg-warn:   rgba(212, 168, 67, 0.18);
+        --at-msg-err:    rgba(181, 55,  58, 0.20);
+        --at-msg-info:   rgba(43,  96,  131,0.20);
+    }
+}
+
+/* ===== Dark Mode — Streamlit in-app theme toggle ===== */
+/* Streamlit sets data-theme="dark" on <html> when the user
+   switches via Settings → Theme → Dark.                    */
+[data-theme="dark"] {
+    --at-bg-page:    #0E1117;
+    --at-bg-cream:   #1A1D23;
+    --at-bg-card:    #1B2838;
+    --at-bg-surface: #151920;
+    --at-bg-sidebar: #0A1929;
+    --at-bg-input:   #1A2535;
+    --at-text-pri:   #E0E0E0;
+    --at-text-mut:   #8899AA;
+    --at-text-deep:  #C5D5E5;
+    --at-border:     #2A3040;
+    --at-border-sub: #252B35;
+    --at-msg-ok:     rgba(46, 125, 82,  0.20);
+    --at-msg-warn:   rgba(212, 168, 67, 0.18);
+    --at-msg-err:    rgba(181, 55,  58, 0.20);
+    --at-msg-info:   rgba(43,  96,  131,0.20);
+}
+
+/* ===== Base & Page ===== */
+html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+    background-color: var(--at-bg-page);
+}
+.main .block-container {
+    background-color: var(--at-bg-page);
+    padding-top: 1.5rem;
+}
+
+/* ===== Sidebar ===== */
+/* The sidebar is always a dark panel — gold/white text on navy bg —
+   so sidebar brand/label colors are hardcoded, not variable.        */
+[data-testid="stSidebar"] {
+    background-color: var(--at-bg-sidebar) !important;
+}
+[data-testid="stSidebar"] .stMarkdown p,
+[data-testid="stSidebar"] .stMarkdown li,
+[data-testid="stSidebar"] .stMarkdown {
+    color: #FFFFFF !important;
+}
+[data-testid="stSidebar"] label {
+    color: #D4A843 !important;
+    font-weight: 600 !important;
+}
+[data-testid="stSidebar"] .stRadio label,
+[data-testid="stSidebar"] .stCheckbox label {
+    color: #FFFFFF !important;
+    font-weight: 400 !important;
+}
+[data-testid="stSidebar"] .stTextInput input,
+[data-testid="stSidebar"] .stNumberInput input {
+    background-color: var(--at-bg-input) !important;
+    color: #FFFFFF !important;
+    border-color: #2B6083 !important;
+}
+
+/* ===== Buttons ===== */
+/* Primary — gold bg, dark navy text: striking on both themes */
+button[data-testid="baseButton-primary"],
+[data-testid="stBaseButton-primary"] {
+    background-color: var(--at-gold) !important;
+    color: var(--at-navy) !important;
+    font-weight: 700 !important;
+    border: none !important;
+    border-radius: 6px !important;
+}
+button[data-testid="baseButton-primary"]:hover,
+[data-testid="stBaseButton-primary"]:hover {
+    background-color: var(--at-gold-warm) !important;
+}
+/* Secondary / download — transparent bg, gold border */
+button[data-testid="baseButton-secondary"],
+[data-testid="stBaseButton-secondary"],
+[data-testid="stDownloadButton"] button,
+.stDownloadButton > button {
+    background-color: transparent !important;
+    color: var(--at-blue) !important;
+    border: 1.5px solid var(--at-gold) !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+}
+button[data-testid="baseButton-secondary"]:hover,
+[data-testid="stDownloadButton"] button:hover {
+    background-color: var(--at-bg-card) !important;
+    color: var(--at-text-deep) !important;
+}
+
+/* ===== Metrics ===== */
+[data-testid="metric-container"],
+[data-testid="stMetric"] {
+    background-color: var(--at-bg-card) !important;
+    border-left: 4px solid var(--at-gold) !important;
+    border-radius: 6px !important;
+    padding: 12px 16px !important;
+}
+[data-testid="stMetricValue"] > div,
+[data-testid="stMetricValue"] {
+    color: var(--at-text-deep) !important;
+    font-weight: 700 !important;
+}
+[data-testid="stMetricLabel"] > div,
+[data-testid="stMetricLabel"] {
+    color: var(--at-text-mut) !important;
+    font-size: 0.85rem !important;
+}
+
+/* ===== Tabs ===== */
+[data-testid="stTabs"] [role="tablist"] {
+    border-bottom: 2px solid var(--at-border-sub);
+    gap: 2px;
+}
+[data-testid="stTabs"] button[role="tab"] {
+    color: var(--at-text-mut) !important;
+    font-weight: 500;
+    padding: 10px 18px;
+    border-radius: 6px 6px 0 0;
+    background: transparent !important;
+    border: none !important;
+}
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+    color: var(--at-text-deep) !important;
+    font-weight: 700 !important;
+    border-bottom: 3px solid var(--at-gold) !important;
+    background-color: var(--at-bg-card) !important;
+}
+
+/* ===== File Uploader ===== */
+[data-testid="stFileUploader"] section {
+    border: 2px dashed var(--at-gold) !important;
+    border-radius: 8px !important;
+    background-color: var(--at-bg-cream) !important;
+}
+
+/* ===== Messages ===== */
+[data-testid="stNotification"][kind="success"], .stSuccess {
+    border-left: 4px solid var(--at-green) !important;
+    background-color: var(--at-msg-ok) !important;
+    border-radius: 4px !important;
+}
+[data-testid="stNotification"][kind="warning"], .stWarning {
+    border-left: 4px solid var(--at-gold) !important;
+    background-color: var(--at-msg-warn) !important;
+    border-radius: 4px !important;
+}
+[data-testid="stNotification"][kind="error"], .stError {
+    border-left: 4px solid var(--at-red) !important;
+    background-color: var(--at-msg-err) !important;
+    border-radius: 4px !important;
+}
+[data-testid="stNotification"][kind="info"], .stInfo {
+    border-left: 4px solid var(--at-blue) !important;
+    background-color: var(--at-msg-info) !important;
+    border-radius: 4px !important;
+}
+
+/* ===== Dividers ===== */
+hr {
+    border-color: var(--at-gold) !important;
+    opacity: 0.35;
+}
+
+/* ===== Expanders ===== */
+[data-testid="stExpander"] summary span {
+    color: var(--at-blue) !important;
+    font-weight: 600 !important;
+}
+
+/* ===== Custom Components ===== */
+.autotraj-header {
+    padding: 0 0 14px 0;
+    margin-bottom: 12px;
+    border-bottom: 2px solid var(--at-gold);
+}
+.autotraj-header h1 {
+    color: var(--at-blue);
+    font-size: 2.1rem;
+    font-weight: 800;
+    margin: 0 0 4px 0;
+    letter-spacing: -0.5px;
+    line-height: 1.1;
+}
+.autotraj-header p {
+    color: var(--at-text-mut);
+    font-size: 1.0rem;
+    margin: 0;
+}
+/* Sidebar brand — hardcoded gold/cream: sidebar is always dark */
+.sidebar-brand {
+    padding: 8px 0 12px 0;
+    border-bottom: 1px solid rgba(212,168,67,0.35);
+    margin-bottom: 8px;
+}
+.sidebar-brand .title {
+    font-size: 1.9rem;
+    font-weight: 800;
+    color: #D4A843;
+    letter-spacing: -0.3px;
+    line-height: 1.1;
+    display: block;
+}
+.sidebar-brand .motto {
+    font-size: 0.76rem;
+    font-style: italic;
+    color: #C8B87A;
+    margin-top: 3px;
+    display: block;
+}
+.sidebar-section-header {
+    color: #D4A843 !important;
+    font-weight: 700 !important;
+    font-size: 0.78rem !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.1em !important;
+    border-bottom: 1px solid rgba(212,168,67,0.3) !important;
+    padding-bottom: 4px !important;
+    margin: 16px 0 8px 0 !important;
+    display: block;
+}
+.model-explorer-card {
+    background-color: var(--at-bg-card);
+    border-left: 4px solid var(--at-gold);
+    border-radius: 6px;
+    padding: 14px 18px 8px 18px;
+    margin-bottom: 8px;
+}
+.model-explorer-card h4 {
+    color: var(--at-text-deep);
+    font-size: 1.05rem;
+    font-weight: 700;
+    margin: 0 0 4px 0;
+}
+.model-explorer-card p {
+    color: var(--at-text-mut);
+    font-size: 0.85rem;
+    margin: 0;
+}
+.app-footer {
+    text-align: center;
+    color: var(--at-text-mut);
+    font-size: 0.80rem;
+    padding: 20px 0 4px 0;
+    margin-top: 28px;
+    border-top: 1px solid var(--at-border-sub);
+}
+</style>
+""", unsafe_allow_html=True)
+
 if 'run_complete' not in st.session_state:
     st.session_state.run_complete = False
     st.session_state.top_models  = None
@@ -518,15 +827,20 @@ if 'run_complete' not in st.session_state:
     st.session_state.use_sample_data = False
 
 with st.sidebar:
-    st.title("AutoTraj")
+    st.markdown("""
+    <div class="sidebar-brand">
+        <span class="title">AutoTraj</span>
+        <span class="motto">Sapientia Veritatem Parit</span>
+    </div>
+    """, unsafe_allow_html=True)
     app_mode = st.radio("Navigation", ["AutoTraj Search", "Single Model Mode", "About & Docs"])
-    st.markdown("---")
+    st.markdown('<span class="sidebar-section-header">&#160;</span>', unsafe_allow_html=True)
 
     if app_mode != "About & Docs":
-        st.markdown("**1. Data Format**")
+        st.markdown('<span class="sidebar-section-header">1. Data Format</span>', unsafe_allow_html=True)
         data_format = st.radio("Select Data Structure:", ["Wide Format", "Long Format"], horizontal=True)
 
-        st.markdown("**2. Data Mapping**")
+        st.markdown('<span class="sidebar-section-header">2. Data Mapping</span>', unsafe_allow_html=True)
         if data_format == "Wide Format":
             col_id, col_out, col_time = st.columns(3)
             with col_id:   id_col      = st.text_input("ID",           value="ID")
@@ -538,7 +852,7 @@ with st.sidebar:
             with col_out:  outcome_col = st.text_input("Out. Col", value="Outcome")
             with col_time: time_col    = st.text_input("Time Col", value="Time")
 
-        st.markdown("**3. Model Distribution**")
+        st.markdown('<span class="sidebar-section-header">3. Model Distribution</span>', unsafe_allow_html=True)
         selected_dist = st.selectbox("Select Outcome Type:", [
             "LOGIT (Binary)",
             "CNORM (Continuous/Tobit)",
@@ -558,7 +872,7 @@ with st.sidebar:
             if c_min_in.strip() != "": cnorm_min = float(c_min_in)
             if c_max_in.strip() != "": cnorm_max = float(c_max_in)
 
-        st.markdown("**4. Engine Options**")
+        st.markdown('<span class="sidebar-section-header">4. Engine Options</span>', unsafe_allow_html=True)
         use_dropout    = st.checkbox("Include MNAR Dropout Model", value=False)
         default_starts = 3 if app_mode == "AutoTraj Search" else 5
         n_starts = st.number_input(
@@ -567,16 +881,16 @@ with st.sidebar:
         )
 
         if app_mode == "AutoTraj Search":
-            st.markdown("**5. Search Grid**")
+            st.markdown('<span class="sidebar-section-header">5. Search Grid</span>', unsafe_allow_html=True)
             group_range = st.slider("Min & Max Groups",           1, 8, (1, 3))
             order_range = st.slider("Min & Max Polynomial Order", 0, 5, (0, 2))
 
-            st.markdown("**6. Heuristic Rules**")
+            st.markdown('<span class="sidebar-section-header">6. Heuristic Rules</span>', unsafe_allow_html=True)
             min_pct = st.slider("Min Group Size (%)", 1.0, 15.0, 5.0, 0.5)
             p_val   = st.number_input("P-Value Threshold", value=0.05, format="%.3f")
 
         elif app_mode == "Single Model Mode":
-            st.markdown("**5. Model Specifications**")
+            st.markdown('<span class="sidebar-section-header">5. Model Specifications</span>', unsafe_allow_html=True)
             k_single = st.number_input("Number of Groups", min_value=1, max_value=8, value=2)
 
             orders_single = []
@@ -591,7 +905,12 @@ with st.sidebar:
 # ── About page ───────────────────────────────────────────────────────────────
 
 if app_mode == "About & Docs":
-    st.header("About AutoTraj")
+    st.markdown("""
+    <div class="autotraj-header">
+        <h1>AutoTraj</h1>
+        <p>Automated Group-Based Trajectory Modeling Engine &nbsp;&mdash;&nbsp; <em>Sapientia Veritatem Parit</em></p>
+    </div>
+    """, unsafe_allow_html=True)
     st.markdown(r"""
     **Overview**
     AutoTraj is a high-performance engine for Group-Based Trajectory Modeling (GBTM), a specialized application of finite mixture modeling utilized to identify latent subpopulations following distinct developmental trajectories over time. It automates the exhaustive search, selection, and visualization of these models by leveraging a fully vectorized, C-compiled analytical Jacobian engine to rapidly evaluate combinatorial polynomial grids.
@@ -631,13 +950,22 @@ if app_mode == "About & Docs":
     * Jones, B. L., Nagin, D. S., & Roeder, K. (2001). A SAS procedure based on mixture models for estimating developmental trajectories. *Sociological Methods & Research*, 29(3), 374-393.
     * Nagin, D. S. (1999). Analyzing developmental trajectories: a semiparametric, group-based approach. *Psychological Methods*, 4(2), 139-157.
     """)
-    st.markdown("---")
-    st.markdown("© 2026 Donald E. Warden, PhD, MPH. Licensed under the MIT License.")
+    st.divider()
+    st.markdown('<div class="app-footer">AutoTraj v1.5 &nbsp;&middot;&nbsp; Built by Donald E. Warden, PhD, MPH &nbsp;&middot;&nbsp; <em>Sapientia Veritatem Parit</em> &nbsp;&middot;&nbsp; MIT License</div>', unsafe_allow_html=True)
 
 # ── Main app ──────────────────────────────────────────────────────────────────
 
 else:
-    st.title(f"GBTM Engine: {app_mode}")
+    _mode_subtitle = {
+        "AutoTraj Search":   "Automated exhaustive search across groups and polynomial orders",
+        "Single Model Mode": "Fit and inspect a single user-specified model",
+    }.get(app_mode, "")
+    st.markdown(f"""
+    <div class="autotraj-header">
+        <h1>AutoTraj</h1>
+        <p>{app_mode} &nbsp;&mdash;&nbsp; {_mode_subtitle}</p>
+    </div>
+    """, unsafe_allow_html=True)
 
     uploaded_file = st.file_uploader("Upload Dataset (.csv, .txt, .xlsx, .sas7bdat)", type=["csv", "txt", "xlsx", "sas7bdat"])
     st.markdown("*Or, just here to try out the engine? Click below to load sample data (Nagin, 1999).*")
@@ -694,7 +1022,7 @@ else:
                     st.stop()
 
             start_time = time.time()
-            with st.spinner("Executing C-Compiled Math Engine..."):
+            with st.spinner("AutoTraj Engine Running..."):
 
                 if data_format == "Wide Format" or st.session_state.use_sample_data:
                     long_df = prep_trajectory_data(raw_df, id_col, outcome_col, time_col).dropna(subset=['Time', 'Outcome'])
@@ -784,7 +1112,12 @@ else:
             st.divider()
 
             if len(top_models) > 1 and app_mode == "AutoTraj Search":
-                st.markdown("#### 🔍 Model Explorer")
+                st.markdown("""
+                <div class="model-explorer-card">
+                    <h4>Model Explorer</h4>
+                    <p>Select a valid model below to explore its trajectories, parameters, and diagnostics.</p>
+                </div>
+                """, unsafe_allow_html=True)
                 model_choices = [f"Rank {i+1} | {len(m['orders'])}-Group {m['orders']} | BIC: {m['bic']:.2f}" for i, m in enumerate(top_models[:10])]
                 selected_model_str = st.selectbox("Select a valid model to visualize:", model_choices, label_visibility="collapsed")
                 selected_rank = int(selected_model_str.split("|")[0].replace("Rank ", "").strip()) - 1
@@ -841,8 +1174,8 @@ else:
             st.subheader("Publication Suite")
 
             tab_viz, tab_est, tab_adq, tab_char, tab_comp = st.tabs([
-                "Visualization", "Exact Estimates", "Adequacy Metrics",
-                "Sample Characteristics", "Model Comparison"
+                "Trajectories", "Parameter Estimates", "Model Adequacy",
+                "Baseline Characteristics", "Model Comparison"
             ])
 
             # ── VISUALIZATION TAB ─────────────────────────────────────────────
@@ -871,8 +1204,9 @@ else:
                 beta_info   = _beta_start_indices(winning_orders)
                 k_plot      = len(winning_orders)
 
-                plotly_colors = ['#EF553B', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3', '#FF6692']
-                mpl_colors_color = ['#E63946', '#457B9D', '#2A9D8F', '#F4A261', '#8338EC', '#FB5607']
+                _BRAND_COLORS    = ['#2B6083', '#B5373A', '#D4A843', '#2E7D52', '#7B4F8A', '#C97B2A']
+                plotly_colors    = _BRAND_COLORS
+                mpl_colors_color = _BRAND_COLORS
                 mpl_colors_gray  = ['black', 'dimgray', 'darkgray', 'lightgray', 'slategray', 'silver']
 
                 # ── helper: compute trajectory curve for one group
@@ -897,9 +1231,9 @@ else:
                 with col_viz1:
                     if "Plotly" in viz_style:
                         fig = go.Figure()
-                        light_colors = ['rgba(239,85,59,0.15)', 'rgba(0,204,150,0.15)',
-                                        'rgba(171,99,250,0.15)', 'rgba(255,161,90,0.15)',
-                                        'rgba(25,211,243,0.15)', 'rgba(255,102,146,0.15)']
+                        light_colors = ['rgba(43,96,131,0.15)',  'rgba(181,55,58,0.15)',
+                                        'rgba(212,168,67,0.15)', 'rgba(46,125,82,0.15)',
+                                        'rgba(123,79,138,0.15)', 'rgba(201,123,42,0.15)']
 
                         if show_spaghetti:
                             id_group_map = assignments_df.set_index('ID')['Assigned_Group'].to_dict()
@@ -956,7 +1290,13 @@ else:
                         y_range_val = [-0.1, 1.1] if dist_type == 'LOGIT' else None
                         fig.update_layout(
                             yaxis_title=y_axis_label, xaxis_title=x_axis_label,
-                            yaxis_range=y_range_val, template="plotly_white"
+                            yaxis_range=y_range_val,
+                            template="plotly_white",
+                            paper_bgcolor='rgba(0,0,0,0)',
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            font=dict(color='#7F8C9A', size=13),
+                            xaxis=dict(gridcolor='rgba(128,128,128,0.15)', title_font=dict(color='#7F8C9A', size=13)),
+                            yaxis=dict(gridcolor='rgba(128,128,128,0.15)', title_font=dict(color='#7F8C9A', size=13)),
                         )
                         st.plotly_chart(fig, use_container_width=True)
 
@@ -964,6 +1304,8 @@ else:
                         # ── Matplotlib ──────────────────────────────────────────
                         colors = mpl_colors_gray if "Grayscale" in viz_style else mpl_colors_color
                         fig_mpl, ax = plt.subplots(figsize=(8, 5))
+                        fig_mpl.patch.set_facecolor('none')
+                        ax.patch.set_facecolor('none')
 
                         if show_spaghetti:
                             id_group_map = assignments_df.set_index('ID')['Assigned_Group'].to_dict()
@@ -1085,7 +1427,7 @@ else:
 
                 # Bar chart of per-group entropy
                 if k_adq > 1:
-                    palette_adq = ['#EF553B', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3', '#FF6692']
+                    palette_adq = ['#2B6083', '#B5373A', '#D4A843', '#2E7D52', '#7B4F8A', '#C97B2A']
                     ent_vals = [
                         float(row["Group Rel. Entropy"]) if row["Group Rel. Entropy"] != "N/A" else 0.0
                         for _, row in ent_df.iterrows()
@@ -1210,10 +1552,10 @@ else:
 
                     # Categorise every evaluated model for scatter colouring
                     STATUS_COLOR = {
-                        'Valid':            '#2ca02c',   # green
-                        'Failed Convergence': '#aaaaaa', # gray
+                        'Valid':              '#2E7D52',  # brand success green
+                        'Failed Convergence': '#aaaaaa',  # gray
                     }
-                    _DEFAULT_REJECTED = '#ff7f0e'        # orange for all rejection reasons
+                    _DEFAULT_REJECTED = '#B5373A'         # brand red for rejected
 
                     # Separate traces by category for a clean legend
                     cat_data: dict[str, list] = {
@@ -1282,8 +1624,8 @@ else:
                             x=ks_line, y=bics_line,
                             mode='lines+markers',
                             name='Best per k',
-                            line=dict(color='#1f77b4', width=3),
-                            marker=dict(color='#1f77b4', size=12,
+                            line=dict(color='#2B6083', width=3),
+                            marker=dict(color='#2B6083', size=12,
                                         symbol='diamond', line=dict(color='white', width=1.5)),
                             hovertext=hover_line,
                             hoverinfo='text',
@@ -1365,3 +1707,10 @@ else:
 
         else:
             st.error("Model Failed to Converge or was rejected based on heuristic rules.")
+
+    st.markdown(
+        '<div class="app-footer">AutoTraj v1.5 &nbsp;&middot;&nbsp; '
+        'Built by Donald E. Warden, PhD, MPH &nbsp;&middot;&nbsp; '
+        '<em>Sapientia Veritatem Parit</em></div>',
+        unsafe_allow_html=True,
+    )
