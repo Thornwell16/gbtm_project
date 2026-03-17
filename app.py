@@ -163,31 +163,36 @@ with st.sidebar:
         
         st.markdown("**4. Engine Options**")
         use_dropout = st.checkbox("Include MNAR Dropout Model", value=False)
-        
+        default_starts = 3 if app_mode == "AutoTraj Search" else 5
+        n_starts = st.number_input(
+            "Multi-Start Restarts", min_value=1, max_value=20, value=default_starts,
+            help="Number of random starting points tried per model. More starts reduce the risk of local maxima but increase runtime."
+        )
+
         if app_mode == "AutoTraj Search":
             st.markdown("**5. Search Grid**")
             group_range = st.slider("Min & Max Groups", 1, 8, (1, 3))
             order_range = st.slider("Min & Max Polynomial Order", 0, 5, (0, 2))
-            
+
             zip_iorder = 0
             if dist_flag == "ZIP":
                 st.markdown("**Zero-Inflation (Global)**")
                 zip_iorder = st.number_input("I-Order (Applies to all groups)", min_value=0, max_value=5, value=0)
-            
+
             st.markdown("**6. Heuristic Rules**")
             min_pct = st.slider("Min Group Size (%)", 1.0, 15.0, 5.0, 0.5)
             p_val = st.number_input("P-Value Threshold", value=0.05, format="%.3f")
-            
+
         elif app_mode == "Single Model Mode":
             st.markdown("**5. Model Specifications**")
             k_single = st.number_input("Number of Groups", min_value=1, max_value=8, value=2)
-            
+
             zip_iorder = 0
             if dist_flag == "ZIP":
                 st.markdown("**Zero-Inflation (Global)**")
                 zip_iorder = st.number_input("I-Order (Applies to all groups)", min_value=0, max_value=5, value=0)
                 st.markdown("**Trajectory Orders ($\mu$)**")
-                
+
             orders_single = []
             cols_ord = st.columns(2)
             for i in range(k_single):
@@ -318,11 +323,11 @@ else:
                     top_models, all_evaluated = run_autotraj(
                         long_df, min_groups=group_range[0], max_groups=group_range[1],
                         min_order=order_range[0], max_order=order_range[1],
-                        min_group_pct=min_pct, p_val_thresh=p_val, use_dropout=use_dropout, 
-                        dist=dist_flag, cnorm_min=cnorm_min, cnorm_max=cnorm_max, zip_iorder=zip_iorder
+                        min_group_pct=min_pct, p_val_thresh=p_val, use_dropout=use_dropout,
+                        dist=dist_flag, cnorm_min=cnorm_min, cnorm_max=cnorm_max, zip_iorder=zip_iorder, n_starts=n_starts
                     )
                 else:
-                    single_res = run_single_model(long_df, orders_single, zip_iorder=zip_iorder, use_dropout=use_dropout, dist=dist_flag, cnorm_min=cnorm_min, cnorm_max=cnorm_max)
+                    single_res = run_single_model(long_df, orders_single, zip_iorder=zip_iorder, use_dropout=use_dropout, dist=dist_flag, cnorm_min=cnorm_min, cnorm_max=cnorm_max, n_starts=n_starts)
                     top_models = [single_res] if single_res['result'].success or single_res['result'].status == 2 else []
                     all_evaluated = []
             
