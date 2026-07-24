@@ -305,6 +305,73 @@ def extract_flat_arrays(df):
     return times, outcomes, dropouts, subj_breaks
 
 
+def extract_joint_flat_arrays(df_y, df_z, id_col='ID'):
+    """Flatten TWO long-format DataFrames into aligned flat-array pairs for the
+    V5.0 joint dual-trajectory kernel (calc_joint_dual_outcome_gradients_jit).
+
+    Requires the identical subject-ID set in both df_y and df_z (a subject
+    present in one outcome's frame but entirely absent from the other's is
+    not supported — raises a clear error naming the offending IDs; this is an
+    explicit scope boundary, not an oversight, per MATH.md §9). Independent
+    per-subject time grids/observation counts ARE supported: df_y and df_z
+    need not share the same Time column values or even the same number of
+    rows per subject, covering both the common case (both outcomes measured
+    at the same annual wave) and genuinely different measurement schedules
+    per outcome.
+
+    Args:
+        df_y: Long-format DataFrame (ID, Time, Outcome) for outcome Y.
+        df_z: Long-format DataFrame (ID, Time, Outcome) for outcome Z.
+        id_col: Name of the subject-ID column in both frames (default 'ID').
+
+    Returns:
+        Tuple of two 4-tuples, each exactly extract_flat_arrays's return shape,
+        plus the canonical subject-ID order both share:
+            (times_y, outcomes_y, dropouts_y, subj_breaks_y),
+            (times_z, outcomes_z, dropouts_z, subj_breaks_z),
+            canonical_ids
+        subj_breaks_y and subj_breaks_z describe the SAME N subjects in the
+        SAME order (position i is the same subject in both), so the joint
+        kernel can index them in lockstep even though each may have a
+        different number of observations per subject.
+    """
+    ids_y = set(df_y[id_col].unique())
+    ids_z = set(df_z[id_col].unique())
+    if ids_y != ids_z:
+        only_y = sorted(ids_y - ids_z)[:5]
+        only_z = sorted(ids_z - ids_y)[:5]
+        raise ValueError(
+            f"Outcome Y and outcome Z must have the identical subject-ID set for the "
+            f"V5.0 joint dual-trajectory model. Subjects only in Y: {only_y}"
+            f"{'...' if len(ids_y - ids_z) > 5 else ''}; only in Z: {only_z}"
+            f"{'...' if len(ids_z - ids_y) > 5 else ''}. Partial outcome-missingness "
+            f"across subjects is not supported."
+        )
+
+    canonical_ids = pd.unique(df_y[id_col].values)  # order of first appearance in df_y
+    rank_map = {v: i for i, v in enumerate(canonical_ids)}
+
+    df_y_sorted = (
+        df_y.assign(_rank=df_y[id_col].map(rank_map))
+        .sort_values(['_rank', 'Time'], kind='stable')
+        .drop(columns='_rank')
+    )
+    df_z_sorted = (
+        df_z.assign(_rank=df_z[id_col].map(rank_map))
+        .sort_values(['_rank', 'Time'], kind='stable')
+        .drop(columns='_rank')
+    )
+
+    times_y, outcomes_y, dropouts_y, subj_breaks_y = extract_flat_arrays(df_y_sorted)
+    times_z, outcomes_z, dropouts_z, subj_breaks_z = extract_flat_arrays(df_z_sorted)
+
+    return (
+        (times_y, outcomes_y, dropouts_y, subj_breaks_y),
+        (times_z, outcomes_z, dropouts_z, subj_breaks_z),
+        canonical_ids,
+    )
+
+
 def extract_tvc_array(df, tvc_cols):
     """Extract the (N_obs, n_tvc) time-varying-covariate matrix from a long-format df.
 
@@ -492,6 +559,265 @@ def logsumexp_jit(a):
     for i in range(len(a)): sum_exp += np.exp(a[i] - max_val)
     return max_val + np.log(sum_exp)
 
+# --- SINGLE-OUTCOME PER-SUBJECT SUBROUTINES (V5.0 refactor) ---
+#
+# These two functions are the single-outcome per-group likelihood and gradient
+# computation, extracted out of calc_universal_subject_gradients_jit so it can
+# be reused unchanged for BOTH outcomes of the V5.0 joint dual-trajectory model
+# (calc_joint_dual_outcome_gradients_jit calls each once, for Y and for Z).
+# calc_universal_subject_gradients_jit itself now calls these too (for its one
+# outcome), rather than keeping a second, independently-maintained copy of the
+# 4-distribution x dropout x CNORM/ZIP-tail math — see MATH.md §9.
+#
+# params_outcome layout (a contiguous slice/view, NOT including any mixing-
+# covariate Gamma block): [beta (group-major) | delta (TVC, k*n_tvc, if
+# n_tvc>0) | gamma_drop (3k, if use_dropout) | tail (CNORM raw_sigma or ZIP
+# zeta, indexed from the END of params_outcome)]. This is exactly the shape
+# of (a) the single-outcome kernel's own params[(k-1)*n_mix:] suffix, and (b)
+# each outcome's own contiguous block in the V5.0 joint parameter vector
+# (MATH.md §9's Y-BLOCK/Z-BLOCK) — by construction of both layouts, so no
+# adjustment is needed when calling these functions from either kernel.
+
+@njit(cache=True)
+def calc_single_outcome_group_ll_jit(params_outcome, times, outcomes, dropouts, start, end,
+                                      orders, tvc_Z, n_tvc, use_dropout, dist_code,
+                                      cnorm_min, cnorm_max):
+    """Per-group conditional log-likelihood and score arrays for ONE outcome,
+    for a single subject's observation window [start, end).
+
+    Args:
+        params_outcome: (p_outcome,) contiguous slice — see module-level layout note.
+        times, outcomes, dropouts: full flat arrays for this outcome (NOT
+            subject-sliced — start/end index into them, same convention as
+            calc_universal_subject_gradients_jit).
+        start, end:  this subject's row range within the flat arrays.
+        orders:      (K,) int32 per-group polynomial orders for this outcome.
+        tvc_Z:       (N_obs, n_tvc) float64 TVC matrix (zeros((N_obs,0)) if none).
+        n_tvc:       number of TVCs for this outcome (0 for the V5.0 joint model,
+                     which does not compose with TVCs — see MATH.md §9 scope note).
+        use_dropout: bool — this outcome's own dropout toggle.
+        dist_code:   this outcome's own distribution selector (0-3).
+        cnorm_min, cnorm_max: this outcome's own CNORM bounds (0.0 if not CNORM).
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            L_g:        (K,) log P(outcome_i | group=g), dropout terms included.
+            err_mu_ig:  (K, n_obs) score residual w.r.t. eta (beta/delta gradient input).
+            err_aux_ig: (K, n_obs) score residual w.r.t. raw_sigma or zeta_g.
+    """
+    k = len(orders)
+    n_obs = end - start
+
+    num_betas = 0
+    for g in range(k): num_betas += orders[g] + 1
+    delta_start_idx = num_betas
+    gamma_start_idx = delta_start_idx + k * n_tvc
+
+    sigma = 1.0
+    var = 1.0
+    sigma_idx = -1
+    zeta_start_idx = -1
+
+    if dist_code == 1:
+        sigma_idx = len(params_outcome) - 1
+        raw_sigma = params_outcome[sigma_idx]
+        sigma = np.exp(raw_sigma) if raw_sigma < 20 else np.exp(20)
+        var = sigma ** 2
+    elif dist_code == 3:
+        zeta_start_idx = len(params_outcome) - k
+
+    zeta_g = 0.0
+
+    L_g = np.zeros(k)
+    err_mu_ig = np.zeros((k, n_obs))
+    err_aux_ig = np.zeros((k, n_obs))
+
+    current_beta_idx = 0
+    current_gamma_idx = gamma_start_idx
+
+    for g in range(k):
+        order = orders[g]
+        n_betas = order + 1
+        group_betas = params_outcome[current_beta_idx : current_beta_idx + n_betas]
+        current_beta_idx += n_betas
+        group_delta = params_outcome[delta_start_idx + g * n_tvc : delta_start_idx + (g + 1) * n_tvc]
+
+        if use_dropout:
+            gamma_0 = params_outcome[current_gamma_idx]
+            gamma_1 = params_outcome[current_gamma_idx + 1]
+            gamma_2 = params_outcome[current_gamma_idx + 2]
+            current_gamma_idx += 3
+
+        if dist_code == 3:
+            zeta_g = params_outcome[zeta_start_idx + g]
+
+        ll_g = 0.0
+
+        for obs in range(n_obs):
+            idx = start + obs
+            t_val = times[idx]
+            y_val = outcomes[idx]
+
+            mu = 0.0
+            for p in range(order + 1): mu += group_betas[p] * (t_val ** p)
+            for q in range(n_tvc): mu += group_delta[q] * tvc_Z[idx, q]
+
+            if dist_code == 0:  # LOGIT
+                if mu > 25.0: mu = 25.0
+                if mu < -25.0: mu = -25.0
+                prob = 1.0 / (1.0 + np.exp(-mu)) if mu >= 0 else np.exp(mu) / (1.0 + np.exp(mu))
+                prob = max(1e-12, min(1.0 - 1e-12, prob))
+                if mu >= 0: ll_g += y_val * mu - (mu + np.log(1.0 + np.exp(-mu)))
+                else: ll_g += y_val * mu - np.log(1.0 + np.exp(mu))
+                err_mu_ig[g, obs] = y_val - prob
+
+            elif dist_code == 2:  # POISSON
+                if mu > 20.0: mu = 20.0
+                if mu < -20.0: mu = -20.0
+                exp_eta = np.exp(mu)
+                ll_g += y_val * mu - exp_eta - math.lgamma(y_val + 1.0)
+                err_mu_ig[g, obs] = y_val - exp_eta
+
+            elif dist_code == 1:  # CNORM
+                if y_val <= cnorm_min:
+                    z = (cnorm_min - mu) / sigma
+                    cdf_val = max(1e-15, 0.5 * math.erfc(-z / math.sqrt(2.0)))
+                    imr = fast_norm_pdf(z) / cdf_val
+                    ll_g += np.log(cdf_val)
+                    err_mu_ig[g, obs] = -(1.0 / sigma) * imr
+                    err_aux_ig[g, obs] = -z * imr
+                elif y_val >= cnorm_max:
+                    z = (cnorm_max - mu) / sigma
+                    sf_val = max(1e-15, 0.5 * math.erfc(z / math.sqrt(2.0)))
+                    imr = fast_norm_pdf(z) / sf_val
+                    ll_g += np.log(sf_val)
+                    err_mu_ig[g, obs] = (1.0 / sigma) * imr
+                    err_aux_ig[g, obs] = z * imr
+                else:
+                    z = (y_val - mu) / sigma
+                    ll_g += fast_norm_logpdf(y_val, mu, sigma)
+                    err_mu_ig[g, obs] = (y_val - mu) / var
+                    err_aux_ig[g, obs] = -1.0 + (z ** 2)
+
+            elif dist_code == 3:  # ZIP
+                if mu > 20.0: mu = 20.0
+                if mu < -20.0: mu = -20.0
+                ll_val, err_m, err_t = fast_zip_logpmf_grad(y_val, mu, zeta_g)
+                ll_g += ll_val
+                err_mu_ig[g, obs] = err_m
+                err_aux_ig[g, obs] = err_t
+
+            if use_dropout and obs > 0:
+                y_prev = outcomes[idx - 1]
+                z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
+                if z_drop > 25.0: z_drop = 25.0
+                if z_drop < -25.0: z_drop = -25.0
+                if z_drop >= 0: ll_g += -z_drop - np.log(1.0 + np.exp(-z_drop))
+                else: ll_g += -np.log(1.0 + np.exp(z_drop))
+
+        if use_dropout:
+            last_idx = end - 1
+            if dropouts[last_idx] == 1.0:
+                t_last = times[last_idx]
+                y_last = outcomes[last_idx]
+                z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
+                if z_drop > 25.0: z_drop = 25.0
+                if z_drop < -25.0: z_drop = -25.0
+                if z_drop >= 0: ll_g += -np.log(1.0 + np.exp(-z_drop))
+                else: ll_g += z_drop - np.log(1.0 + np.exp(z_drop))
+
+        L_g[g] = ll_g
+
+    return L_g, err_mu_ig, err_aux_ig
+
+
+@njit(cache=True)
+def accumulate_single_outcome_gradient_jit(grad_outcome_row, params_outcome, times, outcomes,
+                                            dropouts, start, end, orders, tvc_Z, n_tvc,
+                                            use_dropout, dist_code, err_mu_ig, err_aux_ig,
+                                            posterior_weight):
+    """Accumulate ONE outcome's gradient contribution (beta, delta, dropout
+    gamma, CNORM sigma or ZIP zeta) into grad_outcome_row, weighted by
+    posterior_weight[g]. Mutates grad_outcome_row in place (a view sharing
+    memory with the caller's full gradient row).
+
+    posterior_weight[g] is P(g|i) in the single-outcome model, or the
+    MARGINAL posterior (Sum_h P(g,h|i) for outcome Y, Sum_g P(g,h|i) for
+    outcome Z) in the V5.0 joint model — MATH.md §9 shows the joint
+    per-outcome gradient reduces to exactly this single-outcome formula with
+    the marginal substituted for the posterior, which is what justifies
+    reusing this same function unchanged for both outcomes.
+
+    grad_outcome_row/params_outcome use the same params_outcome-relative
+    offsets as calc_single_outcome_group_ll_jit (beta starts at 0, tail at
+    the end) — grad_outcome_row must have the same length as params_outcome.
+    """
+    k = len(orders)
+    n_obs = end - start
+
+    num_betas = 0
+    for g in range(k): num_betas += orders[g] + 1
+    delta_start_idx = num_betas
+    gamma_start_idx = delta_start_idx + k * n_tvc
+
+    sigma_idx = -1
+    zeta_start_idx = -1
+    if dist_code == 1:
+        sigma_idx = len(params_outcome) - 1
+    elif dist_code == 3:
+        zeta_start_idx = len(params_outcome) - k
+
+    current_beta_idx = 0
+    current_gamma_idx = gamma_start_idx
+
+    for g in range(k):
+        order = orders[g]
+        n_betas = order + 1
+        delta_base = delta_start_idx + g * n_tvc
+        if use_dropout:
+            gamma_0 = params_outcome[current_gamma_idx]
+            gamma_1 = params_outcome[current_gamma_idx + 1]
+            gamma_2 = params_outcome[current_gamma_idx + 2]
+
+        for obs in range(n_obs):
+            idx = start + obs
+            t_val = times[idx]
+
+            weighted_err_mu = err_mu_ig[g, obs] * posterior_weight[g]
+            for p in range(order + 1):
+                grad_outcome_row[current_beta_idx + p] += -1.0 * weighted_err_mu * (t_val ** p)
+            for q in range(n_tvc):
+                grad_outcome_row[delta_base + q] += -1.0 * weighted_err_mu * tvc_Z[idx, q]
+
+            if dist_code == 1:
+                grad_outcome_row[sigma_idx] += -1.0 * err_aux_ig[g, obs] * posterior_weight[g]
+            elif dist_code == 3:
+                grad_outcome_row[zeta_start_idx + g] += -1.0 * err_aux_ig[g, obs] * posterior_weight[g]
+
+            if use_dropout and obs > 0:
+                y_prev = outcomes[idx - 1]
+                z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
+                p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
+                err_drop = (0.0 - p_drop) * posterior_weight[g]
+                grad_outcome_row[current_gamma_idx] += -1.0 * err_drop * 1.0
+                grad_outcome_row[current_gamma_idx + 1] += -1.0 * err_drop * t_val
+                grad_outcome_row[current_gamma_idx + 2] += -1.0 * err_drop * y_prev
+
+        if use_dropout:
+            last_idx = end - 1
+            if dropouts[last_idx] == 1.0:
+                t_last = times[last_idx]
+                y_last = outcomes[last_idx]
+                z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
+                p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
+                err_drop = (1.0 - p_drop) * posterior_weight[g]
+                grad_outcome_row[current_gamma_idx] += -1.0 * err_drop * 1.0
+                grad_outcome_row[current_gamma_idx + 1] += -1.0 * err_drop * t_last
+                grad_outcome_row[current_gamma_idx + 2] += -1.0 * err_drop * y_last
+            current_gamma_idx += 3
+        current_beta_idx += n_betas
+
+
 # --- CORE LIKELIHOOD/GRADIENT ENGINE (UNIVERSAL) ---
 
 @njit(cache=True)
@@ -605,33 +931,18 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
     n_subjects = len(subj_breaks) - 1
     grad_subj = np.zeros((n_subjects, len(params)))
 
-    num_betas = 0
-    for g in range(k): num_betas += orders[g] + 1
-    # V3.0 layout: [Γ: (k-1)*n_mix] [β: num_betas] [δ: k*n_tvc] [γ_drop: 3k] [tail]
-    delta_start_idx = (k - 1) * n_mix + num_betas
-    gamma_start_idx = delta_start_idx + k * n_tvc
-
-    sigma = 1.0
-    var = 1.0
-    sigma_idx = -1
-    zeta_start_idx = -1  # first index of per-group zeta block when dist_code == 3
-
-    if dist_code == 1: # CNORM
-        sigma_idx = len(params) - 1
-        raw_sigma = params[sigma_idx]
-        sigma = np.exp(raw_sigma) if raw_sigma < 20 else np.exp(20)
-        var = sigma ** 2
-    elif dist_code == 3: # ZIP — per-group zeta (logit of zero-inflation), last k params
-        zeta_start_idx = len(params) - k
-
-    zeta_g = 0.0  # per-group zero-inflation logit; set inside group loop when dist_code == 3
+    # V3.0 layout: [Γ: (k-1)*n_mix] [β/δ/γ_drop/tail: everything else]. The
+    # suffix starting right after Γ is exactly a "solo" single-outcome
+    # parameter vector (V5.0 refactor) — see calc_single_outcome_group_ll_jit's
+    # module-level layout note. Sliced once here since it doesn't vary by subject.
+    outcome_beta_start = (k - 1) * n_mix
+    params_outcome = params[outcome_beta_start:]
 
     total_ll = 0.0
 
     for i in range(n_subjects):
         start = subj_breaks[i]
         end = subj_breaks[i+1]
-        n_obs = end - start
 
         # ── PER-SUBJECT MIXING PROBABILITIES (V3.0) ─────────────────────────────
         # theta_g(x_i) = Gamma_g . x_i for g>0; theta_0(x_i) ≡ 0 (reference group).
@@ -657,138 +968,14 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
             pis[g] = p_val
             pis_safe[g] = 1e-15 if p_val < 1e-15 else p_val
 
-        # L_ig_log[g] = log P(y_i | group=g) accumulated over all time points
-        L_ig_log = np.zeros(k)
-        # err_mu_ig[g, obs]  = ∂ℓ_{g,obs}/∂μ  (distribution-specific score residual)
-        err_mu_ig = np.zeros((k, n_obs))
-        # err_aux_ig[g, obs] = ∂ℓ_{g,obs}/∂raw_σ (CNORM) or ∂ℓ_{g,obs}/∂ζ_g (ZIP)
-        err_aux_ig = np.zeros((k, n_obs))
-
-        # Pointer to the first beta of each group in params (advances inside loop)
-        current_beta_idx = (k - 1) * n_mix
-        current_gamma_idx = gamma_start_idx
-
-        for g in range(k):
-            order = orders[g]
-            n_betas = order + 1
-            group_betas = params[current_beta_idx : current_beta_idx + n_betas]
-            current_beta_idx += n_betas
-            # TVC deltas: fixed-width n_tvc block per group (no cumulative advance
-            # needed since every group has the same width, unlike beta blocks).
-            group_delta = params[delta_start_idx + g * n_tvc : delta_start_idx + (g + 1) * n_tvc]
-
-            if use_dropout:
-                # Three dropout coefficients per group: γ₀ (intercept), γ₁ (time), γ₂ (lag-y)
-                gamma_0 = params[current_gamma_idx]
-                gamma_1 = params[current_gamma_idx + 1]
-                gamma_2 = params[current_gamma_idx + 2]
-                current_gamma_idx += 3
-
-            if dist_code == 3:  # ZIP: extract per-group zeta constant (ζ_g)
-                zeta_g = params[zeta_start_idx + g]
-
-            ll_g = 0.0   # accumulates log P(y_i | group=g) over all observations
-
-            for obs in range(n_obs):
-                idx = start + obs
-                t_val = times[idx]
-                y_val = outcomes[idx]
-
-                # Evaluate polynomial: η = β₀ + β₁·t + β₂·t² + …
-                mu = 0.0
-                for p in range(order + 1): mu += group_betas[p] * (t_val ** p)
-                # V3.0: add TVC deflection Σ_q δ_{g,q}·z_{i,q,t} (no-op when n_tvc==0)
-                for q in range(n_tvc): mu += group_delta[q] * tvc_Z[idx, q]
-
-                if dist_code == 0: # LOGIT — binary outcomes
-                    # Clamp linear predictor to prevent exp() overflow
-                    if mu > 25.0: mu = 25.0
-                    if mu < -25.0: mu = -25.0
-                    # Numerically stable logistic: two branches avoid large exp()
-                    prob = 1.0 / (1.0 + np.exp(-mu)) if mu >= 0 else np.exp(mu) / (1.0 + np.exp(mu))
-                    prob = max(1e-12, min(1.0 - 1e-12, prob))   # hard numerical floor
-                    # log P(y|η): log-sum-exp stable form of y·η - log(1+e^η)
-                    if mu >= 0: ll_g += y_val * mu - (mu + np.log(1.0 + np.exp(-mu)))
-                    else: ll_g += y_val * mu - np.log(1.0 + np.exp(mu))
-                    # Score residual for beta gradient: ∂ℓ/∂η = y - P(y=1)
-                    err_mu_ig[g, obs] = y_val - prob
-
-                elif dist_code == 2: # POISSON (log-link: eta=X@beta, mu=exp(eta))
-                    # Clamp linear predictor to avoid overflow in exp()
-                    if mu > 20.0: mu = 20.0
-                    if mu < -20.0: mu = -20.0
-                    exp_eta = np.exp(mu)
-                    # log P(y|μ) = y·η - exp(η) - log(y!)  [canonical log-link]
-                    ll_g += y_val * mu - exp_eta - math.lgamma(y_val + 1.0)
-                    # ∂ℓ/∂η = y - exp(η)  [canonical link, clean score residual]
-                    err_mu_ig[g, obs] = y_val - exp_eta
-
-                elif dist_code == 1: # CNORM — censored normal (Tobit)
-                    if y_val <= cnorm_min:
-                        # LEFT-CENSORED: y is at or below detection limit
-                        # LL = log Φ(z_min) where z_min = (y_min - μ)/σ
-                        z = (cnorm_min - mu) / sigma
-                        cdf_val = max(1e-15, 0.5 * math.erfc(-z / math.sqrt(2.0)))
-                        imr = fast_norm_pdf(z) / cdf_val   # inverse Mills ratio φ(z)/Φ(z)
-                        ll_g += np.log(cdf_val)
-                        # ∂ℓ/∂μ = -IMR/σ  (from dΦ/dμ via chain rule through z)
-                        err_mu_ig[g, obs] = -(1.0 / sigma) * imr
-                        # ∂ℓ/∂raw_σ = -z·IMR  (chain rule already applied; see module docstring)
-                        err_aux_ig[g, obs] = -z * imr
-                    elif y_val >= cnorm_max:
-                        # RIGHT-CENSORED: y is at or above upper limit
-                        # LL = log(1 - Φ(z_max)) where z_max = (y_max - μ)/σ
-                        z = (cnorm_max - mu) / sigma
-                        sf_val = max(1e-15, 0.5 * math.erfc(z / math.sqrt(2.0)))
-                        imr = fast_norm_pdf(z) / sf_val   # inverse Mills ratio φ(z)/(1-Φ(z))
-                        ll_g += np.log(sf_val)
-                        err_mu_ig[g, obs] = (1.0 / sigma) * imr
-                        err_aux_ig[g, obs] = z * imr
-                    else:
-                        z = (y_val - mu) / sigma
-                        # INTERIOR (uncensored): standard normal log-PDF
-                        ll_g += fast_norm_logpdf(y_val, mu, sigma)
-                        # ∂ℓ/∂μ = (y - μ)/σ²
-                        err_mu_ig[g, obs] = (y_val - mu) / var
-                        # ∂ℓ/∂raw_σ = -1 + z²  (chain rule absorbed; see module docstring)
-                        err_aux_ig[g, obs] = -1.0 + (z ** 2)
-
-                elif dist_code == 3: # ZIP (per-group zero-inflation zeta)
-                    # Clamp log-rate predictor before passing to ZIP helper
-                    if mu > 20.0: mu = 20.0
-                    if mu < -20.0: mu = -20.0
-                    # fast_zip_logpmf_grad returns (ll, ∂ll/∂η, ∂ll/∂ζ_g)
-                    ll_val, err_m, err_t = fast_zip_logpmf_grad(y_val, mu, zeta_g)
-                    ll_g += ll_val
-                    err_mu_ig[g, obs] = err_m    # ∂ll/∂η for beta gradient
-                    err_aux_ig[g, obs] = err_t   # ∂ll/∂ζ_g for zeta gradient
-
-                if use_dropout and obs > 0:
-                    # DROPOUT LIKELIHOOD — not-dropped contribution at each non-first obs
-                    # P(not drop | t, y_prev) = 1 - σ(z_drop)  →  log = -log(1+e^{z_drop})
-                    y_prev = outcomes[idx - 1]
-                    z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
-                    if z_drop > 25.0: z_drop = 25.0
-                    if z_drop < -25.0: z_drop = -25.0
-                    # Numerically stable log(1 - σ(z)) = -softplus(z)
-                    if z_drop >= 0: ll_g += -z_drop - np.log(1.0 + np.exp(-z_drop))
-                    else: ll_g += -np.log(1.0 + np.exp(z_drop))
-
-            if use_dropout:
-                last_idx = end - 1
-                if dropouts[last_idx] == 1.0:
-                    # DROPOUT LIKELIHOOD — dropped contribution at last obs
-                    # P(drop | t_last, y_last) = σ(z_drop)  →  log = log σ(z_drop)
-                    t_last = times[last_idx]
-                    y_last = outcomes[last_idx]
-                    z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
-                    if z_drop > 25.0: z_drop = 25.0
-                    if z_drop < -25.0: z_drop = -25.0
-                    # Numerically stable log σ(z)
-                    if z_drop >= 0: ll_g += -np.log(1.0 + np.exp(-z_drop))
-                    else: ll_g += z_drop - np.log(1.0 + np.exp(z_drop))
-
-            L_ig_log[g] = ll_g   # store P(y_i | group=g) for posterior computation
+        # ── PER-GROUP LOG-LIKELIHOOD (single-outcome subroutine; V5.0 refactor) ──
+        # This is the sole outcome's per-group conditional log-likelihood and
+        # score computation, extracted into calc_single_outcome_group_ll_jit so
+        # it can be reused unchanged by the V5.0 joint dual-trajectory kernel.
+        L_ig_log, err_mu_ig, err_aux_ig = calc_single_outcome_group_ll_jit(
+            params_outcome, times, outcomes, dropouts, start, end, orders,
+            tvc_Z, n_tvc, use_dropout, dist_code, cnorm_min, cnorm_max
+        )
 
         # ── POSTERIOR PROBABILITY AND TOTAL LL ─────────────────────────────────
         # numerator_log[g] = log(π_g) + L_{ig}  →  log of un-normalised posterior
@@ -816,64 +1003,14 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
         # the subject's survey/sampling weight (V4.0; weights[i]==1.0 by default)
         total_ll += weights[i] * (post_max + np.log(post_sum_exp))
 
-        # ── BETA / DELTA / GAMMA / AUX GRADIENT ACCUMULATION ───────────────────
-        # Second pass over groups: accumulate weighted score gradients now that
-        # posterior_ig is available.
-        current_beta_idx = (k - 1) * n_mix
-        current_gamma_idx = gamma_start_idx
-
-        for g in range(k):
-            order = orders[g]
-            n_betas = order + 1
-            delta_base = delta_start_idx + g * n_tvc
-            if use_dropout:
-                gamma_0 = params[current_gamma_idx]
-                gamma_1 = params[current_gamma_idx + 1]
-                gamma_2 = params[current_gamma_idx + 2]
-
-            for obs in range(n_obs):
-                idx = start + obs
-                t_val = times[idx]
-
-                # Beta gradient: ∂ℓ_i/∂β_{gp} = Σ_t P(g|i) · err_μ_{g,t} · t^p
-                # NLL sign: negate and weight by posterior
-                weighted_err_mu = err_mu_ig[g, obs] * posterior_ig[g]
-                for p in range(order + 1):
-                    grad_subj[i, current_beta_idx + p] += -1.0 * weighted_err_mu * (t_val ** p)
-                # TVC (delta) gradient (MATH.md §4c): structurally identical to the
-                # beta gradient with t^p replaced by z_{i,q,t}; reuses weighted_err_mu.
-                for q in range(n_tvc):
-                    grad_subj[i, delta_base + q] += -1.0 * weighted_err_mu * tvc_Z[idx, q]
-
-                if dist_code == 1: # CNORM: accumulate raw_sigma gradient
-                    # ∂NLL_i/∂raw_σ = -Σ_{g,t} P(g|i) · err_aux_{g,t}
-                    grad_subj[i, sigma_idx] += -1.0 * err_aux_ig[g, obs] * posterior_ig[g]
-                elif dist_code == 3: # ZIP: accumulate per-group zeta gradient
-                    # ∂NLL_i/∂ζ_g = -Σ_t P(g|i) · err_aux_{g,t}
-                    grad_subj[i, zeta_start_idx + g] += -1.0 * err_aux_ig[g, obs] * posterior_ig[g]
-                    
-                if use_dropout and obs > 0:
-                    y_prev = outcomes[idx - 1]
-                    z_drop = gamma_0 + (gamma_1 * t_val) + (gamma_2 * y_prev)
-                    p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
-                    err_drop = (0.0 - p_drop) * posterior_ig[g] 
-                    grad_subj[i, current_gamma_idx] += -1.0 * err_drop * 1.0
-                    grad_subj[i, current_gamma_idx + 1] += -1.0 * err_drop * t_val
-                    grad_subj[i, current_gamma_idx + 2] += -1.0 * err_drop * y_prev
-                    
-            if use_dropout:
-                last_idx = end - 1
-                if dropouts[last_idx] == 1.0:
-                    t_last = times[last_idx]
-                    y_last = outcomes[last_idx]
-                    z_drop = gamma_0 + (gamma_1 * t_last) + (gamma_2 * y_last)
-                    p_drop = 1.0 / (1.0 + np.exp(-z_drop)) if z_drop >= 0 else np.exp(z_drop) / (1.0 + np.exp(z_drop))
-                    err_drop = (1.0 - p_drop) * posterior_ig[g] 
-                    grad_subj[i, current_gamma_idx] += -1.0 * err_drop * 1.0
-                    grad_subj[i, current_gamma_idx + 1] += -1.0 * err_drop * t_last
-                    grad_subj[i, current_gamma_idx + 2] += -1.0 * err_drop * y_last
-                current_gamma_idx += 3
-            current_beta_idx += n_betas
+        # ── OUTCOME GRADIENT ACCUMULATION (single-outcome subroutine; V5.0 refactor) ──
+        # Accumulates beta/delta/dropout-gamma/CNORM-sigma/ZIP-zeta gradients
+        # into the outcome's slice of grad_subj[i,:], weighted by posterior_ig.
+        accumulate_single_outcome_gradient_jit(
+            grad_subj[i, outcome_beta_start:], params_outcome, times, outcomes, dropouts,
+            start, end, orders, tvc_Z, n_tvc, use_dropout, dist_code,
+            err_mu_ig, err_aux_ig, posterior_ig
+        )
 
         # V4.0: scale subject i's ENTIRE gradient row by its survey/sampling weight,
         # once, after all blocks (Gamma, beta, delta, aux, dropout) have been
@@ -892,6 +1029,549 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
 
     # Return NLL (positive scalar for minimisation) and both gradient forms
     return -1.0 * total_ll, grad_flat, grad_subj
+
+
+# --- JOINT DUAL-TRAJECTORY ENGINE (V5.0) ---
+
+@njit(cache=True)
+def calc_joint_dual_outcome_gradients_jit(
+    params,
+    times_y, outcomes_y, dropouts_y, subj_breaks_y, orders_y, use_dropout_y, dist_code_y, cnorm_min_y, cnorm_max_y,
+    times_z, outcomes_z, dropouts_z, subj_breaks_z, orders_z, use_dropout_z, dist_code_z, cnorm_min_z, cnorm_max_z,
+):
+    """Joint dual-trajectory NLL + gradient kernel (V5.0, Nagin-style).
+
+    Two outcomes Y and Z, each with its own independent GBTM structure (own
+    group count, polynomial orders, distribution, dropout toggle), linked by
+    a joint latent-class probability matrix pi_gh (K_Y x K_Z) instead of
+    assuming independence. Given class (g,h), Y and Z are conditionally
+    independent: P(y_i,z_i|g,h) = P(y_i|g)*P(z_i|h), each factor computed by
+    calc_single_outcome_group_ll_jit — the SAME single-outcome subroutine the
+    single-outcome kernel (calc_universal_subject_gradients_jit) uses for its
+    one outcome. See MATH.md §9 for the full derivation, including the proof
+    that each outcome's beta/dropout/tail gradient is the single-outcome
+    formula with that outcome's MARGINAL posterior substituted for the
+    single-outcome posterior.
+
+    Parameter vector layout (MATH.md §9):
+        theta = [ Theta_joint (K_Y*K_Z - 1) | Y-BLOCK | Z-BLOCK ]
+        Y-BLOCK = [ beta_Y | gamma_drop_Y (3*K_Y, if use_dropout_y) | tail_Y ]
+        Z-BLOCK = [ beta_Z | gamma_drop_Z (3*K_Z, if use_dropout_z) | tail_Z ]
+    Theta_joint is the K_Y x K_Z joint-class grid flattened row-major (g
+    outer, h inner), skipping the reference cell (0,0) which is implicitly 0.
+    Y-BLOCK/Z-BLOCK are each exactly a "solo" single-outcome parameter vector
+    (see calc_single_outcome_group_ll_jit's layout note) — Y's tail sits
+    immediately before Z's block starts (not at the absolute end of theta),
+    which is what makes params[y_beta_start:z_beta_start] and
+    params[z_beta_start:] each look like a standalone single-outcome vector
+    with its own tail "at the end" of that slice.
+
+    V5.0 scope: does not compose with V3.0 mixing-covariates/TVC (no Gamma/
+    delta blocks) or V4.0 survey weights — both are deferred future
+    extensions (MATH.md §9 scope note), not attempted here.
+
+    Args:
+        params: (p,) flat joint parameter vector, layout above.
+        times_y, outcomes_y, dropouts_y, subj_breaks_y: outcome Y's flat arrays
+            (same convention as extract_flat_arrays / calc_universal_subject_gradients_jit).
+        orders_y: (K_Y,) int32 per-group polynomial orders for Y.
+        use_dropout_y, dist_code_y, cnorm_min_y, cnorm_max_y: outcome Y's own
+            dropout toggle / distribution / CNORM bounds.
+        times_z, ..., cnorm_max_z: the same, for outcome Z. subj_breaks_y and
+            subj_breaks_z must describe the SAME N subjects in the SAME
+            subject order (see extract_joint_flat_arrays), but may have
+            independent per-subject time grids/observation counts.
+
+    Returns:
+        Tuple[float, np.ndarray, np.ndarray]:
+            nll:       negative total joint log-likelihood.
+            grad_flat: (p,) gradient of nll w.r.t. params.
+            grad_subj: (N_subjects, p) per-subject gradient matrix.
+    """
+    k_y = len(orders_y)
+    k_z = len(orders_z)
+    n_subjects = len(subj_breaks_y) - 1
+
+    num_betas_y = 0
+    for g in range(k_y): num_betas_y += orders_y[g] + 1
+    num_betas_z = 0
+    for g in range(k_z): num_betas_z += orders_z[g] + 1
+
+    n_theta = k_y * k_z - 1
+    y_beta_start = n_theta
+
+    y_block_width = num_betas_y
+    if use_dropout_y: y_block_width += 3 * k_y
+    if dist_code_y == 1: y_block_width += 1
+    elif dist_code_y == 3: y_block_width += k_y
+
+    z_beta_start = y_beta_start + y_block_width
+
+    params_y = params[y_beta_start:z_beta_start]
+    params_z = params[z_beta_start:]
+
+    # No TVCs in V5.0 (scope note above) — pass empty (N_obs, 0) arrays so the
+    # single-outcome subroutines' no-TVC code path is exercised, matching the
+    # V3.0-equivalent default used elsewhere.
+    tvc_y = np.zeros((len(times_y), 0))
+    tvc_z = np.zeros((len(times_z), 0))
+
+    grad_subj = np.zeros((n_subjects, len(params)))
+    total_ll = 0.0
+
+    for i in range(n_subjects):
+        start_y = subj_breaks_y[i]
+        end_y = subj_breaks_y[i + 1]
+        start_z = subj_breaks_z[i]
+        end_z = subj_breaks_z[i + 1]
+
+        # Per-outcome per-group log-likelihoods (single-outcome subroutine, §1).
+        L_y, err_mu_y, err_aux_y = calc_single_outcome_group_ll_jit(
+            params_y, times_y, outcomes_y, dropouts_y, start_y, end_y, orders_y,
+            tvc_y, 0, use_dropout_y, dist_code_y, cnorm_min_y, cnorm_max_y
+        )
+        L_z, err_mu_z, err_aux_z = calc_single_outcome_group_ll_jit(
+            params_z, times_z, outcomes_z, dropouts_z, start_z, end_z, orders_z,
+            tvc_z, 0, use_dropout_z, dist_code_z, cnorm_min_z, cnorm_max_z
+        )
+
+        # ── JOINT MIXING PROPORTIONS pi_gh (stable softmax over Theta_joint) ──
+        theta_grid = np.zeros((k_y, k_z))
+        idx = 0
+        for g in range(k_y):
+            for h in range(k_z):
+                if g == 0 and h == 0:
+                    continue
+                theta_grid[g, h] = params[idx]
+                idx += 1
+
+        max_theta = theta_grid[0, 0]
+        for g in range(k_y):
+            for h in range(k_z):
+                if theta_grid[g, h] > max_theta: max_theta = theta_grid[g, h]
+        sum_exp_theta = 0.0
+        for g in range(k_y):
+            for h in range(k_z):
+                sum_exp_theta += np.exp(theta_grid[g, h] - max_theta)
+        log_theta_norm = max_theta + np.log(sum_exp_theta)
+
+        log_pi_gh = np.zeros((k_y, k_z))
+        pi_gh = np.zeros((k_y, k_z))
+        for g in range(k_y):
+            for h in range(k_z):
+                log_pi_gh[g, h] = theta_grid[g, h] - log_theta_norm
+                pi_gh[g, h] = np.exp(log_pi_gh[g, h])
+
+        # ── JOINT LOG-LIKELIHOOD (2-D log-sum-exp) ────────────────────────────
+        numerator_log = np.zeros((k_y, k_z))
+        for g in range(k_y):
+            for h in range(k_z):
+                numerator_log[g, h] = log_pi_gh[g, h] + L_y[g] + L_z[h]
+
+        post_max = numerator_log[0, 0]
+        for g in range(k_y):
+            for h in range(k_z):
+                if numerator_log[g, h] > post_max: post_max = numerator_log[g, h]
+        post_sum_exp = 0.0
+        for g in range(k_y):
+            for h in range(k_z):
+                post_sum_exp += np.exp(numerator_log[g, h] - post_max)
+        log_norm = post_max + np.log(post_sum_exp)
+        total_ll += log_norm
+
+        # Joint posterior P(g,h|i) and marginals P(g|i), P(h|i).
+        posterior_gh = np.zeros((k_y, k_z))
+        for g in range(k_y):
+            for h in range(k_z):
+                posterior_gh[g, h] = np.exp(numerator_log[g, h] - log_norm)
+
+        posterior_g = np.zeros(k_y)  # P(g|i) = sum_h P(g,h|i) — Y's beta gradient weight
+        for g in range(k_y):
+            acc = 0.0
+            for h in range(k_z): acc += posterior_gh[g, h]
+            posterior_g[g] = acc
+
+        posterior_h = np.zeros(k_z)  # P(h|i) = sum_g P(g,h|i) — Z's beta gradient weight
+        for h in range(k_z):
+            acc = 0.0
+            for g in range(k_y): acc += posterior_gh[g, h]
+            posterior_h[h] = acc
+
+        # ── Theta_joint GRADIENT: d ell_i / d theta_gh = P(g,h|i) - pi_gh ─────
+        idx = 0
+        for g in range(k_y):
+            for h in range(k_z):
+                if g == 0 and h == 0:
+                    continue
+                grad_subj[i, idx] = -1.0 * (posterior_gh[g, h] - pi_gh[g, h])
+                idx += 1
+
+        # ── Y-OUTCOME GRADIENT, weighted by the MARGINAL posterior_g ──────────
+        accumulate_single_outcome_gradient_jit(
+            grad_subj[i, y_beta_start:z_beta_start], params_y, times_y, outcomes_y, dropouts_y,
+            start_y, end_y, orders_y, tvc_y, 0, use_dropout_y, dist_code_y,
+            err_mu_y, err_aux_y, posterior_g
+        )
+        # ── Z-OUTCOME GRADIENT, weighted by the MARGINAL posterior_h ──────────
+        accumulate_single_outcome_gradient_jit(
+            grad_subj[i, z_beta_start:], params_z, times_z, outcomes_z, dropouts_z,
+            start_z, end_z, orders_z, tvc_z, 0, use_dropout_z, dist_code_z,
+            err_mu_z, err_aux_z, posterior_h
+        )
+
+    grad_flat = np.zeros(len(params))
+    for i in range(grad_subj.shape[0]):
+        for j in range(grad_subj.shape[1]):
+            grad_flat[j] += grad_subj[i, j]
+
+    return -1.0 * total_ll, grad_flat, grad_subj
+
+
+def calc_joint_nll_wrapper(params, *args):
+    """NLL-only callable for SciPy minimise, joint dual-trajectory model (V5.0).
+
+    Args mirror calc_joint_dual_outcome_gradients_jit exactly (see that
+    function's docstring) — this wrapper has the signature scipy.optimize.minimize
+    expects when passed as ``fun``.
+    """
+    nll, _, _ = calc_joint_dual_outcome_gradients_jit(params, *args)
+    return nll
+
+
+def calc_joint_jac_wrapper(params, *args):
+    """Jacobian-only callable for SciPy minimise, joint dual-trajectory model (V5.0)."""
+    _, grad_flat, _ = calc_joint_dual_outcome_gradients_jit(params, *args)
+    return grad_flat
+
+
+def calc_joint_grad_subj_wrapper(params, *args):
+    """Per-subject-gradient-only callable (Huber-White sandwich G matrix), joint model (V5.0)."""
+    _, _, grad_subj = calc_joint_dual_outcome_gradients_jit(params, *args)
+    return grad_subj
+
+
+def _joint_layout(k_y, k_z, orders_y, orders_z, use_dropout_y, dist_y, use_dropout_z, dist_z):
+    """Compute the joint parameter vector's block boundaries (MATH.md §9).
+
+    Returns (n_theta, y_beta_start, z_beta_start, num_betas_y, num_betas_z,
+    num_params) — the handful of indices every joint fitting/post-processing
+    function needs, computed once in one place to avoid drift between them.
+    """
+    n_theta = k_y * k_z - 1
+    num_betas_y = sum(o + 1 for o in orders_y)
+    num_betas_z = sum(o + 1 for o in orders_z)
+    y_beta_start = n_theta
+
+    y_block_width = num_betas_y
+    if use_dropout_y: y_block_width += 3 * k_y
+    if dist_y == 'CNORM': y_block_width += 1
+    elif dist_y == 'ZIP': y_block_width += k_y
+
+    z_beta_start = y_beta_start + y_block_width
+
+    z_block_width = num_betas_z
+    if use_dropout_z: z_block_width += 3 * k_z
+    if dist_z == 'CNORM': z_block_width += 1
+    elif dist_z == 'ZIP': z_block_width += k_z
+
+    num_params = z_beta_start + z_block_width
+    return n_theta, y_beta_start, z_beta_start, num_betas_y, num_betas_z, num_params
+
+
+def process_joint_optimization_result(result, num_params, k_y, k_z, orders_y, orders_z,
+                                       times_y, outcomes_y, dropouts_y, subj_breaks_y, use_dropout_y, dist_y, cnorm_min_y, cnorm_max_y, scale_factor_y,
+                                       times_z, outcomes_z, dropouts_z, subj_breaks_z, use_dropout_z, dist_z, cnorm_min_z, cnorm_max_z, scale_factor_z):
+    """Post-process a joint dual-trajectory OptimizeResult (V5.0): SEs, BIC/AIC,
+    and the joint mixing-probability matrix pi_gh.
+
+    Mirrors process_optimization_result (MATH.md §5) — same finite-difference
+    Hessian / model-based / Huber-White sandwich recipe — but for the wider
+    joint parameter vector, with TWO independent time-unscaling factors (each
+    outcome rescales its own betas by its own scale_factor; Theta_joint stays
+    dimensionless, D=1, same convention as Gamma/delta in V3.0).
+
+    Returns:
+        Tuple of 12 elements (same shape as process_optimization_result):
+            is_valid, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard,
+            se_model, se_robust, pis_joint (K_Y x K_Z ndarray), cond_num, V_model_unscaled
+    """
+    n_subjects = len(subj_breaks_y) - 1
+    n_obs = len(times_y) + len(times_z)
+    dist_map = {'LOGIT': 0, 'CNORM': 1, 'POISSON': 2, 'ZIP': 3}
+    dist_code_y = dist_map.get(dist_y, 0)
+    dist_code_z = dist_map.get(dist_z, 0)
+
+    n_theta, y_beta_start, z_beta_start, num_betas_y, num_betas_z, _ = _joint_layout(
+        k_y, k_z, orders_y, orders_z, use_dropout_y, dist_y, use_dropout_z, dist_z
+    )
+
+    if not (result.success or result.status == 2):
+        return False, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, None, None, None, np.nan, None
+
+    D_diag = np.ones(num_params)
+    idx = y_beta_start
+    for g in range(k_y):
+        for p in range(orders_y[g] + 1):
+            D_diag[idx + p] = 1.0 / (scale_factor_y ** p)
+        idx += orders_y[g] + 1
+    if use_dropout_y:
+        for g in range(k_y):
+            D_diag[idx + 1] = 1.0 / scale_factor_y
+            idx += 3
+    # Y's tail (if any) stays D=1 — already the default (dimensionless, MATH.md §5b).
+
+    idx = z_beta_start
+    for g in range(k_z):
+        for p in range(orders_z[g] + 1):
+            D_diag[idx + p] = 1.0 / (scale_factor_z ** p)
+        idx += orders_z[g] + 1
+    if use_dropout_z:
+        for g in range(k_z):
+            D_diag[idx + 1] = 1.0 / scale_factor_z
+            idx += 3
+
+    D = np.diag(D_diag)
+
+    try:
+        times_y_scaled = times_y / scale_factor_y
+        times_z_scaled = times_z / scale_factor_z
+        orders_y_arr = np.array(orders_y, dtype=np.int32)
+        orders_z_arr = np.array(orders_z, dtype=np.int32)
+        args = (times_y_scaled, outcomes_y, dropouts_y, subj_breaks_y, orders_y_arr, use_dropout_y, dist_code_y, float(cnorm_min_y), float(cnorm_max_y),
+                times_z_scaled, outcomes_z, dropouts_z, subj_breaks_z, orders_z_arr, use_dropout_z, dist_code_z, float(cnorm_min_z), float(cnorm_max_z))
+
+        H_scaled = np.zeros((num_params, num_params))
+        for i in range(num_params):
+            eps_i = 1e-5 * max(1.0, abs(result.x[i]))
+            if eps_i < 1e-8: eps_i = 1e-8
+            p_plus = np.copy(result.x)
+            p_minus = np.copy(result.x)
+            p_plus[i] += eps_i
+            p_minus[i] -= eps_i
+            g_plus = calc_joint_jac_wrapper(p_plus, *args)
+            g_minus = calc_joint_jac_wrapper(p_minus, *args)
+            H_scaled[i, :] = (g_plus - g_minus) / (2.0 * eps_i)
+
+        H_scaled = (H_scaled + H_scaled.T) / 2.0
+
+        try:
+            cond_num = np.linalg.cond(H_scaled)
+        except np.linalg.LinAlgError:
+            cond_num = np.inf
+
+        H_inv_scaled = np.linalg.pinv(H_scaled, rcond=1e-10)
+
+        _, _, grad_subj_scaled = calc_joint_dual_outcome_gradients_jit(result.x, *args)
+        G_scaled = grad_subj_scaled.T @ grad_subj_scaled
+        V_robust_scaled = H_inv_scaled @ G_scaled @ H_inv_scaled
+    except Exception:
+        H_inv_scaled = np.eye(num_params)
+        V_robust_scaled = np.eye(num_params)
+        cond_num = np.inf
+
+    params_unscaled = D @ result.x
+    V_model_unscaled = D @ H_inv_scaled @ D
+    V_robust_unscaled = D @ V_robust_scaled @ D
+
+    se_model = np.sqrt(np.abs(np.diag(V_model_unscaled)))
+    se_robust = np.sqrt(np.abs(np.diag(V_robust_unscaled)))
+
+    ll = -1.0 * result.fun
+    aic_nagin = ll - num_params
+    bic_nagin = ll - 0.5 * num_params * np.log(n_subjects)
+    bic_obs = ll - 0.5 * num_params * np.log(n_obs)
+    aic_standard = -2.0 * ll + 2.0 * num_params
+    bic_standard = -2.0 * ll + num_params * np.log(n_subjects)
+
+    # Joint mixing proportions pi_gh, recovered from Theta_joint via softmax
+    # over the flattened (k_y, k_z) grid (reference cell (0,0) implicitly 0).
+    theta_grid = np.zeros((k_y, k_z))
+    idx = 0
+    for g in range(k_y):
+        for h in range(k_z):
+            if g == 0 and h == 0: continue
+            theta_grid[g, h] = params_unscaled[idx]
+            idx += 1
+    max_theta = np.max(theta_grid)
+    pis_joint = np.exp(theta_grid - max_theta)
+    pis_joint /= pis_joint.sum()
+
+    result.x = params_unscaled
+    return True, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis_joint, cond_num, V_model_unscaled
+
+
+def _permute_solo_outcome_blocks(params_slice, se_m_slice, se_r_slice, orders_list, use_dropout, dist, sorted_idx):
+    """Permute ONE outcome's solo parameter slice (beta/dropout/tail — the
+    same layout calc_single_outcome_group_ll_jit consumes) by sorted_idx, so
+    calc_universal_subject_gradients_jit's sort_groups_by_intercept and V5.0's
+    sort_joint_groups_by_intercept can share this logic instead of each
+    re-implementing beta/dropout/zeta block permutation independently.
+
+    Returns (new_params, new_se_model, new_se_robust, new_orders_list) —
+    does not mutate its inputs.
+    """
+    k = len(orders_list)
+    if k == 1:
+        return params_slice.copy(), se_m_slice.copy(), se_r_slice.copy(), orders_list
+
+    beta_starts = []
+    idx = 0
+    for g in range(k):
+        beta_starts.append(idx)
+        idx += orders_list[g] + 1
+    gamma_start = idx
+
+    new_params = params_slice.copy()
+    new_se_m = se_m_slice.copy()
+    new_se_r = se_r_slice.copy()
+
+    new_orders = [orders_list[sorted_idx[g]] for g in range(k)]
+    write_idx = 0
+    for new_g in range(k):
+        old_g = sorted_idx[new_g]
+        n_betas = orders_list[old_g] + 1
+        src = beta_starts[old_g]
+        new_params[write_idx:write_idx + n_betas] = params_slice[src:src + n_betas]
+        new_se_m[write_idx:write_idx + n_betas] = se_m_slice[src:src + n_betas]
+        new_se_r[write_idx:write_idx + n_betas] = se_r_slice[src:src + n_betas]
+        write_idx += n_betas
+
+    if use_dropout:
+        for new_g in range(k):
+            old_g = sorted_idx[new_g]
+            src = gamma_start + 3 * old_g
+            dst = gamma_start + 3 * new_g
+            new_params[dst:dst + 3] = params_slice[src:src + 3]
+            new_se_m[dst:dst + 3] = se_m_slice[src:src + 3]
+            new_se_r[dst:dst + 3] = se_r_slice[src:src + 3]
+
+    if dist == 'ZIP':
+        zeta_start = len(params_slice) - k
+        for new_g in range(k):
+            old_g = sorted_idx[new_g]
+            new_params[zeta_start + new_g] = params_slice[zeta_start + old_g]
+            new_se_m[zeta_start + new_g] = se_m_slice[zeta_start + old_g]
+            new_se_r[zeta_start + new_g] = se_r_slice[zeta_start + old_g]
+    # CNORM raw_sigma is a scalar tail — not group-specific, left untouched.
+
+    return new_params, new_se_m, new_se_r, new_orders
+
+
+def sort_joint_groups_by_intercept(result, k_y, k_z, orders_y, orders_z, se_model, se_robust,
+                                    use_dropout_y, dist_y, use_dropout_z, dist_z):
+    """Sort BOTH outcomes' groups independently by ascending intercept, and
+    consistently re-permute the joint mixing matrix pi_gh across both axes
+    (V5.0's two-dimensional generalization of sort_groups_by_intercept).
+
+    Theta_joint's raw logits CANNOT simply be permuted like a beta block —
+    they are only meaningful relative to the OLD reference cell (0,0). Instead:
+    (1) reconstruct the full pi_gh matrix via softmax (uniquely defined, no
+    reference ambiguity), (2) permute BOTH axes simultaneously via
+    pi_new = pi_old[np.ix_(sorted_idx_y, sorted_idx_z)], (3) re-derive
+    theta'_gh = log(pi_new[g,h]) - log(pi_new[0,0]). This recompute runs
+    whenever EITHER axis needs resorting, since the reference cell can change
+    even if only one axis actually permutes.
+
+    Theta_joint SE carryover (mapping each new cell back to its old cell) is
+    an approximation, same caveat as sort_groups_by_intercept's Gamma SEs.
+    Y-BLOCK/Z-BLOCK beta/dropout/tail SEs are exact (mechanical permutation).
+
+    Returns:
+        new_orders_y, new_orders_z, new_se_model, new_se_robust, new_pis_joint (K_Y x K_Z)
+        result.x is mutated in place.
+    """
+    n_theta, y_beta_start, z_beta_start, num_betas_y, num_betas_z, _ = _joint_layout(
+        k_y, k_z, orders_y, orders_z, use_dropout_y, dist_y, use_dropout_z, dist_z
+    )
+
+    params = result.x.copy()
+    se_m = se_model.copy()
+    se_r = se_robust.copy()
+
+    # Recover the full pi_gh matrix from Theta_joint (reference cell (0,0) = 0).
+    theta_grid = np.zeros((k_y, k_z))
+    idx = 0
+    for g in range(k_y):
+        for h in range(k_z):
+            if g == 0 and h == 0: continue
+            theta_grid[g, h] = params[idx]
+            idx += 1
+    max_theta = np.max(theta_grid)
+    pi_gh = np.exp(theta_grid - max_theta)
+    pi_gh /= pi_gh.sum()
+
+    y_beta_starts = []
+    idx = y_beta_start
+    for g in range(k_y):
+        y_beta_starts.append(idx)
+        idx += orders_y[g] + 1
+    y_intercepts = np.array([params[y_beta_starts[g]] for g in range(k_y)])
+    sorted_idx_y = np.argsort(y_intercepts)
+
+    z_beta_starts = []
+    idx = z_beta_start
+    for g in range(k_z):
+        z_beta_starts.append(idx)
+        idx += orders_z[g] + 1
+    z_intercepts = np.array([params[z_beta_starts[g]] for g in range(k_z)])
+    sorted_idx_z = np.argsort(z_intercepts)
+
+    if np.all(sorted_idx_y == np.arange(k_y)) and np.all(sorted_idx_z == np.arange(k_z)):
+        return orders_y, orders_z, se_model, se_robust, pi_gh  # already sorted
+
+    new_params = params.copy()
+    new_se_m = se_m.copy()
+    new_se_r = se_r.copy()
+
+    # --- Permute pi_gh across BOTH axes simultaneously, re-derive Theta_joint ---
+    pi_new = pi_gh[np.ix_(sorted_idx_y, sorted_idx_z)]
+    theta_new = np.log(np.maximum(pi_new, 1e-300)) - np.log(max(pi_new[0, 0], 1e-300))
+    idx = 0
+    for g in range(k_y):
+        for h in range(k_z):
+            if g == 0 and h == 0: continue
+            new_params[idx] = theta_new[g, h]
+            idx += 1
+
+    # Approximate SE carryover: new cell (g',h') <- old cell (sorted_idx_y[g'], sorted_idx_z[h']).
+    old_theta_se_m = np.zeros((k_y, k_z))
+    old_theta_se_r = np.zeros((k_y, k_z))
+    idx = 0
+    for g in range(k_y):
+        for h in range(k_z):
+            if g == 0 and h == 0: continue
+            old_theta_se_m[g, h] = se_m[idx]
+            old_theta_se_r[g, h] = se_r[idx]
+            idx += 1
+    new_theta_se_m = old_theta_se_m[np.ix_(sorted_idx_y, sorted_idx_z)]
+    new_theta_se_r = old_theta_se_r[np.ix_(sorted_idx_y, sorted_idx_z)]
+    idx = 0
+    for g in range(k_y):
+        for h in range(k_z):
+            if g == 0 and h == 0: continue
+            new_se_m[idx] = new_theta_se_m[g, h]
+            new_se_r[idx] = new_theta_se_r[g, h]
+            idx += 1
+
+    # --- Permute Y-BLOCK and Z-BLOCK independently (shared solo-outcome logic) ---
+    new_y_params, new_y_se_m, new_y_se_r, new_orders_y = _permute_solo_outcome_blocks(
+        params[y_beta_start:z_beta_start], se_m[y_beta_start:z_beta_start], se_r[y_beta_start:z_beta_start],
+        orders_y, use_dropout_y, dist_y, sorted_idx_y
+    )
+    new_params[y_beta_start:z_beta_start] = new_y_params
+    new_se_m[y_beta_start:z_beta_start] = new_y_se_m
+    new_se_r[y_beta_start:z_beta_start] = new_y_se_r
+
+    new_z_params, new_z_se_m, new_z_se_r, new_orders_z = _permute_solo_outcome_blocks(
+        params[z_beta_start:], se_m[z_beta_start:], se_r[z_beta_start:],
+        orders_z, use_dropout_z, dist_z, sorted_idx_z
+    )
+    new_params[z_beta_start:] = new_z_params
+    new_se_m[z_beta_start:] = new_z_se_m
+    new_se_r[z_beta_start:] = new_z_se_r
+
+    result.x = new_params
+    return new_orders_y, new_orders_z, new_se_m, new_se_r, pi_new
 
 
 def _resolve_covariate_arrays(n_subjects, n_obs, baseline_X, tvc_Z):
@@ -1788,6 +2468,232 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
     all_evaluated_models = sorted(all_evaluated_models, key=lambda x: x['BIC (Nagin)'] if pd.notnull(x['BIC (Nagin)']) else -np.inf, reverse=True)
     return valid_models, all_evaluated_models
 
+
+# --- JOINT DUAL-TRAJECTORY FITTING PIPELINE (V5.0) ---
+
+def generate_joint_initial_params(k_y, k_z, orders_y, orders_z, use_dropout_y, dist_y, outcomes_y,
+                                   use_dropout_z, dist_z, outcomes_z, n_starts=10):
+    """Generate n_starts starting points for the V5.0 joint dual-trajectory model.
+
+    Mirrors generate_initial_params's initialisation strategy independently
+    for each outcome's own block (staggered intercepts; dropout intercepts at
+    -2; CNORM log-sigma from std(outcomes); ZIP zeta at -1), plus an
+    all-zero (uniform joint mixture) Theta_joint block for the deterministic
+    base start — analogous to the base model's theta staying at 0.
+    """
+    n_theta, y_beta_start, z_beta_start, num_betas_y, num_betas_z, num_params = _joint_layout(
+        k_y, k_z, orders_y, orders_z, use_dropout_y, dist_y, use_dropout_z, dist_z
+    )
+    y_block_width = z_beta_start - y_beta_start
+    z_block_width = num_params - z_beta_start
+
+    def _staggered_intercepts(k, dist, outcomes):
+        if dist == 'POISSON':
+            mean_out = np.mean(outcomes[outcomes > 0]) if np.any(outcomes > 0) else 1.0
+            log_mean = np.log(mean_out)
+            offsets = np.linspace(-0.5 * (k - 1), 0.5 * (k - 1), k)
+            return log_mean + offsets * 0.5
+        elif dist == 'CNORM':
+            qs = np.linspace(1.0 / (k + 1.0), k * 1.0 / (k + 1.0), k) if k > 1 else [0.5]
+            return np.quantile(outcomes, qs)
+        else:
+            p_init = np.linspace(1.0 / (k + 1.0), k * 1.0 / (k + 1.0), k) if k > 1 else [0.5]
+            return np.log(p_init / (1.0 - np.array(p_init)))
+
+    base = np.zeros(num_params)
+
+    y_intercepts = _staggered_intercepts(k_y, dist_y, outcomes_y)
+    idx = y_beta_start
+    for g in range(k_y):
+        base[idx] = y_intercepts[g]
+        idx += orders_y[g] + 1
+    if use_dropout_y:
+        for g in range(k_y):
+            base[idx] = -2.0
+            idx += 3
+    if dist_y == 'CNORM':
+        sd_guess = np.std(outcomes_y)
+        base[z_beta_start - 1] = np.log(sd_guess) if sd_guess > 0 else 0.0
+    elif dist_y == 'ZIP':
+        base[z_beta_start - k_y:z_beta_start] = -1.0
+
+    z_intercepts = _staggered_intercepts(k_z, dist_z, outcomes_z)
+    idx = z_beta_start
+    for g in range(k_z):
+        base[idx] = z_intercepts[g]
+        idx += orders_z[g] + 1
+    if use_dropout_z:
+        for g in range(k_z):
+            base[idx] = -2.0
+            idx += 3
+    if dist_z == 'CNORM':
+        sd_guess = np.std(outcomes_z)
+        base[num_params - 1] = np.log(sd_guess) if sd_guess > 0 else 0.0
+    elif dist_z == 'ZIP':
+        base[num_params - k_z:num_params] = -1.0
+
+    starts = [base.copy()]
+
+    for s in range(1, n_starts):
+        np.random.seed(42 + s)
+        perturbed = base.copy()
+
+        if n_theta > 0:
+            perturbed[:n_theta] += np.random.normal(0, 0.5, n_theta)
+
+        idx = y_beta_start
+        for g in range(k_y):
+            n_betas = orders_y[g] + 1
+            perturbed[idx:idx + n_betas] += np.random.normal(0, 0.3, n_betas)
+            idx += n_betas
+        if use_dropout_y:
+            for g in range(k_y):
+                perturbed[idx:idx + 3] += np.random.normal(0, 0.2, 3)
+                idx += 3
+        if dist_y == 'CNORM':
+            perturbed[z_beta_start - 1] += np.random.normal(0, 0.2)
+        elif dist_y == 'ZIP':
+            perturbed[z_beta_start - k_y:z_beta_start] += np.random.normal(0, 0.3, k_y)
+
+        idx = z_beta_start
+        for g in range(k_z):
+            n_betas = orders_z[g] + 1
+            perturbed[idx:idx + n_betas] += np.random.normal(0, 0.3, n_betas)
+            idx += n_betas
+        if use_dropout_z:
+            for g in range(k_z):
+                perturbed[idx:idx + 3] += np.random.normal(0, 0.2, 3)
+                idx += 3
+        if dist_z == 'CNORM':
+            perturbed[num_params - 1] += np.random.normal(0, 0.2)
+        elif dist_z == 'ZIP':
+            perturbed[num_params - k_z:num_params] += np.random.normal(0, 0.3, k_z)
+
+        starts.append(perturbed)
+
+    return starts
+
+
+def run_joint_dual_trajectory_model(df_y, df_z, orders_y, orders_z, dist_y='LOGIT', dist_z='LOGIT',
+                                     use_dropout_y=False, use_dropout_z=False,
+                                     cnorm_min_y=0.0, cnorm_max_y=0.0, cnorm_min_z=0.0, cnorm_max_z=0.0,
+                                     n_starts=5):
+    """Fit a V5.0 Nagin-style joint dual-trajectory model.
+
+    Two outcomes Y and Z, each with its own independent GBTM structure (own
+    group count/orders/distribution/dropout), linked by a joint latent-class
+    probability matrix pi_gh instead of assuming independence. See MATH.md §9.
+
+    Single Model Mode only — fixed (K_Y, orders_y) and (K_Z, orders_z), no
+    AutoTraj-style combinatorial search over both outcomes' grids
+    simultaneously (explicit V5.0 scope boundary; a future extension).
+    Does not compose with V3.0 mixing-covariates/TVC or V4.0 survey weights
+    in this pass (also explicit scope boundaries).
+
+    Args:
+        df_y, df_z:  Long-format DataFrames (ID, Time, Outcome) for outcomes Y
+                     and Z — must share the identical subject-ID set
+                     (extract_joint_flat_arrays raises a clear error otherwise).
+        orders_y, orders_z: list of per-group polynomial orders for Y/Z.
+        dist_y, dist_z: distribution family per outcome, chosen independently.
+        use_dropout_y, use_dropout_z: independent MNAR dropout toggles.
+        cnorm_min_y/max_y, cnorm_min_z/max_z: independent CNORM bounds
+                     (auto-set to observed min/max if NaN, same as
+                     run_single_model).
+        n_starts:    multi-start random restarts (default 5).
+
+    Returns:
+        dict with keys:
+            'll', 'bic'/'bic_nagin', 'bic_standard', 'aic'/'aic_nagin', 'aic_standard',
+            'orders_y', 'orders_z', 'k_y', 'k_z', 'result' (scipy OptimizeResult,
+            .x in original time units), 'pis_joint' (K_Y x K_Z ndarray, None if
+            not converged), 'use_dropout_y', 'use_dropout_z', 'dist_y', 'dist_z',
+            'cnorm_min_y'/'cnorm_max_y', 'cnorm_min_z'/'cnorm_max_z',
+            'se_model', 'se_robust', 'cond_num', 'dof', 'v_model'.
+    """
+    (times_y, outcomes_y, dropouts_y, subj_breaks_y), \
+        (times_z, outcomes_z, dropouts_z, subj_breaks_z), \
+        canonical_ids = extract_joint_flat_arrays(df_y, df_z)
+
+    n_obs = len(times_y) + len(times_z)
+
+    dist_map = {'LOGIT': 0, 'CNORM': 1, 'POISSON': 2, 'ZIP': 3}
+    dist_code_y = dist_map.get(dist_y, 0)
+    dist_code_z = dist_map.get(dist_z, 0)
+
+    if dist_y == 'CNORM':
+        if cnorm_min_y is None or np.isnan(cnorm_min_y): cnorm_min_y = np.min(outcomes_y)
+        if cnorm_max_y is None or np.isnan(cnorm_max_y): cnorm_max_y = np.max(outcomes_y)
+    if dist_z == 'CNORM':
+        if cnorm_min_z is None or np.isnan(cnorm_min_z): cnorm_min_z = np.min(outcomes_z)
+        if cnorm_max_z is None or np.isnan(cnorm_max_z): cnorm_max_z = np.max(outcomes_z)
+
+    max_t_y = np.max(np.abs(times_y)); scale_factor_y = max_t_y if max_t_y > 0 else 1.0
+    max_t_z = np.max(np.abs(times_z)); scale_factor_z = max_t_z if max_t_z > 0 else 1.0
+    times_y_scaled = times_y / scale_factor_y
+    times_z_scaled = times_z / scale_factor_z
+
+    k_y = len(orders_y)
+    k_z = len(orders_z)
+    orders_y_arr = np.array(orders_y, dtype=np.int32)
+    orders_z_arr = np.array(orders_z, dtype=np.int32)
+
+    _, _, _, _, _, num_params = _joint_layout(
+        k_y, k_z, orders_y, orders_z, use_dropout_y, dist_y, use_dropout_z, dist_z
+    )
+
+    args = (times_y_scaled, outcomes_y, dropouts_y, subj_breaks_y, orders_y_arr, use_dropout_y, dist_code_y, float(cnorm_min_y), float(cnorm_max_y),
+            times_z_scaled, outcomes_z, dropouts_z, subj_breaks_z, orders_z_arr, use_dropout_z, dist_code_z, float(cnorm_min_z), float(cnorm_max_z))
+
+    starts = generate_joint_initial_params(k_y, k_z, orders_y, orders_z, use_dropout_y, dist_y, outcomes_y,
+                                            use_dropout_z, dist_z, outcomes_z, n_starts=n_starts)
+
+    best_result = None
+    best_nll = np.inf
+    best_start_idx = 0
+
+    for s_idx, initial_guess in enumerate(starts):
+        res = minimize(
+            calc_joint_nll_wrapper, initial_guess, args=args,
+            method='BFGS', jac=calc_joint_jac_wrapper, options={'maxiter': 3000, 'gtol': 1e-6}
+        )
+        if (res.success or res.status == 2) and res.fun < best_nll:
+            best_nll = res.fun
+            best_result = res
+            best_start_idx = s_idx
+
+    if best_result is None:
+        best_result = res  # fallback: last attempted result
+
+    if best_start_idx > 0:
+        print(f"  [multi-start] joint model Y{orders_y}/Z{orders_z}: best on start {best_start_idx + 1}/{n_starts} (NLL={best_nll:.4f})")
+
+    result = best_result
+    is_valid, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis_joint, cond_num, v_model = process_joint_optimization_result(
+        result, num_params, k_y, k_z, orders_y, orders_z,
+        times_y, outcomes_y, dropouts_y, subj_breaks_y, use_dropout_y, dist_y, cnorm_min_y, cnorm_max_y, scale_factor_y,
+        times_z, outcomes_z, dropouts_z, subj_breaks_z, use_dropout_z, dist_z, cnorm_min_z, cnorm_max_z, scale_factor_z,
+    )
+
+    if is_valid:
+        orders_y, orders_z, se_model, se_robust, pis_joint = sort_joint_groups_by_intercept(
+            result, k_y, k_z, orders_y, orders_z, se_model, se_robust, use_dropout_y, dist_y, use_dropout_z, dist_z
+        )
+
+    return {
+        'bic': bic_nagin, 'bic_nagin': bic_nagin, 'bic_standard': bic_standard,
+        'aic': aic_nagin, 'aic_nagin': aic_nagin, 'aic_standard': aic_standard, 'll': ll,
+        'orders_y': orders_y, 'orders_z': orders_z, 'k_y': k_y, 'k_z': k_z,
+        'result': result, 'pis_joint': pis_joint,
+        'use_dropout_y': use_dropout_y, 'use_dropout_z': use_dropout_z,
+        'dist_y': dist_y, 'dist_z': dist_z,
+        'cnorm_min_y': cnorm_min_y, 'cnorm_max_y': cnorm_max_y,
+        'cnorm_min_z': cnorm_min_z, 'cnorm_max_z': cnorm_max_z,
+        'se_model': se_model, 'se_robust': se_robust, 'cond_num': cond_num,
+        'dof': n_obs - num_params, 'v_model': v_model,
+    }
+
+
 def get_subject_assignments(model_dict, df):
     """Compute posterior group probabilities and hard assignments for every subject.
 
@@ -1946,8 +2852,118 @@ def get_subject_assignments(model_dict, df):
         row = {'ID': subject_ids_unique[i], 'Assigned_Group': np.argmax(posterior_ig) + 1}
         for g in range(k): row[f'Group_{g+1}_Prob'] = posterior_ig[g]
         assignments.append(row)
-        
+
     return pd.DataFrame(assignments)
+
+
+def get_joint_subject_assignments(model_dict, df_y, df_z):
+    """Compute joint and marginal posterior group probabilities and hard
+    assignments for every subject, for a fitted V5.0 joint dual-trajectory
+    model (mirrors get_subject_assignments, generalized to the (K_Y,K_Z)
+    joint posterior grid).
+
+    Reuses calc_single_outcome_group_ll_jit directly (the same JIT subroutine
+    the joint kernel itself calls) rather than a third hand-duplicated copy
+    of the forward-pass math.
+
+    Args:
+        model_dict: Model dict returned by run_joint_dual_trajectory_model
+                    (keys: 'orders_y', 'orders_z', 'result', 'use_dropout_y',
+                    'use_dropout_z', 'dist_y', 'dist_z', 'cnorm_min_y/max_y',
+                    'cnorm_min_z/max_z').
+        df_y, df_z: Long-format DataFrames for outcomes Y and Z — must share
+                    the identical subject-ID set (extract_joint_flat_arrays).
+
+    Returns:
+        pd.DataFrame: One row per subject with columns:
+            'ID', 'Assigned_Group_Y', 'Assigned_Group_Z' (1-based hard
+            assignments from the MARGINAL posteriors), 'Joint_G{g}_H{h}_Prob'
+            for every joint cell, 'Y_Group_{g}_Prob' / 'Z_Group_{h}_Prob'
+            marginal posteriors.
+    """
+    orders_y = model_dict['orders_y']
+    orders_z = model_dict['orders_z']
+    use_dropout_y = model_dict['use_dropout_y']
+    use_dropout_z = model_dict['use_dropout_z']
+    dist_y = model_dict.get('dist_y', 'LOGIT')
+    dist_z = model_dict.get('dist_z', 'LOGIT')
+    dist_map = {'LOGIT': 0, 'CNORM': 1, 'POISSON': 2, 'ZIP': 3}
+    dist_code_y = dist_map.get(dist_y, 0)
+    dist_code_z = dist_map.get(dist_z, 0)
+    cnorm_min_y = float(model_dict.get('cnorm_min_y', 0.0))
+    cnorm_max_y = float(model_dict.get('cnorm_max_y', 0.0))
+    cnorm_min_z = float(model_dict.get('cnorm_min_z', 0.0))
+    cnorm_max_z = float(model_dict.get('cnorm_max_z', 0.0))
+    params = model_dict['result'].x
+
+    k_y = len(orders_y)
+    k_z = len(orders_z)
+    orders_y_arr = np.array(orders_y, dtype=np.int32)
+    orders_z_arr = np.array(orders_z, dtype=np.int32)
+
+    (times_y, outcomes_y, dropouts_y, subj_breaks_y), \
+        (times_z, outcomes_z, dropouts_z, subj_breaks_z), \
+        canonical_ids = extract_joint_flat_arrays(df_y, df_z)
+
+    _, y_beta_start, z_beta_start, _, _, _ = _joint_layout(
+        k_y, k_z, orders_y, orders_z, use_dropout_y, dist_y, use_dropout_z, dist_z
+    )
+    params_y = params[y_beta_start:z_beta_start]
+    params_z = params[z_beta_start:]
+
+    tvc_y = np.zeros((len(times_y), 0))
+    tvc_z = np.zeros((len(times_z), 0))
+
+    n_subjects = len(subj_breaks_y) - 1
+    rows = []
+
+    for i in range(n_subjects):
+        start_y, end_y = subj_breaks_y[i], subj_breaks_y[i + 1]
+        start_z, end_z = subj_breaks_z[i], subj_breaks_z[i + 1]
+
+        L_y, _, _ = calc_single_outcome_group_ll_jit(
+            params_y, times_y, outcomes_y, dropouts_y, start_y, end_y, orders_y_arr,
+            tvc_y, 0, use_dropout_y, dist_code_y, cnorm_min_y, cnorm_max_y
+        )
+        L_z, _, _ = calc_single_outcome_group_ll_jit(
+            params_z, times_z, outcomes_z, dropouts_z, start_z, end_z, orders_z_arr,
+            tvc_z, 0, use_dropout_z, dist_code_z, cnorm_min_z, cnorm_max_z
+        )
+
+        theta_grid = np.zeros((k_y, k_z))
+        idx = 0
+        for g in range(k_y):
+            for h in range(k_z):
+                if g == 0 and h == 0: continue
+                theta_grid[g, h] = params[idx]
+                idx += 1
+        max_theta = np.max(theta_grid)
+        log_theta_norm = max_theta + np.log(np.sum(np.exp(theta_grid - max_theta)))
+        log_pi_gh = theta_grid - log_theta_norm
+
+        numerator_log = log_pi_gh + np.asarray(L_y).reshape(-1, 1) + np.asarray(L_z).reshape(1, -1)
+        post_max = np.max(numerator_log)
+        log_norm = post_max + np.log(np.sum(np.exp(numerator_log - post_max)))
+        posterior_gh = np.exp(numerator_log - log_norm)
+
+        posterior_g = posterior_gh.sum(axis=1)
+        posterior_h = posterior_gh.sum(axis=0)
+
+        row = {
+            'ID': canonical_ids[i],
+            'Assigned_Group_Y': int(np.argmax(posterior_g)) + 1,
+            'Assigned_Group_Z': int(np.argmax(posterior_h)) + 1,
+        }
+        for g in range(k_y):
+            for h in range(k_z):
+                row[f'Joint_G{g+1}_H{h+1}_Prob'] = posterior_gh[g, h]
+        for g in range(k_y):
+            row[f'Y_Group_{g+1}_Prob'] = posterior_g[g]
+        for h in range(k_z):
+            row[f'Z_Group_{h+1}_Prob'] = posterior_h[h]
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 def calc_model_adequacy(assignments_df, pis, group_names):
     """Compute Nagin (2005) adequacy metrics: AvePP, OCC, and relative entropy.
@@ -2017,5 +3033,53 @@ def calc_model_adequacy(assignments_df, pis, group_names):
             "AvePP": round(ave_pp, 4) if pd.notnull(ave_pp) else "N/A",
             "OCC": round(occ, 2) if pd.notnull(occ) else "N/A"
         })
-        
+
     return pd.DataFrame(adequacy_data), relative_entropy
+
+
+def calc_joint_model_adequacy(assignments_df, pis_joint, group_names_y, group_names_z):
+    """Joint AND per-outcome-marginal Nagin (2005) adequacy metrics (AvePP,
+    OCC, relative entropy) for a fitted V5.0 joint dual-trajectory model.
+
+    calc_model_adequacy is already generic over the number of groups/columns,
+    so no new adequacy-metric math is needed for V5.0 — this function just
+    builds three column-adapted views of get_joint_subject_assignments's
+    output (joint cells flattened into a single group index, plus each
+    outcome's own marginal) and calls calc_model_adequacy unchanged on each.
+
+    Args:
+        assignments_df: DataFrame from get_joint_subject_assignments.
+        pis_joint:      (K_Y, K_Z) joint mixing-probability matrix.
+        group_names_y, group_names_z: display names for Y's/Z's groups.
+
+    Returns:
+        Tuple[pd.DataFrame, float, pd.DataFrame, float, pd.DataFrame, float]:
+            joint_adq_df, joint_rel_entropy, y_adq_df, y_rel_entropy, z_adq_df, z_rel_entropy
+    """
+    k_y, k_z = pis_joint.shape
+
+    # --- Joint: flatten (g,h) cells into a single 1..K_Y*K_Z group index ---
+    joint_group_names = [f"{gn}/{hn}" for gn in group_names_y for hn in group_names_z]
+    joint_prob_cols = [f'Joint_G{g+1}_H{h+1}_Prob' for g in range(k_y) for h in range(k_z)]
+    joint_df = assignments_df[['ID'] + joint_prob_cols].copy()
+    joint_df.columns = ['ID'] + [f'Group_{idx+1}_Prob' for idx in range(k_y * k_z)]
+    joint_df['Assigned_Group'] = (
+        (assignments_df['Assigned_Group_Y'] - 1) * k_z + (assignments_df['Assigned_Group_Z'] - 1) + 1
+    )
+    joint_adq_df, joint_rel_entropy = calc_model_adequacy(joint_df, pis_joint.flatten(), joint_group_names)
+
+    # --- Y-marginal ---
+    y_prob_cols = [f'Y_Group_{g+1}_Prob' for g in range(k_y)]
+    y_df = assignments_df[['ID'] + y_prob_cols].copy()
+    y_df.columns = ['ID'] + [f'Group_{g+1}_Prob' for g in range(k_y)]
+    y_df['Assigned_Group'] = assignments_df['Assigned_Group_Y']
+    y_adq_df, y_rel_entropy = calc_model_adequacy(y_df, pis_joint.sum(axis=1), group_names_y)
+
+    # --- Z-marginal ---
+    z_prob_cols = [f'Z_Group_{h+1}_Prob' for h in range(k_z)]
+    z_df = assignments_df[['ID'] + z_prob_cols].copy()
+    z_df.columns = ['ID'] + [f'Group_{h+1}_Prob' for h in range(k_z)]
+    z_df['Assigned_Group'] = assignments_df['Assigned_Group_Z']
+    z_adq_df, z_rel_entropy = calc_model_adequacy(z_df, pis_joint.sum(axis=0), group_names_z)
+
+    return joint_adq_df, joint_rel_entropy, y_adq_df, y_rel_entropy, z_adq_df, z_rel_entropy

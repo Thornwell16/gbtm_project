@@ -11,6 +11,7 @@ return silently corrupted results (NaN/Inf where not expected).
 
 import os
 import sys
+import types
 
 import numpy as np
 import pandas as pd
@@ -24,9 +25,14 @@ from main import (
     run_autotraj,
     get_subject_assignments,
     extract_flat_arrays,
+    extract_joint_flat_arrays,
     generate_initial_params,
     calc_nll_wrapper,
     calc_jac_wrapper,
+    calc_joint_nll_wrapper,
+    build_baseline_covariate_matrix,
+    sort_groups_by_intercept,
+    sort_joint_groups_by_intercept,
 )
 from tests.simulate import (
     simulate_logit_trajectories,
@@ -34,6 +40,8 @@ from tests.simulate import (
     simulate_poisson_trajectories,
     simulate_zip_trajectories,
     simulate_dropout_data,
+    simulate_logit_with_mixing_covariates,
+    simulate_joint_two_outcome_trajectories,
 )
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -685,6 +693,117 @@ def test_gradient_matches_finite_difference_with_weights():
         f"max_rel_err={max_rel_err:.3e}\n"
         f"analytical: {analytical_grad}\n"
         f"numerical:  {numerical_grad}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# TEST: sort_groups_by_intercept must be an exact likelihood-invariant symmetry
+# ---------------------------------------------------------------------------
+
+def test_sort_groups_by_intercept_is_likelihood_invariant():
+    """Label-switching resort must be an exact likelihood-invariant symmetry:
+    the NLL evaluated at the pre-sort parameter vector must equal the NLL
+    evaluated at the post-sort (permuted + re-referenced) parameter vector, on
+    the same data. Uses a mixing-covariate (Gamma) model specifically, since
+    that block's re-referencing (subtracting the new reference group's full
+    Gamma vector, main.py's sort_groups_by_intercept) is the nonlinear part of
+    the resort and the part most likely to silently break the invariant.
+
+    This is the 1-D baseline for the planned 2-D (joint dual-trajectory)
+    version of this same invariance check (V5.0).
+    """
+    df, _ = simulate_logit_with_mixing_covariates(
+        n_subjects=200, time_points=np.linspace(-1, 1, 6),
+        group_params=[{'betas': [2.0, -0.5]}, {'betas': [-1.0, 0.3]}],
+        gamma_matrix=[[0.0, 0.0], [0.5, 1.2]], seed=88,
+    )
+    times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
+    baseline_X = build_baseline_covariate_matrix(df, ['X1'])
+    tvc_Z = np.zeros((len(times), 0))
+    orders_list = [1, 1]
+    n_mix = 2
+
+    # Intercepts deliberately DESCENDING (group 0 = 2.0 > group 1 = -1.0) so
+    # sort_groups_by_intercept must actually perform a swap, not a no-op.
+    params = np.array([0.5, 1.2, 2.0, -0.5, -1.0, 0.3])
+    result = types.SimpleNamespace(x=params.copy())
+    se_model = np.ones(6)
+    se_robust = np.ones(6)
+    pis = np.array([0.6, 0.4])
+
+    args = (times, outcomes, dropouts, subj_breaks, np.array(orders_list, dtype=np.int32),
+            0, False, 0, 0.0, 0.0, baseline_X, tvc_Z)
+    nll_before = calc_nll_wrapper(params.copy(), *args)
+
+    sort_groups_by_intercept(
+        result, orders_list, se_model, se_robust, pis, False, 'LOGIT', n_mix=n_mix, n_tvc=0,
+    )
+
+    assert not np.allclose(result.x, params), (
+        "Test setup error: resort did not change the parameter vector — "
+        "the intercepts were not actually out of order."
+    )
+
+    nll_after = calc_nll_wrapper(result.x, *args)
+    assert nll_before == pytest.approx(nll_after, abs=1e-8), (
+        f"Label-switching resort changed the NLL: before={nll_before}, after={nll_after}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# TEST: sort_joint_groups_by_intercept (V5.0, 2-D) must be likelihood-invariant
+# ---------------------------------------------------------------------------
+
+def test_sort_joint_groups_by_intercept_is_likelihood_invariant():
+    """2-D generalization of the 1-D label-switching invariance check (V5.0):
+    the joint NLL evaluated at the pre-sort parameter vector must equal the
+    NLL evaluated at the post-sort vector (both outcomes' groups
+    independently permuted, Theta_joint re-derived from the re-permuted
+    pi_gh matrix) on the same data. This is the mandatory correctness check
+    for the trickiest part of the V5.0 implementation (MATH.md §9f) — Theta_joint
+    cannot simply be permuted like a beta block, since it's only meaningful
+    relative to the OLD reference cell.
+    """
+    df_y, df_z, _ = simulate_joint_two_outcome_trajectories(
+        n_subjects=150, time_points_y=np.linspace(-1, 1, 6), time_points_z=np.linspace(-1, 1, 5),
+        group_params_y=[{'betas': [-1.0]}, {'betas': [1.0, -0.3]}],
+        group_params_z=[{'betas': [-0.5]}, {'betas': [0.8, 0.2]}],
+        pi_gh=np.array([[0.4, 0.1], [0.1, 0.4]]), seed=91,
+    )
+    (times_y, outcomes_y, dropouts_y, subj_breaks_y), \
+        (times_z, outcomes_z, dropouts_z, subj_breaks_z), _ = extract_joint_flat_arrays(df_y, df_z)
+
+    orders_y = [1, 1]
+    orders_z = [1, 1]
+    k_y, k_z = 2, 2
+
+    # Params deliberately DESCENDING-intercept on BOTH axes, forcing a real
+    # swap on Y and Z simultaneously (the hardest case for the resort logic).
+    params = np.array([
+        -2.0, -2.0, 1.0,        # Theta_joint: theta_01, theta_10, theta_11
+        2.0, -0.3, -1.0, 0.4,   # Y-BLOCK: group0=[2.0,-0.3], group1=[-1.0,0.4]
+        1.5, -0.2, -0.8, 0.1,   # Z-BLOCK: group0=[1.5,-0.2], group1=[-0.8,0.1]
+    ])
+    result = types.SimpleNamespace(x=params.copy())
+    se_model = np.ones(11)
+    se_robust = np.ones(11)
+
+    args = (times_y, outcomes_y, dropouts_y, subj_breaks_y, np.array(orders_y, dtype=np.int32), False, 0, 0.0, 0.0,
+            times_z, outcomes_z, dropouts_z, subj_breaks_z, np.array(orders_z, dtype=np.int32), False, 0, 0.0, 0.0)
+    nll_before = calc_joint_nll_wrapper(params.copy(), *args)
+
+    sort_joint_groups_by_intercept(
+        result, k_y, k_z, orders_y, orders_z, se_model, se_robust, False, 'LOGIT', False, 'LOGIT'
+    )
+
+    assert not np.allclose(result.x, params), (
+        "Test setup error: resort did not change the parameter vector — "
+        "the intercepts were not actually out of order on both axes."
+    )
+
+    nll_after = calc_joint_nll_wrapper(result.x, *args)
+    assert nll_before == pytest.approx(nll_after, abs=1e-8), (
+        f"Joint label-switching resort changed the NLL: before={nll_before}, after={nll_after}"
     )
 
 

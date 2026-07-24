@@ -56,6 +56,7 @@ import numpy as np
 import time
 import io
 import zipfile
+from types import SimpleNamespace
 import plotly.graph_objects as go
 import matplotlib
 matplotlib.use('Agg')
@@ -75,7 +76,11 @@ from main import (
     calc_logit_prob_jit,
     create_design_matrix_jit,
     get_subject_assignments,
-    calc_model_adequacy
+    calc_model_adequacy,
+    run_joint_dual_trajectory_model,
+    get_joint_subject_assignments,
+    calc_joint_model_adequacy,
+    _joint_layout,
 )
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -266,6 +271,86 @@ def get_parameter_estimates_for_ui(model_dict, group_names=None):
                 "T for H0: Param=0": round(t_stat, 3),
                 "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
             })
+
+    return pd.DataFrame(data)
+
+
+def get_joint_parameter_estimates_for_ui(model_dict):
+    """Parameter table for a V5.0 joint dual-trajectory model.
+
+    Mirrors get_parameter_estimates_for_ui but for the joint layout
+    (Theta_joint | Y-BLOCK | Z-BLOCK) — no mixing covariates/TVC, since V5.0
+    doesn't compose with those in this pass (explicit scope boundary).
+    """
+    orders_y, orders_z = model_dict['orders_y'], model_dict['orders_z']
+    k_y, k_z = len(orders_y), len(orders_z)
+    params = model_dict['result'].x
+    se_model, se_robust = model_dict['se_model'], model_dict['se_robust']
+    use_dropout_y, use_dropout_z = model_dict['use_dropout_y'], model_dict['use_dropout_z']
+    dist_y, dist_z = model_dict.get('dist_y', 'LOGIT'), model_dict.get('dist_z', 'LOGIT')
+    dof = model_dict['dof']
+
+    n_theta, y_beta_start, z_beta_start, num_betas_y, num_betas_z, num_params = _joint_layout(
+        k_y, k_z, orders_y, orders_z, use_dropout_y, dist_y, use_dropout_z, dist_z
+    )
+
+    data = []
+    labels = ["Intercept", "Linear", "Quadratic", "Cubic", "Quartic", "Quintic"]
+    gamma_labels = ["Dropout: Intercept", "Dropout: Time", "Dropout: Prev Outcome"]
+
+    def _row(component, group, parameter, idx):
+        est, err_m, err_r = params[idx], se_model[idx], se_robust[idx]
+        t_stat = est / err_m if err_m > 0 else 0
+        p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+        return {
+            "Component": component, "Group": str(group), "Parameter": parameter,
+            "Estimate": round(est, 5), "Standard Error": round(err_m, 5),
+            "Robust SE": round(err_r, 5),
+            "T for H0: Param=0": round(t_stat, 3),
+            "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001",
+        }
+
+    idx = 0
+    for g in range(k_y):
+        for h in range(k_z):
+            if g == 0 and h == 0:
+                continue
+            data.append(_row("Joint Mixing", f"Y{g+1}/Z{h+1}", "Theta (log-odds vs. Y1/Z1)", idx))
+            idx += 1
+
+    def _outcome_rows(outcome_label, k, orders, use_dropout, dist, block_start):
+        cur = block_start
+        for g in range(k):
+            n_betas = orders[g] + 1
+            for b in range(n_betas):
+                data.append(_row(f"{outcome_label} Trajectory", f"Group {g+1}", labels[b], cur + b))
+            cur += n_betas
+            if use_dropout:
+                for gi in range(3):
+                    data.append(_row(f"{outcome_label} Dropout", f"Group {g+1}", gamma_labels[gi], cur + gi))
+                cur += 3
+        if dist == 'CNORM':
+            est = np.exp(params[cur])
+            err_m, err_r = se_model[cur] * est, se_robust[cur] * est
+            t_stat = est / err_m if err_m > 0 else 0
+            p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+            data.append({
+                "Component": f"{outcome_label} Variance", "Group": "All Groups",
+                "Parameter": "Sigma (Standard Deviation)",
+                "Estimate": round(est, 5), "Standard Error": round(err_m, 5),
+                "Robust SE": round(err_r, 5),
+                "T for H0: Param=0": round(t_stat, 3),
+                "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001",
+            })
+            cur += 1
+        elif dist == 'ZIP':
+            for g in range(k):
+                data.append(_row(f"{outcome_label} Zero Inflation", f"Group {g+1}", "Zeta (logit of omega)", cur + g))
+            cur += k
+        return cur
+
+    _outcome_rows("Y", k_y, orders_y, use_dropout_y, dist_y, y_beta_start)
+    _outcome_rows("Z", k_z, orders_z, use_dropout_z, dist_z, z_beta_start)
 
     return pd.DataFrame(data)
 
@@ -917,10 +1002,10 @@ with st.sidebar:
         <span class="motto">Sapientia Veritatem Parit</span>
     </div>
     """, unsafe_allow_html=True)
-    app_mode = st.radio("Navigation", ["AutoTraj Search", "Single Model Mode", "About & Docs"])
+    app_mode = st.radio("Navigation", ["AutoTraj Search", "Single Model Mode", "Dual-Trajectory (Joint) Mode", "About & Docs"])
     st.markdown('<span class="sidebar-section-header">&#160;</span>', unsafe_allow_html=True)
 
-    if app_mode != "About & Docs":
+    if app_mode in ("AutoTraj Search", "Single Model Mode"):
         st.markdown('<span class="sidebar-section-header">1. Data Format</span>', unsafe_allow_html=True)
         data_format = st.radio("Select Data Structure:", ["Wide Format", "Long Format"], horizontal=True)
 
@@ -986,6 +1071,60 @@ with st.sidebar:
 
         zip_iorder = 0  # no longer used; kept for API compatibility
 
+    elif app_mode == "Dual-Trajectory (Joint) Mode":
+        st.caption(
+            "V5.0: two outcomes (Y, Z) linked by a joint latent-class probability "
+            "matrix, instead of assuming independent group membership. Long format "
+            "only — single model specification (no AutoTraj-style search over both "
+            "outcomes' group/order grids)."
+        )
+        st.markdown('<span class="sidebar-section-header">1. Data Mapping (Long Format)</span>', unsafe_allow_html=True)
+        joint_id_col = st.text_input("ID Col", value="ID", key="joint_id_col")
+        col_jy1, col_jy2 = st.columns(2)
+        with col_jy1: joint_outcome_y_col = st.text_input("Outcome Y Col", value="Outcome_Y", key="joint_out_y")
+        with col_jy2: joint_time_y_col = st.text_input("Time Y Col", value="Time_Y", key="joint_time_y")
+        col_jz1, col_jz2 = st.columns(2)
+        with col_jz1: joint_outcome_z_col = st.text_input("Outcome Z Col", value="Outcome_Z", key="joint_out_z")
+        with col_jz2: joint_time_z_col = st.text_input("Time Z Col", value="Time_Z", key="joint_time_z")
+
+        st.markdown('<span class="sidebar-section-header">2. Outcome Y</span>', unsafe_allow_html=True)
+        joint_dist_y = st.selectbox("Distribution:", ["LOGIT", "CNORM", "POISSON", "ZIP"], key="joint_dist_y")
+        joint_cnorm_min_y, joint_cnorm_max_y = 0.0, 0.0
+        if joint_dist_y == "CNORM":
+            c1, c2 = st.columns(2)
+            miny = c1.text_input("Min", value="", key="joint_cmin_y")
+            maxy = c2.text_input("Max", value="", key="joint_cmax_y")
+            if miny.strip() != "": joint_cnorm_min_y = float(miny)
+            if maxy.strip() != "": joint_cnorm_max_y = float(maxy)
+        joint_dropout_y = st.checkbox("Include MNAR Dropout (Y)", value=False, key="joint_drop_y")
+        joint_k_y = st.number_input("Number of Groups (Y)", min_value=1, max_value=6, value=2, key="joint_k_y")
+        joint_orders_y = [
+            st.number_input(f"Y Group {i+1} Order", min_value=0, max_value=5, value=1, key=f"joint_oy_{i}")
+            for i in range(joint_k_y)
+        ]
+
+        st.markdown('<span class="sidebar-section-header">3. Outcome Z</span>', unsafe_allow_html=True)
+        joint_dist_z = st.selectbox("Distribution:", ["LOGIT", "CNORM", "POISSON", "ZIP"], key="joint_dist_z")
+        joint_cnorm_min_z, joint_cnorm_max_z = 0.0, 0.0
+        if joint_dist_z == "CNORM":
+            c1, c2 = st.columns(2)
+            minz = c1.text_input("Min", value="", key="joint_cmin_z")
+            maxz = c2.text_input("Max", value="", key="joint_cmax_z")
+            if minz.strip() != "": joint_cnorm_min_z = float(minz)
+            if maxz.strip() != "": joint_cnorm_max_z = float(maxz)
+        joint_dropout_z = st.checkbox("Include MNAR Dropout (Z)", value=False, key="joint_drop_z")
+        joint_k_z = st.number_input("Number of Groups (Z)", min_value=1, max_value=6, value=2, key="joint_k_z")
+        joint_orders_z = [
+            st.number_input(f"Z Group {i+1} Order", min_value=0, max_value=5, value=1, key=f"joint_oz_{i}")
+            for i in range(joint_k_z)
+        ]
+
+        st.markdown('<span class="sidebar-section-header">4. Engine Options</span>', unsafe_allow_html=True)
+        joint_n_starts = st.number_input(
+            "Multi-Start Restarts", min_value=1, max_value=20, value=5, key="joint_n_starts",
+            help="Number of random starting points. More starts reduce local-optima risk."
+        )
+
 # ── About page ───────────────────────────────────────────────────────────────
 
 if app_mode == "About & Docs":
@@ -1036,6 +1175,182 @@ if app_mode == "About & Docs":
     """)
     st.divider()
     st.markdown('<div class="app-footer">AutoTraj v1.5 &nbsp;&middot;&nbsp; Built by Donald E. Warden, PhD, MPH &nbsp;&middot;&nbsp; <em>Sapientia Veritatem Parit</em> &nbsp;&middot;&nbsp; MIT License</div>', unsafe_allow_html=True)
+
+# ── Dual-Trajectory (Joint) mode ───────────────────────────────────────────────
+
+elif app_mode == "Dual-Trajectory (Joint) Mode":
+    st.markdown("""
+    <div class="autotraj-header">
+        <h1>AutoTraj</h1>
+        <p>Dual-Trajectory (Joint) Mode &nbsp;&mdash;&nbsp; Two outcomes linked by a joint latent-class probability matrix</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    uploaded_file_j = st.file_uploader(
+        "Upload Long-Format Dataset (.csv, .txt, .xlsx)", type=["csv", "txt", "xlsx"], key="joint_uploader"
+    )
+    raw_df_j = None
+    if uploaded_file_j is not None:
+        try:
+            file_name_j = uploaded_file_j.name.lower()
+            if file_name_j.endswith('.csv'):
+                raw_df_j = pd.read_csv(uploaded_file_j, encoding='utf-8-sig')
+            elif file_name_j.endswith('.txt'):
+                raw_df_j = pd.read_csv(uploaded_file_j, sep=r'\s+', encoding='utf-8-sig')
+            elif file_name_j.endswith('.xlsx'):
+                raw_df_j = pd.read_excel(uploaded_file_j, engine='openpyxl')
+            raw_df_j.columns = [str(c).strip() for c in raw_df_j.columns]
+            st.success("Custom file uploaded successfully!")
+        except Exception as e:
+            st.error(f"Error loading file: {e}")
+
+    if raw_df_j is not None:
+        required_cols_j = [joint_id_col, joint_outcome_y_col, joint_time_y_col, joint_outcome_z_col, joint_time_z_col]
+        missing_j = [c for c in required_cols_j if c not in raw_df_j.columns]
+        if missing_j:
+            st.error(f"Column(s) not found in uploaded file: {', '.join(missing_j)}. Available columns: {', '.join(raw_df_j.columns)}")
+        else:
+            df_y_j = raw_df_j[[joint_id_col, joint_time_y_col, joint_outcome_y_col]].rename(
+                columns={joint_id_col: 'ID', joint_time_y_col: 'Time', joint_outcome_y_col: 'Outcome'}
+            ).dropna()
+            df_z_j = raw_df_j[[joint_id_col, joint_time_z_col, joint_outcome_z_col]].rename(
+                columns={joint_id_col: 'ID', joint_time_z_col: 'Time', joint_outcome_z_col: 'Outcome'}
+            ).dropna()
+
+            ids_y_j, ids_z_j = set(df_y_j['ID'].unique()), set(df_z_j['ID'].unique())
+            if ids_y_j != ids_z_j:
+                only_y_j, only_z_j = sorted(ids_y_j - ids_z_j), sorted(ids_z_j - ids_y_j)
+                msg = "Outcome Y and Outcome Z must share the identical subject-ID set after dropping missing rows. "
+                if only_y_j: msg += f"IDs only in Y ({len(only_y_j)}): {only_y_j[:10]}. "
+                if only_z_j: msg += f"IDs only in Z ({len(only_z_j)}): {only_z_j[:10]}."
+                st.error(msg)
+            else:
+                st.success(f"Loaded {df_y_j['ID'].nunique()} subjects — {len(df_y_j)} Y-observations, {len(df_z_j)} Z-observations.")
+
+                if st.button("Fit Joint Dual-Trajectory Model", type="primary"):
+                    with st.spinner("Fitting joint model (multi-start BFGS)... this may take a while."):
+                        try:
+                            model_j = run_joint_dual_trajectory_model(
+                                df_y_j, df_z_j, orders_y=joint_orders_y, orders_z=joint_orders_z,
+                                dist_y=joint_dist_y, dist_z=joint_dist_z,
+                                use_dropout_y=joint_dropout_y, use_dropout_z=joint_dropout_z,
+                                cnorm_min_y=joint_cnorm_min_y, cnorm_max_y=joint_cnorm_max_y,
+                                cnorm_min_z=joint_cnorm_min_z, cnorm_max_z=joint_cnorm_max_z,
+                                n_starts=joint_n_starts,
+                            )
+                            st.session_state.joint_model = model_j
+                            st.session_state.joint_df_y = df_y_j
+                            st.session_state.joint_df_z = df_z_j
+                        except Exception as e:
+                            st.error(f"Model fitting failed: {e}")
+                            st.session_state.joint_model = None
+
+                if st.session_state.get("joint_model") is not None:
+                    model_j = st.session_state.joint_model
+                    df_y_j = st.session_state.joint_df_y
+                    df_z_j = st.session_state.joint_df_z
+
+                    if model_j['pis_joint'] is None:
+                        st.error("Model did not converge to a valid solution. Try increasing restarts or simplifying the group/order specification.")
+                    else:
+                        pis_joint  = model_j['pis_joint']
+                        k_y, k_z   = model_j['k_y'], model_j['k_z']
+                        group_names_y = [f"Y-Group {g+1}" for g in range(k_y)]
+                        group_names_z = [f"Z-Group {h+1}" for h in range(k_z)]
+
+                        st.divider()
+                        st.subheader("Model Fit")
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Log-Likelihood", f"{model_j['ll']:.2f}")
+                        c2.metric("BIC (Nagin)", f"{model_j['bic']:.2f}")
+                        c3.metric("AIC (Nagin)", f"{model_j['aic']:.2f}")
+                        c4.metric("Condition Number", f"{model_j['cond_num']:.1e}")
+                        if model_j['cond_num'] > 1e10:
+                            st.warning("High condition number — model may be weakly identified. Consider fewer groups or lower polynomial orders.")
+
+                        st.subheader("Joint Latent-Class Probability Matrix (πₘₕ)")
+                        st.caption(
+                            "Cell (g,h) = P(subject is simultaneously in Y-Group g AND Z-Group h). "
+                            "If Y and Z were independent, each cell would equal the product of its row and "
+                            "column marginals — deviations from that indicate the two outcomes co-develop."
+                        )
+                        fig_pi = go.Figure(go.Heatmap(
+                            z=pis_joint, x=group_names_z, y=group_names_y,
+                            colorscale='Blues', text=np.round(pis_joint, 3), texttemplate="%{text}",
+                            zmin=0, colorbar=dict(title="P(g,h)"),
+                        ))
+                        fig_pi.update_layout(height=320 + 40 * max(k_y, k_z), template="plotly_white")
+                        st.plotly_chart(fig_pi, use_container_width=True)
+
+                        col_cond1, col_cond2 = st.columns(2)
+                        with col_cond1:
+                            st.markdown("**P(Z-Group | Y-Group)** — row-normalized")
+                            p_h_given_g = pis_joint / pis_joint.sum(axis=1, keepdims=True)
+                            st.dataframe(pd.DataFrame(np.round(p_h_given_g, 3), index=group_names_y, columns=group_names_z), use_container_width=True)
+                        with col_cond2:
+                            st.markdown("**P(Y-Group | Z-Group)** — column-normalized")
+                            p_g_given_h = pis_joint / pis_joint.sum(axis=0, keepdims=True)
+                            st.dataframe(pd.DataFrame(np.round(p_g_given_h, 3), index=group_names_y, columns=group_names_z), use_container_width=True)
+
+                        assignments_df_j = get_joint_subject_assignments(model_j, df_y_j, df_z_j)
+
+                        st.subheader("Hard-Assignment Contingency Table")
+                        st.caption("Empirical cross-check: counts of subjects by their most-likely Y-group and Z-group (computed independently of the fitted πₘₕ, from marginal posteriors).")
+                        contingency_j = pd.crosstab(
+                            assignments_df_j['Assigned_Group_Y'].map(lambda g: group_names_y[g - 1]),
+                            assignments_df_j['Assigned_Group_Z'].map(lambda h: group_names_z[h - 1]),
+                        )
+                        st.dataframe(contingency_j, use_container_width=True)
+
+                        joint_adq_df, joint_rel_entropy, y_adq_df, y_rel_entropy, z_adq_df, z_rel_entropy = calc_joint_model_adequacy(
+                            assignments_df_j, pis_joint, group_names_y, group_names_z
+                        )
+                        st.subheader("Model Adequacy Diagnostics (Nagin, 2005)")
+                        tab_adq_j, tab_adq_y, tab_adq_z = st.tabs(["Joint", "Y-Marginal", "Z-Marginal"])
+                        with tab_adq_j:
+                            st.dataframe(joint_adq_df, use_container_width=True)
+                            st.caption(f"Relative Entropy: {joint_rel_entropy:.3f}")
+                        with tab_adq_y:
+                            st.dataframe(y_adq_df, use_container_width=True)
+                            st.caption(f"Relative Entropy: {y_rel_entropy:.3f}")
+                        with tab_adq_z:
+                            st.dataframe(z_adq_df, use_container_width=True)
+                            st.caption(f"Relative Entropy: {z_rel_entropy:.3f}")
+
+                        st.subheader("Parameter Estimates")
+                        st.caption("Theta rows are joint mixing log-odds relative to reference cell Y-Group 1/Z-Group 1. Model-based SE is shown for reference; Robust SE (Huber-White sandwich) is the recommended inference basis.")
+                        st.dataframe(get_joint_parameter_estimates_for_ui(model_j), use_container_width=True)
+
+                        st.subheader("Fitted Trajectories")
+                        n_theta_j, y_beta_start_j, z_beta_start_j, num_betas_y_j, num_betas_z_j, _ = _joint_layout(
+                            k_y, k_z, model_j['orders_y'], model_j['orders_z'],
+                            model_j['use_dropout_y'], model_j['dist_y'], model_j['use_dropout_z'], model_j['dist_z']
+                        )
+                        col_traj_y, col_traj_z = st.columns(2)
+                        with col_traj_y:
+                            st.markdown("**Outcome Y**")
+                            fake_x_y = np.concatenate([np.zeros(k_y - 1), model_j['result'].x[y_beta_start_j:z_beta_start_j]])
+                            model_y_view = {'orders': model_j['orders_y'], 'result': SimpleNamespace(x=fake_x_y), 'n_mix': 1}
+                            assignments_y_view = assignments_df_j.rename(columns={
+                                **{f'Y_Group_{g+1}_Prob': f'Group_{g+1}_Prob' for g in range(k_y)},
+                                'Assigned_Group_Y': 'Assigned_Group',
+                            })
+                            st.plotly_chart(
+                                _obs_vs_est_figure(df_y_j, assignments_y_view, model_y_view, group_names_y, model_j['dist_y']),
+                                use_container_width=True,
+                            )
+                        with col_traj_z:
+                            st.markdown("**Outcome Z**")
+                            fake_x_z = np.concatenate([np.zeros(k_z - 1), model_j['result'].x[z_beta_start_j:]])
+                            model_z_view = {'orders': model_j['orders_z'], 'result': SimpleNamespace(x=fake_x_z), 'n_mix': 1}
+                            assignments_z_view = assignments_df_j.rename(columns={
+                                **{f'Z_Group_{h+1}_Prob': f'Group_{h+1}_Prob' for h in range(k_z)},
+                                'Assigned_Group_Z': 'Assigned_Group',
+                            })
+                            st.plotly_chart(
+                                _obs_vs_est_figure(df_z_j, assignments_z_view, model_z_view, group_names_z, model_j['dist_z']),
+                                use_container_width=True,
+                            )
 
 # ── Main app ──────────────────────────────────────────────────────────────────
 

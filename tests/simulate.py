@@ -753,6 +753,106 @@ def simulate_logit_with_biased_sampling_weights(
 
 
 # ---------------------------------------------------------------------------
+# V5.0: joint dual-trajectory (two outcomes linked by a joint pi_gh)
+# ---------------------------------------------------------------------------
+
+def simulate_joint_two_outcome_trajectories(
+    n_subjects: int,
+    time_points_y: Sequence[float],
+    time_points_z: Sequence[float],
+    group_params_y: List[Dict],
+    group_params_z: List[Dict],
+    pi_gh,
+    dist_y: str = 'LOGIT',
+    dist_z: str = 'LOGIT',
+    seed: int = 42,
+):
+    """Simulate a Nagin-style joint dual-trajectory dataset: two outcomes Y
+    and Z whose latent group memberships are drawn JOINTLY from a
+    (K_Y, K_Z) probability matrix pi_gh, rather than independently.
+
+    Supports LOGIT and CNORM for dist_y/dist_z (sufficient for the V5.0 test
+    suite). group_params_y[g]/group_params_z[h] each need 'betas'; CNORM
+    additionally needs 'sigma', 'cnorm_min', 'cnorm_max'.
+
+    Parameters
+    ----------
+    pi_gh : (K_Y, K_Z) array-like joint class probabilities (renormalised to
+            sum to 1). Should be explicitly NON-independent (not close to an
+            outer product of its own marginals) — a joint-recovery test using
+            an independent pi_gh cannot distinguish "the joint model works"
+            from "two separate single-outcome models happen to work".
+
+    Returns
+    -------
+    df_y, df_z : DataFrame [ID, Time, Outcome] for outcomes Y and Z, same ID
+                 set, aligned by construction.
+    truth : {'assignments_y', 'assignments_z' (1-based dicts), 'pi_gh'
+             (renormalised), 'group_params_y', 'group_params_z'}
+    """
+    rng = np.random.default_rng(seed)
+    pi_gh_arr = np.asarray(pi_gh, dtype=float)
+    pi_gh_arr = pi_gh_arr / pi_gh_arr.sum()
+    k_y, k_z = pi_gh_arr.shape
+
+    flat_probs = pi_gh_arr.flatten()
+    joint_idx = rng.choice(k_y * k_z, size=n_subjects, p=flat_probs)
+    g_idx = joint_idx // k_z
+    h_idx = joint_idx % k_z
+
+    times_y = np.asarray(time_points_y, dtype=float)
+    times_z = np.asarray(time_points_z, dtype=float)
+
+    def _simulate_one(betas, t, dist, group_spec):
+        eta = _poly_eval(betas, t)
+        if dist == 'LOGIT':
+            p = float(_logistic(eta))
+            return float(rng.binomial(1, p))
+        elif dist == 'CNORM':
+            sigma = group_spec.get('sigma', 1.0)
+            cmin = group_spec.get('cnorm_min', -1e9)
+            cmax = group_spec.get('cnorm_max', 1e9)
+            y = float(rng.normal(eta, sigma))
+            return float(np.clip(y, cmin, cmax))
+        else:
+            raise ValueError(f"simulate_joint_two_outcome_trajectories does not support dist={dist!r}")
+
+    records_y: List[dict] = []
+    records_z: List[dict] = []
+    assignments_y: Dict[int, int] = {}
+    assignments_z: Dict[int, int] = {}
+
+    for i in range(n_subjects):
+        sid = i + 1
+        g = int(g_idx[i])
+        h = int(h_idx[i])
+        assignments_y[sid] = g + 1
+        assignments_z[sid] = h + 1
+
+        betas_y = group_params_y[g]['betas']
+        for t in times_y:
+            y_val = _simulate_one(betas_y, t, dist_y, group_params_y[g])
+            records_y.append({'ID': sid, 'Time': float(t), 'Outcome': y_val})
+
+        betas_z = group_params_z[h]['betas']
+        for t in times_z:
+            z_val = _simulate_one(betas_z, t, dist_z, group_params_z[h])
+            records_z.append({'ID': sid, 'Time': float(t), 'Outcome': z_val})
+
+    df_y = _build_df(records_y)
+    df_z = _build_df(records_z)
+
+    truth = {
+        'assignments_y': assignments_y,
+        'assignments_z': assignments_z,
+        'pi_gh': pi_gh_arr,
+        'group_params_y': group_params_y,
+        'group_params_z': group_params_z,
+    }
+    return df_y, df_z, truth
+
+
+# ---------------------------------------------------------------------------
 # Convenience: canonical test-case presets
 # ---------------------------------------------------------------------------
 

@@ -73,9 +73,9 @@ make lint
 Test suites:
 | Suite | File | Description |
 |-------|------|-------------|
-| Parameter Recovery | `tests/test_parameter_recovery.py` | 9 tests: simulate known ground-truth, verify AutoTraj recovers parameters |
+| Parameter Recovery | `tests/test_parameter_recovery.py` | 24 tests: simulate known ground-truth (incl. weighted and joint dual-trajectory models), verify AutoTraj recovers parameters |
 | Cambridge Benchmark | `tests/test_cambridge_benchmark.py` | 7 tests: validate against Nagin (1999) published results |
-| Edge Cases | `tests/test_edge_cases.py` | 12 tests: pathological inputs, boundary conditions, reproducibility |
+| Edge Cases | `tests/test_edge_cases.py` | 21 tests: pathological inputs, boundary conditions, reproducibility, label-switching invariance |
 
 ## Future Roadmap
 AutoTraj is actively maintained. Upcoming architecture upgrades include:
@@ -86,7 +86,7 @@ AutoTraj is actively maintained. Upcoming architecture upgrades include:
 
 * ✅ **Survey Weights (V4.0):** Inverse probability sampling weights for complex stratified national surveys. — *Engine and UI complete; see CHANGELOG.md*
 
-* **Joint Trajectories (V5.0):** Dual-trajectory FMM architecture for modeling interacting longitudinal outcomes.
+* ✅ **Joint Trajectories (V5.0):** Nagin-style dual-trajectory FMM architecture — two outcomes with independent group structures linked by a joint latent-class probability matrix, for modeling interacting longitudinal outcomes. — *Engine and UI complete; see CHANGELOG.md*
 
 ## Methodology & Attribution
 Code architecture and UI generation were assisted by Large Language Models, under the strict mathematical direction and validation of the author to ensure alignment with established FMM and GBTM statistical formulas.

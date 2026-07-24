@@ -29,7 +29,13 @@ import pytest
 # Make project root importable when pytest is run from the repo root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main import run_single_model, run_autotraj, get_subject_assignments
+from main import (
+    run_single_model,
+    run_autotraj,
+    get_subject_assignments,
+    run_joint_dual_trajectory_model,
+    get_joint_subject_assignments,
+)
 from tests.simulate import (
     simulate_logit_trajectories,
     simulate_cnorm_trajectories,
@@ -38,6 +44,7 @@ from tests.simulate import (
     simulate_logit_with_tvc,
     simulate_logit_with_covariates_and_tvc,
     simulate_logit_with_biased_sampling_weights,
+    simulate_joint_two_outcome_trajectories,
     make_two_group_logit,
     make_two_group_poisson,
     make_two_group_cnorm,
@@ -723,3 +730,172 @@ def test_non_positive_weight_rejected():
     df['W'] = df['ID'].map(weight_by_id)
     with pytest.raises(ValueError, match="strictly positive"):
         run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=1, weight_col='W')
+
+
+# ---------------------------------------------------------------------------
+# V5.0: joint dual-trajectory model (Nagin-style)
+# ---------------------------------------------------------------------------
+
+_JOINT_PI_GH_CONCORDANT = np.array([[0.45, 0.05], [0.05, 0.45]])
+
+
+def _joint_true_params():
+    """Shared ground truth for the V5.0 joint recovery tests. Both outcomes'
+    true group betas are already in ascending-intercept order, matching the
+    convention sort_joint_groups_by_intercept imposes post-fit — this avoids
+    label-switching ambiguity in these tests' assertions (label-switching
+    correctness itself is covered separately by
+    test_sort_joint_groups_by_intercept_is_likelihood_invariant)."""
+    group_params_y = [{'betas': [-1.5]}, {'betas': [1.0, -0.3]}]
+    group_params_z = [{'betas': [-1.0]}, {'betas': [0.8, -0.2]}]
+    return group_params_y, group_params_z
+
+
+def test_joint_dual_trajectory_pi_gh_recovery():
+    """Recovered pi_gh matches the true NON-independent joint probability
+    matrix cell-wise, and the concordant-vs-discordant mass pattern is
+    preserved (more robust to Monte Carlo noise than exact-cell tolerance
+    alone)."""
+    group_params_y, group_params_z = _joint_true_params()
+    df_y, df_z, truth = simulate_joint_two_outcome_trajectories(
+        n_subjects=600, time_points_y=T15, time_points_z=T15,
+        group_params_y=group_params_y, group_params_z=group_params_z,
+        pi_gh=_JOINT_PI_GH_CONCORDANT, seed=101,
+    )
+    m = run_joint_dual_trajectory_model(df_y, df_z, orders_y=[0, 1], orders_z=[0, 1], n_starts=N_STARTS)
+    assert m['result'].success or m['result'].status == 2
+
+    pis_est = m['pis_joint']
+    true_pi = _JOINT_PI_GH_CONCORDANT
+
+    assert np.max(np.abs(pis_est - true_pi)) < 0.15, (
+        f"pi_gh cell-wise recovery too far off:\nestimated=\n{pis_est}\ntrue=\n{true_pi}"
+    )
+
+    concordant_est = pis_est[0, 0] + pis_est[1, 1]
+    discordant_est = pis_est[0, 1] + pis_est[1, 0]
+    assert concordant_est > discordant_est, (
+        f"Failed to recover concordant joint structure: pis_joint=\n{pis_est}"
+    )
+
+
+def test_joint_dual_trajectory_conditional_probability_recovery():
+    """Recovered P(h|g) (row-normalized pi_gh) matches the true conditional
+    probability — the actual 'do these behaviors co-develop' deliverable a
+    dual-trajectory analysis is run to answer."""
+    group_params_y, group_params_z = _joint_true_params()
+    df_y, df_z, truth = simulate_joint_two_outcome_trajectories(
+        n_subjects=600, time_points_y=T15, time_points_z=T15,
+        group_params_y=group_params_y, group_params_z=group_params_z,
+        pi_gh=_JOINT_PI_GH_CONCORDANT, seed=101,
+    )
+    m = run_joint_dual_trajectory_model(df_y, df_z, orders_y=[0, 1], orders_z=[0, 1], n_starts=N_STARTS)
+    assert m['result'].success or m['result'].status == 2
+
+    pis_est = m['pis_joint']
+    true_pi = _JOINT_PI_GH_CONCORDANT
+
+    cond_est = pis_est / pis_est.sum(axis=1, keepdims=True)
+    cond_true = true_pi / true_pi.sum(axis=1, keepdims=True)
+
+    assert np.max(np.abs(cond_est - cond_true)) < 0.20, (
+        f"Conditional probability P(h|g) recovery too far off:\n"
+        f"estimated=\n{cond_est}\ntrue=\n{cond_true}"
+    )
+
+
+def test_joint_dual_trajectory_beta_and_assignment_recovery():
+    """beta_Y/beta_Z recovery, plus joint hard-assignment accuracy against
+    ground truth group memberships."""
+    group_params_y, group_params_z = _joint_true_params()
+    df_y, df_z, truth = simulate_joint_two_outcome_trajectories(
+        n_subjects=600, time_points_y=T15, time_points_z=T15,
+        group_params_y=group_params_y, group_params_z=group_params_z,
+        pi_gh=_JOINT_PI_GH_CONCORDANT, seed=101,
+    )
+    m = run_joint_dual_trajectory_model(df_y, df_z, orders_y=[0, 1], orders_z=[0, 1], n_starts=N_STARTS)
+    assert m['result'].success or m['result'].status == 2
+
+    n_theta = m['k_y'] * m['k_z'] - 1  # = 3
+    y_beta_start = n_theta
+    params = m['result'].x
+
+    beta_y_g0 = params[y_beta_start]              # group0 (order0): 1 param
+    beta_y_g1 = params[y_beta_start + 1:y_beta_start + 3]  # group1 (order1): 2 params
+    assert abs(beta_y_g0 - (-1.5)) < 0.5, f"Y group0 intercept off: {beta_y_g0:.3f}"
+    assert abs(beta_y_g1[0] - 1.0) < 0.5, f"Y group1 intercept off: {beta_y_g1[0]:.3f}"
+
+    z_beta_start = y_beta_start + 3  # num_betas_y = 1+2 = 3
+    beta_z_g0 = params[z_beta_start]
+    beta_z_g1 = params[z_beta_start + 1:z_beta_start + 3]
+    assert abs(beta_z_g0 - (-1.0)) < 0.5, f"Z group0 intercept off: {beta_z_g0:.3f}"
+    assert abs(beta_z_g1[0] - 0.8) < 0.5, f"Z group1 intercept off: {beta_z_g1[0]:.3f}"
+
+    assignments = get_joint_subject_assignments(m, df_y, df_z)
+    true_y = pd.Series(truth['assignments_y'])
+    true_z = pd.Series(truth['assignments_z'])
+    pred = assignments.set_index('ID')
+    common = pred.index.intersection(true_y.index)
+    acc_y = (pred.loc[common, 'Assigned_Group_Y'] == true_y.loc[common]).mean()
+    acc_z = (pred.loc[common, 'Assigned_Group_Z'] == true_z.loc[common]).mean()
+    assert acc_y >= 0.80, f"Y assignment accuracy too low: {acc_y:.1%}"
+    assert acc_z >= 0.75, f"Z assignment accuracy too low: {acc_z:.1%}"
+
+
+def test_joint_dual_trajectory_independent_pi_gh_does_not_misbehave():
+    """When the true pi_gh is EXACTLY an outer product of independent
+    marginals, the model must still converge stably and must not manufacture
+    spurious association (recovered pi_gh should stay close to the outer
+    product of its own recovered marginals)."""
+    group_params_y, group_params_z = _joint_true_params()
+    marginal_y = np.array([0.6, 0.4])
+    marginal_z = np.array([0.5, 0.5])
+    pi_gh_independent = np.outer(marginal_y, marginal_z)
+
+    df_y, df_z, truth = simulate_joint_two_outcome_trajectories(
+        n_subjects=600, time_points_y=T15, time_points_z=T15,
+        group_params_y=group_params_y, group_params_z=group_params_z,
+        pi_gh=pi_gh_independent, seed=202,
+    )
+    m = run_joint_dual_trajectory_model(df_y, df_z, orders_y=[0, 1], orders_z=[0, 1], n_starts=N_STARTS)
+    assert m['result'].success or m['result'].status == 2
+
+    pis_est = m['pis_joint']
+    est_marginal_y = pis_est.sum(axis=1)
+    est_marginal_z = pis_est.sum(axis=0)
+    est_outer = np.outer(est_marginal_y, est_marginal_z)
+
+    assert np.max(np.abs(pis_est - est_outer)) < 0.10, (
+        f"Independent pi_gh spuriously manufactured association:\n"
+        f"estimated=\n{pis_est}\nouter(marginals)=\n{est_outer}"
+    )
+
+
+def test_joint_collapses_to_single_outcome_when_kz_1():
+    """With K_Z=1, the joint log-likelihood additively separates into the
+    single-outcome Y log-likelihood plus a Z-only term (MATH.md §9g), so the
+    joint fit's Y-betas should match an INDEPENDENT single-outcome fit of Y
+    alone within tolerance — NOT bit-identical, since it's still a different
+    (larger, jointly-optimized) numerical problem; a deliberately weaker
+    guarantee than V3.0/V4.0's exact-reduction invariants."""
+    group_params_y, _ = _joint_true_params()
+    df_y, df_z, truth = simulate_joint_two_outcome_trajectories(
+        n_subjects=500, time_points_y=T15, time_points_z=T15,
+        group_params_y=group_params_y, group_params_z=[{'betas': [0.0]}],  # K_Z=1
+        pi_gh=np.array([[0.6], [0.4]]), seed=303,
+    )
+    m_joint = run_joint_dual_trajectory_model(df_y, df_z, orders_y=[0, 1], orders_z=[0], n_starts=N_STARTS)
+    assert m_joint['result'].success or m_joint['result'].status == 2
+
+    m_single = run_single_model(df_y, orders_list=[0, 1], dist='LOGIT', n_starts=N_STARTS)
+    assert m_single['result'].success or m_single['result'].status == 2
+
+    n_theta = m_joint['k_y'] * m_joint['k_z'] - 1  # = 1, same width as the base model's k-1 theta block
+    y_beta_start = n_theta
+    joint_y_betas = m_joint['result'].x[y_beta_start:y_beta_start + 3]  # num_betas_y = 1+2 = 3
+    single_y_betas = m_single['result'].x[1:4]  # (k-1)*n_mix=1 theta, then 3 betas
+
+    assert np.allclose(joint_y_betas, single_y_betas, atol=0.5), (
+        f"Joint K_Z=1 Y-betas don't match an independent single-outcome fit within tolerance:\n"
+        f"joint={joint_y_betas}, single={single_y_betas}"
+    )

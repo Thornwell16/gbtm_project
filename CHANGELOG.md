@@ -5,6 +5,52 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## V5.0 (Unreleased) — Joint Trajectories
+
+### New Features
+
+- **Dual-trajectory (Nagin-style joint) modeling** — two outcomes Y and Z, each with its own
+  independent group structure (own group count, polynomial orders, distribution, optional MNAR
+  dropout), linked by a joint latent-class probability matrix π_gh (K_Y × K_Z) instead of assuming
+  independent group membership. Conditional on class (g,h), Y and Z are conditionally independent —
+  P(y_i,z_i|g,h) = P(y_i|g)·P(z_i|h) — so the joint kernel reuses the existing single-outcome
+  likelihood/gradient math for each outcome unchanged, weighted by the appropriate marginal
+  posterior (P(g|i) for Y's parameters, P(h|i) for Z's).
+- **Kernel refactor**: the existing single-outcome kernel's per-group likelihood and gradient loops
+  were extracted into two shared `@njit` subroutines, now called by both the single-outcome kernel
+  and the new joint kernel — confirmed behavior-preserving by a full regression run before any
+  joint-model code was built on top.
+- **Two-dimensional label-switching handling** — group-sorting by intercept is generalized to
+  resort Y's and Z's groups independently, then reconstruct and re-permute the full π_gh matrix
+  along both axes simultaneously (the joint mixing logits are only meaningful relative to the
+  reference cell, so they cannot be permuted directly). Verified by a dedicated NLL-invariance
+  test using deliberately descending-intercept parameters on both axes.
+- New `run_joint_dual_trajectory_model` fitting entry point, `get_joint_subject_assignments`
+  (joint + marginal posteriors and hard assignments), and joint/per-outcome-marginal model
+  adequacy diagnostics (AvePP, OCC, relative entropy) via the existing, unmodified
+  `calc_model_adequacy`.
+- Streamlit UI: new "Dual-Trajectory (Joint) Mode" — independent Outcome Y / Outcome Z
+  configuration (distribution, CNORM bounds, groups/orders, dropout), a joint probability heatmap,
+  row/column-normalized conditional probability tables, a hard-assignment contingency table,
+  per-outcome parameter estimates, adequacy diagnostics, and side-by-side fitted trajectory plots.
+  Single Model Mode only — no combinatorial search over both outcomes' group/order grids.
+- Explicit scope boundaries (deferred as future work): does not compose with V3.0's mixing
+  covariates/TVC or V4.0's survey weights in this pass; requires the identical subject-ID set
+  across both outcomes (partial outcome-missingness across subjects not yet supported).
+- New tests: joint π_gh recovery, conditional-probability recovery, β/assignment recovery, a
+  stability check under an independent (non-associated) true π_gh, and a tolerance-based collapse
+  check (K_Z=1 reduces to the single-outcome Y model) — a weaker guarantee than V3.0's bit-identical
+  P=0,Q=0 invariant, since it's still a distinct, jointly-optimized numerical problem.
+
+### Documentation
+
+- **MATH.md** — new §9 covering the conditional-independence factorization, the joint parameter
+  vector layout, joint likelihood/posterior derivations, the β_Y/β_Z gradient proof (showing they
+  reduce to the existing single-outcome gradient weighted by the marginal posterior), SE/BIC/AIC
+  extensions, the two-dimensional label-switching argument, and the backward-compatibility framing.
+
+---
+
 ## V4.0 (Unreleased) — Survey (Sampling) Weights
 
 ### New Features

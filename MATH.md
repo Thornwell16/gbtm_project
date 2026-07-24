@@ -13,6 +13,12 @@ scaling each subject's contribution to the log-likelihood (and hence the gradien
 this adds **no new parameters** to $\theta$ — it is a pure likelihood-level device. Setting
 $w_i \equiv 1$ for all subjects recovers the unweighted (V3.0) model **exactly**.
 
+**V5.0 note:** Section 9 (additive — does not modify §1-§8) describes a wholly separate model
+family, the Nagin-style **joint dual-trajectory** model: two outcomes Y and Z, each with its own
+independent single-outcome GBTM structure, linked by a joint latent-class probability matrix
+instead of assuming independence. It does not compose with V3.0's mixing-covariates/TVC or V4.0's
+survey weights in this pass (both are deferred future extensions).
+
 ---
 
 ## Table of Contents
@@ -25,6 +31,7 @@ $w_i \equiv 1$ for all subjects recovers the unweighted (V3.0) model **exactly**
 6. [BIC and AIC Formulas](#6-bic-and-aic-formulas)
 7. [Model Adequacy Metrics](#7-model-adequacy-metrics)
 8. [References](#8-references)
+9. [Joint Dual-Trajectory Model (V5.0)](#9-joint-dual-trajectory-model-v50)
 
 ---
 
@@ -584,3 +591,142 @@ The inner double sum equals the total entropy of the posterior distribution (whi
 - White, H. (1980). A heteroskedasticity-consistent covariance matrix estimator and a direct test for heteroskedasticity. *Econometrica*, 48(4), 817–838.
 
 - Tobin, J. (1958). Estimation of relationships for limited dependent variables. *Econometrica*, 26(1), 24–36.
+
+---
+
+## 9. Joint Dual-Trajectory Model (V5.0)
+
+This section is **additive** — it describes a separate model family and does not modify §1-§8.
+Two outcomes Y and Z, each with its own independent GBTM structure (own group count, polynomial
+orders, distribution, dropout toggle), linked by a **joint latent-class probability matrix**
+$\pi_{gh}$ ($K_Y \times K_Z$) instead of assuming the two outcomes' group memberships are
+independent — the standard "dual trajectory" approach (Nagin & Tremblay). Does not compose with
+V3.0's mixing-covariates/TVC or V4.0's survey weights in this pass (deferred future extensions).
+
+### 9a. Conditional Independence Assumption
+
+Given joint class $(g,h)$, Y's trajectory and Z's trajectory are assumed conditionally independent:
+
+$$P(y_i, z_i \mid g, h) = P(y_i \mid g) \cdot P(z_i \mid h)$$
+
+where each factor is computed by the **same** single-outcome machinery in §3 — Y's factor uses
+outcome Y's own distribution/parameters exactly as a standalone single-outcome model would, and
+likewise for Z. No new per-observation likelihood formulas are introduced by V5.0.
+
+### 9b. Parameter Vector Layout
+
+$$\theta_{\text{joint}} = \big[\, \Theta_{\text{joint}} \;\big|\; \text{Y-BLOCK} \;\big|\; \text{Z-BLOCK} \,\big]$$
+$$\text{Y-BLOCK} = [\, \beta_Y \;|\; \gamma_{\text{drop},Y} \text{ (optional)} \;|\; \text{tail}_Y \text{ (optional)} \,]$$
+$$\text{Z-BLOCK} = [\, \beta_Z \;|\; \gamma_{\text{drop},Z} \text{ (optional)} \;|\; \text{tail}_Z \text{ (optional)} \,]$$
+
+- **$\Theta_{\text{joint}}$** ($K_Y K_Z - 1$ params): the $K_Y \times K_Z$ joint-class grid
+  flattened row-major ($g$ outer, $h$ inner), skipping the reference cell $(0,0)$, which is
+  implicitly $\theta_{0,0} \equiv 0$.
+- **Y-BLOCK / Z-BLOCK**: each is exactly a "solo" single-outcome parameter vector — group-major
+  $\beta$, then optional 3-per-group dropout $\gamma$, then an optional CNORM raw-$\sigma$ or ZIP
+  $\zeta$ tail — identical in form to §2b-2e/2f with no Gamma/delta blocks (V5.0 doesn't use
+  mixing covariates or TVCs). **Y's tail sits immediately before Z's block starts** (not at the
+  vector's absolute end) — this is what makes $\theta_{\text{joint}}$'s Y-slice and Z-slice each
+  individually look like a standalone single-outcome vector with its own tail "at the end" of
+  that slice, letting both reuse the identical per-outcome subroutines described in 9d.
+
+### 9c. Joint Likelihood and Posteriors
+
+$$\pi_{gh} = \frac{\exp(\theta_{gh})}{\sum_{g',h'} \exp(\theta_{g'h'})}, \qquad \theta_{0,0} \equiv 0$$
+
+$$P(y_i, z_i) = \sum_{g=0}^{K_Y-1} \sum_{h=0}^{K_Z-1} \pi_{gh} \cdot P(y_i \mid g) \cdot P(z_i \mid h)$$
+
+computed via a 2-D log-sum-exp over the flattened $K_Y \cdot K_Z$ grid (same stability pattern as
+§1's marginal likelihood). Total log-likelihood: $\ell(\theta_{\text{joint}}) = \sum_i \log P(y_i, z_i)$.
+
+Joint posterior:
+
+$$P(g,h \mid i) = \frac{\pi_{gh} \cdot P(y_i\mid g) \cdot P(z_i\mid h)}{P(y_i,z_i)}$$
+
+**Marginal posteriors** — these are what the per-outcome gradients need (derived, not assumed, in 9d):
+
+$$P(g\mid i) = \sum_{h=0}^{K_Z-1} P(g,h\mid i), \qquad P(h\mid i) = \sum_{g=0}^{K_Y-1} P(g,h\mid i)$$
+
+The estimated $\pi_{gh}$ matrix itself, and the **conditional probabilities**
+$P(h\mid g) = \pi_{gh} / \sum_{h'}\pi_{gh'}$ (row-normalize) and $P(g\mid h)$ (column-normalize),
+are the key applied deliverables — they answer "do these two behaviors co-develop?", the standard
+question a dual-trajectory analysis is run to answer.
+
+### 9d. Gradient Derivations
+
+**$\Theta_{\text{joint}}$ gradient.** The softmax-derivative identity from §4a
+($\partial \ell_i/\partial\theta_g = P(g\mid i) - \pi_g$) holds pointwise for each subject
+regardless of what the categorical index represents. Treating the flattened joint class $(g,h)$ as
+a single categorical index of size $K_Y K_Z$ transfers the identity unchanged:
+
+$$\frac{\partial \ell_i}{\partial \theta_{gh}} = P(g,h\mid i) - \pi_{gh}, \qquad (g,h) \neq (0,0)$$
+
+**$\beta_Y$ gradient — derived explicitly** (not assumed). Only the $g'=g$ terms of the joint
+log-sum depend on $\beta_{Y,g,p}$:
+
+$$\frac{\partial \ell_i}{\partial \beta_{Y,g,p}} = \frac{\partial L_{Y,i}(g)}{\partial \beta_{Y,g,p}} \cdot \frac{\sum_h \pi_{gh}\exp(L_{Y,i}(g)+L_{Z,i}(h))}{P(y_i,z_i)} = \frac{\partial L_{Y,i}(g)}{\partial \beta_{Y,g,p}} \cdot \sum_h P(g,h\mid i) = \frac{\partial L_{Y,i}(g)}{\partial \beta_{Y,g,p}} \cdot P(g\mid i)$$
+
+Since $L_{Y,i}(g)$ is *exactly* the same function of $\beta_Y$ as the single-outcome model's
+$L_{ig}$, $\partial L_{Y,i}(g)/\partial\beta_{Y,g,p} = \sum_t \varepsilon_\mu^{(Y,g,t)}\cdot t^p$
+unchanged from §4b. Therefore:
+
+$$\boxed{\frac{\partial \ell_i}{\partial \beta_{Y,g,p}} = P(g\mid i)\cdot\sum_t \varepsilon_\mu^{(Y,g,t)}\cdot t^p}$$
+
+— **identical in form** to the existing single-outcome beta gradient (§4b), with the joint
+model's **marginal** $P(g\mid i)$ substituted for the single-outcome posterior. The same argument
+(nothing outside its own outcome's sum depends on that outcome's parameters) applies verbatim to
+$\beta_Z$ (weight $P(h\mid i)$), and to $\gamma_{\text{drop},Y/Z}$ and $\text{raw}\_\sigma$/$\zeta$
+tails — every per-outcome parameter block's gradient is the existing single-outcome formula (§4b-4f)
+with the appropriate marginal posterior substituted for the posterior. This is exactly what
+justifies reusing the single-outcome gradient-accumulation code unchanged for both outcomes.
+
+### 9e. Standard Errors, BIC/AIC
+
+Same recipe as §5 (finite-difference Hessian, model-based and Huber-White sandwich SEs) applied to
+the wider joint parameter vector, with **two independent time-unscaling factors** — each outcome
+rescales only its own $\beta$ block by its own $s_Y$/$s_Z$ scale factor; $\Theta_{\text{joint}}$
+stays dimensionless ($D=1$), same convention as Gamma/delta in §5b. BIC/AIC (§6) use the joint
+$\ell$, the shared subject count $N$, and $p$ = the full joint vector's dimension.
+
+### 9f. Label-Switching Is Two-Dimensional
+
+Both outcomes' groups can each be independently relabeled by the optimizer, so the ascending-
+intercept resort (§ analogous to the base model's group resort) must run **independently per
+outcome** and then **consistently re-permute $\pi_{gh}$ across both axes**:
+
+1. Compute $\text{sortY}$, $\text{sortZ}$ (ascending-intercept permutations) independently for Y
+   and Z.
+2. Permute $\beta_Y/\gamma_{\text{drop},Y}/\text{tail}_Y$ and
+   $\beta_Z/\gamma_{\text{drop},Z}/\text{tail}_Z$ mechanically, same per-block logic as the
+   existing single-outcome resort.
+3. $\Theta_{\text{joint}}$'s raw logits **cannot** be permuted directly — they are only meaningful
+   relative to the *old* reference cell $(0,0)$. Instead: reconstruct the full $\pi$ matrix via
+   softmax (uniquely defined), permute **both axes simultaneously**
+   ($\pi_{\text{new}} = \pi_{\text{old}}[\text{sortY}, \text{sortZ}]$), then re-derive
+   $\theta'_{gh} = \log(\pi_{\text{new}}[g,h]) - \log(\pi_{\text{new}}[0,0])$. This full recompute
+   runs whenever *either* axis needs resorting, since the reference cell can change even if only
+   one axis actually permutes.
+4. $\Theta_{\text{joint}}$ SE carryover (mapping each new cell back to its old cell) is an
+   **approximation** — same caveat as the base model's Gamma SE carryover (§2a's note). Y-BLOCK/
+   Z-BLOCK beta/dropout/tail SEs are exact (pure mechanical permutation).
+
+This is the highest-risk correctness surface in the V5.0 implementation. It is verified by a
+dedicated invariance test: resorting a hand-built parameter vector must reproduce the identical
+NLL on the same data before vs. after the resort (label permutation is a likelihood-invariant
+symmetry — the strongest available check), analogous to the equivalent 1-D invariance test added
+for the base model's `sort_groups_by_intercept`.
+
+### 9g. Backward-Compatibility Framing
+
+Unlike V3.0's "$P=0,Q=0$" and V4.0's "$w_i\equiv 1$" invariants (which reduce a wider model back
+to the *exact same* prior model), V5.0 is a wholly new capability with no default that reduces to
+an existing single-outcome fit. The closest analogous guarantee: with $K_Z=1$, $P(z_i\mid h{=}0)$
+has no $g$-dependence, so the joint log-likelihood **additively separates**:
+
+$$\log P(y_i,z_i) = \log P(z_i\mid h{=}0) + \log\sum_g \pi_g P(y_i\mid g)$$
+
+— the second term is exactly the single-outcome Y log-likelihood, so the $(\Theta_Y,\beta_Y)$
+optimum equals the single-outcome Y MLE exactly. Because it is nonetheless a different (larger,
+jointly-optimized) numerical problem, this is checked via **tolerance-based** agreement against an
+independent single-outcome fit, not bit-identical equality — a deliberately weaker guarantee than
+V3.0/V4.0's invariants, stated as such rather than oversold.
