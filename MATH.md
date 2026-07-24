@@ -47,7 +47,7 @@ The total log-likelihood summed over all $N$ subjects is:
 
 $$\ell(\theta) = \sum_{i=1}^{N} \log P(\mathbf{y}_i) = \sum_{i=1}^{N} \log \left[ \sum_{g=0}^{K-1} \pi_g \prod_{t=1}^{T_i} P(y_{it} \mid g, t) \right]$$
 
-This is the objective function maximised by the L-BFGS-B optimizer.
+This is the objective function maximised by the BFGS optimizer.
 
 ### Posterior Group Probabilities
 
@@ -235,7 +235,7 @@ $$\ell(\theta) = \sum_{i=1}^{N} \log \left[ \sum_{g=0}^{K-1} \pi_g \prod_{t} P(y
 
 ## 4. Gradient Derivations
 
-All gradients are computed **analytically** (not by finite differences) and passed to L-BFGS-B as the Jacobian. The derivations use the chain rule through the log-sum-exp marginal likelihood.
+All gradients are computed **analytically** (not by finite differences) and passed to BFGS as the Jacobian. The derivations use the chain rule through the log-sum-exp marginal likelihood.
 
 Define the **per-subject log-sum** in numerically stable form:
 

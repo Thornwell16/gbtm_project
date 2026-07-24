@@ -1545,9 +1545,9 @@ def get_subject_assignments(model_dict, df):
             L_ig_log[g] = ll_g
             
         numerator_log = np.log(pis_safe) + L_ig_log
-        max_val = np.max(numerator_log)
-        sum_exp = np.sum(np.exp(numerator_log - max_val))
-        posterior_ig = np.exp(numerator_log - (max_val + np.log(sum_exp)))
+        post_max = np.max(numerator_log)
+        post_sum_exp = np.sum(np.exp(numerator_log - post_max))
+        posterior_ig = np.exp(numerator_log - (post_max + np.log(post_sum_exp)))
         
         row = {'ID': subject_ids_unique[i], 'Assigned_Group': np.argmax(posterior_ig) + 1}
         for g in range(k): row[f'Group_{g+1}_Prob'] = posterior_ig[g]

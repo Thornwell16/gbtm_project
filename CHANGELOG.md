@@ -5,6 +5,36 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## Unreleased — Mathematical Audit
+
+A full audit cross-checking `MATH.md` against `main.py`'s JIT kernel for every
+distribution, the dropout sub-model, and the theta/mixing gradient. All
+formulas matched exactly. Two issues were found and fixed:
+
+### Bug Fixes
+
+- **Fixed a subject-processing-order bug in `get_subject_assignments`** — a
+  per-subject log-sum-exp intermediate was named `max_val`, silently reusing
+  the same name as the CNORM upper censoring bound and corrupting it for every
+  subject after the first in the loop. Affected only post-hoc CNORM subject
+  assignment/adequacy reporting, not model fitting itself. Added a permanent
+  order-invariance regression test.
+
+### Testing
+
+- **New automated finite-difference gradient regression test** covering all
+  four distributions and the dropout sub-model — the permanent, automated
+  version of the manual verification previously only claimed in a code
+  comment.
+
+### Documentation
+
+- **MATH.md** — fixed a stale reference to "L-BFGS-B"; the engine has always
+  used plain unconstrained BFGS, since all constraints (σ>0, softmax) are
+  handled via reparameterization rather than box constraints.
+
+---
+
 ## V1.5.0 (2026-03-16)
 
 ### New Features

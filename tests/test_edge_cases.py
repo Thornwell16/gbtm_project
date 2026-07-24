@@ -23,8 +23,18 @@ from main import (
     run_single_model,
     run_autotraj,
     get_subject_assignments,
+    extract_flat_arrays,
+    generate_initial_params,
+    calc_nll_wrapper,
+    calc_jac_wrapper,
 )
-from tests.simulate import simulate_logit_trajectories
+from tests.simulate import (
+    simulate_logit_trajectories,
+    simulate_cnorm_trajectories,
+    simulate_poisson_trajectories,
+    simulate_zip_trajectories,
+    simulate_dropout_data,
+)
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CAMBRIDGE_PATH = os.path.join(_REPO_ROOT, "cambridge.txt")
@@ -524,4 +534,150 @@ def test_wide_vs_long_format():
     assert m_direct['ll'] == pytest.approx(m_roundtrip['ll'], abs=1e-6), (
         f"Round-trip LL mismatch: direct={m_direct['ll']:.8f}, "
         f"roundtrip={m_roundtrip['ll']:.8f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# TEST: analytical gradient matches central finite-difference (all distributions)
+# ---------------------------------------------------------------------------
+
+def _central_finite_diff_gradient(params, args, rel_step=1e-6, abs_step=1e-8):
+    """Central finite-difference gradient of calc_nll_wrapper w.r.t. params."""
+    grad = np.zeros_like(params)
+    for j in range(len(params)):
+        step = max(abs_step, rel_step * abs(params[j]))
+        p_plus = params.copy()
+        p_plus[j] += step
+        p_minus = params.copy()
+        p_minus[j] -= step
+        f_plus = calc_nll_wrapper(p_plus, *args)
+        f_minus = calc_nll_wrapper(p_minus, *args)
+        grad[j] = (f_plus - f_minus) / (2.0 * step)
+    return grad
+
+
+@pytest.mark.parametrize("dist_name,dist_code,use_dropout", [
+    ("LOGIT", 0, False),
+    ("LOGIT", 0, True),
+    ("CNORM", 1, False),
+    ("POISSON", 2, False),
+    ("ZIP", 3, False),
+])
+def test_gradient_matches_finite_difference(dist_name, dist_code, use_dropout):
+    """Analytical Jacobian (calc_jac_wrapper) must match central finite-difference
+    to high precision for every distribution, with and without the dropout
+    sub-model.
+
+    This is the permanent, automated version of the manual verification claimed
+    in main.py's module docstring/comments (no such automated test previously
+    existed). Any future parameter-vector extension must keep passing this test.
+    """
+    k = 2
+    orders_list = [1, 1]
+    common = dict(
+        n_subjects=80,
+        time_points=np.linspace(-1, 1, 6),
+        group_proportions=[0.6, 0.4],
+        seed=321,
+    )
+
+    if use_dropout:
+        long_df, _ = simulate_dropout_data(
+            group_params=[{'betas': [-1.0, 1.0]}, {'betas': [0.5, -0.8]}],
+            dropout_gammas=[-2.0, 0.3, -0.2],
+            **common,
+        )
+    elif dist_name == "LOGIT":
+        long_df, _ = simulate_logit_trajectories(
+            group_params=[{'betas': [-1.0, 1.0]}, {'betas': [0.5, -0.8]}],
+            **common,
+        )
+    elif dist_name == "CNORM":
+        long_df, _ = simulate_cnorm_trajectories(
+            group_params=[{'betas': [1.0, 0.5]}, {'betas': [3.0, -0.5]}],
+            sigma=1.0, cnorm_min=0.0, cnorm_max=10.0,
+            **common,
+        )
+    elif dist_name == "POISSON":
+        long_df, _ = simulate_poisson_trajectories(
+            group_params=[{'betas': [0.5, 0.3]}, {'betas': [1.5, -0.3]}],
+            **common,
+        )
+    elif dist_name == "ZIP":
+        long_df, _ = simulate_zip_trajectories(
+            group_params=[{'betas': [0.5, 0.3]}, {'betas': [1.5, -0.3]}],
+            zero_inflation_rates=[0.3, 0.15],
+            **common,
+        )
+    else:
+        raise ValueError(dist_name)
+
+    times, outcomes, dropouts, subj_breaks = extract_flat_arrays(long_df)
+    orders = np.array(orders_list, dtype=np.int32)
+    cnorm_min = 0.0 if dist_name != "CNORM" else 0.0
+    cnorm_max = 0.0 if dist_name != "CNORM" else 10.0
+
+    starts = generate_initial_params(
+        k=k, orders_list=orders_list, zip_iorder=0, use_dropout=use_dropout,
+        dist=dist_name, outcomes=outcomes, n_starts=2,
+    )
+    params = starts[1]  # perturbed (non-degenerate) starting point, not a stationary one
+
+    args = (times, outcomes, dropouts, subj_breaks, orders, 0, use_dropout,
+            dist_code, cnorm_min, cnorm_max)
+
+    analytical_grad = calc_jac_wrapper(params, *args)
+    numerical_grad = _central_finite_diff_gradient(params, args)
+
+    diff = np.abs(analytical_grad - numerical_grad)
+    max_abs_err = np.max(diff)
+    max_rel_err = np.max(diff / np.maximum(1.0, np.abs(numerical_grad)))
+
+    assert max_rel_err < 1e-3, (
+        f"{dist_name} (dropout={use_dropout}): analytical vs finite-difference "
+        f"gradient mismatch. max_abs_err={max_abs_err:.3e}, "
+        f"max_rel_err={max_rel_err:.3e}\n"
+        f"analytical: {analytical_grad}\n"
+        f"numerical:  {numerical_grad}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# TEST: get_subject_assignments must be invariant to subject processing order
+# ---------------------------------------------------------------------------
+
+def test_cnorm_subject_assignment_order_invariance():
+    """get_subject_assignments must give identical per-subject posteriors
+    regardless of the order subjects appear in the input DataFrame.
+
+    Regression test for a bug where a per-subject log-sum-exp intermediate
+    (formerly named `max_val`) silently reused the same variable name as the
+    CNORM upper censoring bound `cnorm_max`, corrupting the censoring bound
+    for every subject after the first in the loop. CNORM with heavy
+    right-censoring is used here specifically because that code path reads
+    the (previously shadowed) censoring bound on every observation.
+    """
+    df, _ = simulate_cnorm_trajectories(
+        n_subjects=60,
+        time_points=np.linspace(-1, 1, 6),
+        group_params=[{'betas': [1.0, 0.5]}, {'betas': [3.0, -0.5]}],
+        group_proportions=[0.6, 0.4],
+        sigma=1.0, cnorm_min=0.0, cnorm_max=3.0,  # low cnorm_max -> heavy right-censoring
+        seed=99,
+    )
+    m = run_single_model(df, orders_list=[1, 1], dist='CNORM', cnorm_min=0.0, cnorm_max=3.0, n_starts=3)
+
+    assignments_original = get_subject_assignments(m, df).sort_values('ID').reset_index(drop=True)
+
+    ids = df['ID'].unique()
+    rng = np.random.default_rng(0)
+    shuffled_ids = rng.permutation(ids)
+    df_shuffled = pd.concat([df[df['ID'] == sid] for sid in shuffled_ids], ignore_index=True)
+
+    assignments_shuffled = get_subject_assignments(m, df_shuffled).sort_values('ID').reset_index(drop=True)
+
+    max_diff = (assignments_original['Group_1_Prob'] - assignments_shuffled['Group_1_Prob']).abs().max()
+    assert max_diff < 1e-10, (
+        f"Subject assignments depend on processing order (max diff={max_diff:.3e}) — "
+        f"indicates state leaking between subject iterations in get_subject_assignments."
     )
