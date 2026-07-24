@@ -25,7 +25,7 @@ classifiers = [
 [project.optional-dependencies]
 # Only needed to run the Streamlit UI (app.py) — the core engine
 # (`import autotraj` or `import main`) does not require these.
-ui = ["streamlit", "plotly", "matplotlib", "tableone", "openpyxl", "pyreadstat"]
+ui = ["streamlit", "plotly", "matplotlib", "tableone", "openpyxl", "pyreadstat", "reportlab"]
 
 [project.urls]
 Homepage = "https://github.com/Thornwell16/gbtm_project"

@@ -9,6 +9,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### New Features
 
+- **Plain-Language Summary** — a rule-based (not AI-generated) auto-interpretation of each fitted
+  model: classifies each group's trajectory by relative level and direction (stable/increasing/
+  decreasing, comparing fitted values at the first vs. last observed time point), and summarizes
+  overall group separation against the standard Nagin (2005) adequacy thresholds (relative entropy
+  ≥ 0.50, AvePP ≥ 0.70). Shown prominently in the results view, and included in both the HTML and
+  PDF reports and the ZIP export.
+- **PDF Report export** — a print-ready PDF version of the model report (same content as the HTML
+  report: plain-language summary, model summary, trajectory plot, equations, parameter/adequacy
+  tables), built with `reportlab` — a pure-Python PDF library with no external binary or system
+  dependency (deliberately avoiding `wkhtmltopdf`/`weasyprint`, which need system libraries that
+  aren't reliably available across Windows/Streamlit Cloud).
+
+
 - **~2.3x faster fitting via parallel multi-start restarts.** The three fitting entry points
   (`run_single_model`, `run_autotraj`, `run_joint_dual_trajectory_model`) now run their multi-start
   BFGS restarts concurrently via a thread pool instead of sequentially. Real parallelism (not just

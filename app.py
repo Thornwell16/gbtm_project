@@ -467,8 +467,95 @@ def _make_model_summary_txt(winning_model, group_names, rel_entropy):
     return "\n".join(lines)
 
 
+def _generate_plain_language_summary(winning_model, group_names, long_df, adq_df, rel_entropy, dist_type):
+    """Return a rule-based, plain-English interpretation of a fitted GBTM model.
+
+    Classifies each group's trajectory by its predicted level (relative to
+    the other groups) and direction (stable/increasing/decreasing, comparing
+    the fitted value at the first vs. last observed time point), then
+    summarizes overall group separation using the standard Nagin (2005)
+    adequacy thresholds (relative entropy >= 0.50, AvePP >= 0.70). This is a
+    deterministic heuristic, not a model-generated narrative — it always
+    describes exactly what the fitted parameters say, nothing more.
+    """
+    orders = winning_model['orders']
+    result = winning_model['result']
+    pis = winning_model['pis']
+    k = len(orders)
+    n_mix = winning_model.get('n_mix', 1)
+    beta_info = _beta_start_indices(orders, n_mix=n_mix)
+    unique_times = np.sort(long_df['Time'].unique())
+    t_start, t_end = float(unique_times[0]), float(unique_times[-1])
+
+    group_stats = []
+    for g in range(k):
+        beta_start, n_betas = beta_info[g]
+        g_betas = result.x[beta_start:beta_start + n_betas]
+        X_endpoints = create_design_matrix_jit(np.array([t_start, t_end], dtype=np.float64), orders[g])
+        eta_endpoints = X_endpoints @ g_betas
+        if dist_type == 'LOGIT':
+            val_endpoints = 1.0 / (1.0 + np.exp(-np.clip(eta_endpoints, -25, 25)))
+        elif dist_type in ('POISSON', 'ZIP'):
+            val_endpoints = np.exp(np.clip(eta_endpoints, -20, 20))
+        else:
+            val_endpoints = eta_endpoints
+        val_start, val_end = float(val_endpoints[0]), float(val_endpoints[1])
+        group_stats.append({
+            'name': group_names[g], 'pct': pis[g] * 100,
+            'val_start': val_start, 'val_end': val_end,
+            'mean_val': (val_start + val_end) / 2.0,
+        })
+
+    sorted_by_level = sorted(group_stats, key=lambda gs: gs['mean_val'])
+    n = len(sorted_by_level)
+    for i, gs in enumerate(sorted_by_level):
+        if n == 1: gs['level'] = "a single-level"
+        elif i == 0: gs['level'] = "the lowest-level"
+        elif i == n - 1: gs['level'] = "the highest-level"
+        else: gs['level'] = "an intermediate-level"
+
+    all_vals = [gs['val_start'] for gs in group_stats] + [gs['val_end'] for gs in group_stats]
+    overall_range = max(all_vals) - min(all_vals)
+    threshold = max(overall_range * 0.1, 1e-9)
+    for gs in group_stats:
+        delta = gs['val_end'] - gs['val_start']
+        if abs(delta) < threshold:
+            gs['direction'] = "stable"
+        elif delta > 0:
+            gs['direction'] = "increasing"
+        else:
+            gs['direction'] = "decreasing"
+
+    group_stats.sort(key=lambda gs: -gs['pct'])
+
+    lines = [f"This model identified **{k} distinct trajectory group{'s' if k != 1 else ''}** in the data:"]
+    for gs in group_stats:
+        lines.append(f"- **{gs['name']}** ({gs['pct']:.1f}% of subjects) followed {gs['level']}, **{gs['direction']}** pattern over the observed time period.")
+
+    entropy_verdict = "good" if rel_entropy >= 0.80 else ("adequate" if rel_entropy >= 0.50 else "weak")
+    lines.append("")
+    lines.append(
+        f"Overall group separation was **{entropy_verdict}** (relative entropy = {rel_entropy:.2f}; "
+        f"the conventional adequacy threshold, per Nagin 2005, is ≥ 0.50)."
+    )
+
+    if adq_df is not None and len(adq_df) > 0 and 'AvePP' in adq_df.columns:
+        try:
+            ave_pps = [float(v) for v in adq_df['AvePP'] if v != "N/A"]
+            if ave_pps:
+                min_avepp = min(ave_pps)
+                if min_avepp >= 0.70:
+                    lines.append(f"Classification confidence was strong for every group (lowest average posterior probability = {min_avepp:.2f}, above the recommended 0.70 threshold).")
+                else:
+                    lines.append(f"Classification confidence fell below the recommended 0.70 threshold for at least one group (lowest average posterior probability = {min_avepp:.2f}) — interpret hard group assignments for that group with caution.")
+        except (ValueError, TypeError):
+            pass
+
+    return "\n".join(lines)
+
+
 def _build_html_report(winning_model, group_names, estimates_df, adq_df, rel_entropy,
-                        summary_txt, equations, png_bytes=None):
+                        summary_txt, equations, png_bytes=None, plain_summary=None):
     """Return a single self-contained HTML report string bundling the model
     summary, parameter table, adequacy table, fitted equations, and (if
     available) the trajectory plot as an embedded base64 PNG — suitable for
@@ -487,6 +574,24 @@ def _build_html_report(winning_model, group_names, estimates_df, adq_df, rel_ent
         img_tag = f'<img src="data:image/png;base64,{b64}" style="max-width:100%;height:auto;" alt="Trajectory plot"/>'
 
     eq_html = "\n".join(f"<div>\\[{e}\\]</div>" for e in equations)
+
+    plain_summary_html = ""
+    if plain_summary:
+        import re as _re
+        body_lines = []
+        for line in plain_summary.split("\n"):
+            escaped = _html.escape(line)
+            escaped = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+            if escaped.startswith("- "):
+                body_lines.append(f"<li>{escaped[2:]}</li>")
+            elif escaped.strip() == "":
+                body_lines.append("")
+            else:
+                body_lines.append(f"<p>{escaped}</p>")
+        plain_summary_html = (
+            '<div style="background:#f0f6fa;border-left:4px solid #2B6083;padding:1rem 1.2rem;">'
+            + "\n".join(body_lines) + "</div>"
+        )
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"/>
@@ -507,6 +612,9 @@ pre {{ background: #f4f4f4; padding: 1rem; overflow-x: auto; }}
 <h1>AutoTraj Model Report</h1>
 <p class="meta">Generated by AutoTraj &mdash; {dist} distribution, {k} group(s), orders {orders}.</p>
 
+<h2>Plain-Language Summary</h2>
+{plain_summary_html if plain_summary_html else "<p><em>Not available.</em></p>"}
+
 <h2>Model Summary</h2>
 <pre>{_html.escape(summary_txt)}</pre>
 
@@ -525,6 +633,108 @@ pre {{ background: #f4f4f4; padding: 1rem; overflow-x: auto; }}
 
 <p class="meta">Suggested Citation: Warden, D. E. (2026). AutoTraj: Automated Group-Based Trajectory Modeling Engine [Software]. GitHub. https://github.com/Thornwell16/gbtm_project</p>
 </body></html>"""
+
+
+def _build_pdf_report(winning_model, group_names, estimates_df, adq_df, rel_entropy,
+                       summary_txt, equations, png_bytes=None, plain_summary=None):
+    """Return PDF bytes for a shareable model report, built with reportlab
+    (pure-Python, no external binary/system dependency — unlike wkhtmltopdf
+    or weasyprint, this works identically on Windows/macOS/Linux/Streamlit
+    Cloud with no extra system packages).
+
+    Mirrors _build_html_report's content (plain-language summary, model
+    summary, trajectory plot, equations, parameter/adequacy tables) in a
+    print-friendly layout for journal supplementary materials.
+    """
+    import re as _re
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle, Preformatted,
+    )
+
+    orders = winning_model['orders']
+    dist = winning_model.get('dist', 'LOGIT')
+    k = len(orders)
+
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle('AT_H1', parent=styles['Heading1'], textColor=colors.HexColor('#2B6083'))
+    h2 = ParagraphStyle('AT_H2', parent=styles['Heading2'], textColor=colors.HexColor('#2B6083'), spaceBefore=14)
+    body = styles['BodyText']
+    meta = ParagraphStyle('AT_Meta', parent=styles['BodyText'], textColor=colors.grey, fontSize=8.5)
+
+    def _clean_latex(s):
+        s = _re.sub(r"\\text\{([^}]*)\}", r"\1", s)
+        s = s.replace("\\quad", "    ").replace("\\;", " ").replace("\\,", " ")
+        s = s.replace("\\cdot", "*")
+        return s
+
+    def _md_inline(s):
+        # Minimal **bold** -> <b> conversion for reportlab's mini-HTML markup.
+        return _re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+
+    def _df_to_table(df, max_rows=40):
+        data = [list(df.columns)] + df.head(max_rows).astype(str).values.tolist()
+        t = Table(data, repeatRows=1)
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2B6083')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 7),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7f7f7')]),
+        ]))
+        return t
+
+    story = [
+        Paragraph("AutoTraj Model Report", h1),
+        Paragraph(f"Generated by AutoTraj &mdash; {dist} distribution, {k} group(s), orders {orders}.", meta),
+        Spacer(1, 10),
+    ]
+
+    if plain_summary:
+        story.append(Paragraph("Plain-Language Summary", h2))
+        for line in plain_summary.split("\n"):
+            if line.strip() == "":
+                continue
+            text = _md_inline(line[2:] if line.startswith("- ") else line)
+            story.append(Paragraph(("&bull; " + text) if line.startswith("- ") else text, body))
+        story.append(Spacer(1, 8))
+
+    story.append(Paragraph("Model Summary", h2))
+    story.append(Preformatted(summary_txt, styles['Code']))
+
+    if png_bytes is not None:
+        story.append(Paragraph("Fitted Trajectories", h2))
+        try:
+            story.append(RLImage(io.BytesIO(png_bytes), width=6.5 * inch, height=4.06 * inch))
+        except Exception:
+            story.append(Paragraph("<i>Plot could not be embedded.</i>", body))
+
+    if equations:
+        story.append(Paragraph("Fitted Model Equations", h2))
+        for eq in equations:
+            story.append(Paragraph(_clean_latex(eq), styles['Code']))
+
+    story.append(Paragraph("Parameter Estimates", h2))
+    story.append(_df_to_table(estimates_df))
+
+    story.append(Paragraph("Model Adequacy Diagnostics (Nagin, 2005)", h2))
+    story.append(Paragraph(f"Relative Entropy: {rel_entropy:.3f}", meta))
+    story.append(Spacer(1, 4))
+    story.append(_df_to_table(adq_df))
+
+    story.append(Spacer(1, 14))
+    story.append(Paragraph(
+        "Suggested Citation: Warden, D. E. (2026). AutoTraj: Automated Group-Based Trajectory "
+        "Modeling Engine [Software]. GitHub. https://github.com/Thornwell16/gbtm_project", meta,
+    ))
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch)
+    doc.build(story)
+    return buf.getvalue()
 
 
 # ── diagnostic helpers ────────────────────────────────────────────────────────
@@ -1959,6 +2169,15 @@ else:
 
             assignments_df = get_subject_assignments(winning_model, long_df)
 
+            adq_df_summary, rel_entropy_summary = calc_model_adequacy(assignments_df, winning_pis_raw, group_names)
+            plain_summary_txt = _generate_plain_language_summary(
+                winning_model, group_names, long_df, adq_df_summary, rel_entropy_summary, dist_type
+            )
+            with st.container(border=True):
+                st.markdown("##### 🗒️ Plain-Language Summary")
+                st.markdown(plain_summary_txt)
+                st.caption("Auto-generated directly from the fitted parameters and adequacy diagnostics — not an AI-written narrative.")
+
             st.divider()
             st.subheader("Publication Suite")
 
@@ -2500,7 +2719,7 @@ else:
             st.divider()
             st.subheader("Export")
 
-            export_col1, export_col2, export_col3 = st.columns(3)
+            export_col1, export_col2, export_col3, export_col4 = st.columns(4)
 
             with export_col1:
                 st.download_button(
@@ -2534,6 +2753,7 @@ else:
                     zf.writestr("posterior_assignments.csv",  assignments_df.to_csv(index=False))
                     zf.writestr("adequacy_metrics.csv",       adq_df_exp.to_csv(index=False))
                     zf.writestr("model_summary.txt",          summary_txt)
+                    zf.writestr("plain_language_summary.md",  plain_summary_txt)
                     if all_evaluated:
                         comp_df_exp = pd.DataFrame(all_evaluated)
                         zf.writestr("model_comparison.csv",  comp_df_exp.to_csv(index=False))
@@ -2554,6 +2774,7 @@ else:
                     winning_model, group_names, estimates_df_exp, adq_df_exp, rel_entropy_exp,
                     summary_txt, report_equations,
                     png_bytes=buf_png_exp.getvalue() if plot_bytes_available else None,
+                    plain_summary=plain_summary_txt,
                 )
                 st.download_button(
                     label="📄 Generate HTML Report",
@@ -2562,6 +2783,24 @@ else:
                     help="A single shareable HTML file with the model summary, equations, "
                          "parameter table, adequacy diagnostics, and trajectory plot.",
                 )
+
+            with export_col4:
+                try:
+                    report_pdf = _build_pdf_report(
+                        winning_model, group_names, estimates_df_exp, adq_df_exp, rel_entropy_exp,
+                        summary_txt, report_equations,
+                        png_bytes=buf_png_exp.getvalue() if plot_bytes_available else None,
+                        plain_summary=plain_summary_txt,
+                    )
+                    st.download_button(
+                        label="📑 Generate PDF Report",
+                        data=report_pdf,
+                        file_name='gbtm_model_report.pdf', mime='application/pdf',
+                        help="A print-ready PDF version of the same report — suitable for "
+                             "journal supplementary materials.",
+                    )
+                except Exception as e:
+                    st.caption(f"PDF report unavailable: {e}")
 
         else:
             st.error("Model Failed to Converge or was rejected based on heuristic rules.")

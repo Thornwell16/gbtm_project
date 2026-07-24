@@ -6,3 +6,4 @@ numba
 plotly
 matplotlib
 tableone
+reportlab
