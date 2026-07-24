@@ -305,6 +305,78 @@ def extract_flat_arrays(df):
     return times, outcomes, dropouts, subj_breaks
 
 
+def extract_tvc_array(df, tvc_cols):
+    """Extract the (N_obs, n_tvc) time-varying-covariate matrix from a long-format df.
+
+    Row alignment with times/outcomes/dropouts/subj_breaks (from extract_flat_arrays)
+    is guaranteed by construction: this must be called on the *same* long-format
+    df, in the same row order, as extract_flat_arrays (V3.0; see MATH.md §2c).
+
+    Args:
+        df:       Long-format DataFrame (same one passed to extract_flat_arrays).
+        tvc_cols: List of column names to use as TVCs, or None/[] for no TVCs.
+
+    Returns:
+        np.ndarray: (len(df), len(tvc_cols)) C-contiguous float64 array. When
+            tvc_cols is empty, returns a (len(df), 0) array — the V1.5.0-equivalent
+            no-TVC default consumed by calc_universal_subject_gradients_jit.
+    """
+    if not tvc_cols:
+        return np.zeros((len(df), 0), dtype=np.float64)
+    return np.ascontiguousarray(df[list(tvc_cols)].values, dtype=np.float64)
+
+
+def build_baseline_covariate_matrix(df, baseline_cov_cols, id_col='ID'):
+    """Build the (N_subjects, P+1) mixing-covariate design matrix for group membership.
+
+    Row order matches subj_breaks from extract_flat_arrays: subjects in order of
+    first appearance in the (already ID-sorted, contiguous-per-subject) df. Column
+    0 is always the intercept (V3.0; see MATH.md §2a).
+
+    Baseline covariates must be time-invariant (constant within each subject) —
+    this is validated explicitly and raises a clear error otherwise, since a
+    covariate that actually varies within subject should be supplied as a
+    time-varying covariate (TVC, see extract_tvc_array) instead.
+
+    Args:
+        df:                Long-format DataFrame (same one passed to extract_flat_arrays).
+        baseline_cov_cols: List of column names to use as baseline covariates, or
+                           None/[] for the no-covariate (intercept-only) case.
+        id_col:            Name of the subject-ID column (default 'ID').
+
+    Returns:
+        np.ndarray: (N_subjects, P+1) C-contiguous float64 design matrix, intercept
+            first. With baseline_cov_cols empty, returns ones((N_subjects, 1)) —
+            the V1.5.0-equivalent default consumed by
+            calc_universal_subject_gradients_jit.
+    """
+    ids = df[id_col].values
+    subject_order = pd.unique(ids)  # order of first appearance (matches subj_breaks)
+    n_subjects = len(subject_order)
+
+    if not baseline_cov_cols:
+        return np.ones((n_subjects, 1), dtype=np.float64)
+
+    grouped = df.groupby(id_col, sort=False)
+    n_unique = grouped[list(baseline_cov_cols)].nunique(dropna=True)
+    for col in baseline_cov_cols:
+        offending = n_unique.index[n_unique[col] > 1].tolist()
+        if offending:
+            raise ValueError(
+                f"Baseline covariate '{col}' varies within subject for "
+                f"{len(offending)} subject(s) (e.g. ID={offending[0]!r}) — baseline "
+                f"covariates must be time-invariant. Supply this as a time-varying "
+                f"covariate (TVC) instead if it genuinely changes over time."
+            )
+
+    first_vals = grouped[list(baseline_cov_cols)].first().reindex(subject_order)
+    X = np.column_stack([
+        np.ones(n_subjects),
+        first_vals[list(baseline_cov_cols)].values.astype(np.float64),
+    ])
+    return np.ascontiguousarray(X, dtype=np.float64)
+
+
 @njit(cache=True)
 def create_design_matrix_jit(times, order):
     """Build a polynomial design matrix X of shape (n, order+1).
@@ -372,7 +444,7 @@ def logsumexp_jit(a):
 # --- CORE LIKELIHOOD/GRADIENT ENGINE (UNIVERSAL) ---
 
 @njit(cache=True)
-def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max):
+def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, n_mix, n_tvc):
     """Compute total NLL, flat gradient, and per-subject gradient matrix in one pass.
 
     This is the single performance-critical kernel that drives every model fit.
@@ -382,11 +454,16 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
     Algorithm overview
     ------------------
     For each subject i:
-      1. For each group g, compute the conditional log-likelihood L_{ig} =
-         Σ_t log P(y_{it} | g, t) + (optional dropout terms).
-      2. Compute the posterior probability P(g | i) ∝ π_g · exp(L_{ig}).
-      3. Accumulate the total log-likelihood:  ℓ += log Σ_g π_g · exp(L_{ig}).
-      4. Compute the per-subject gradient contributions for all parameter blocks.
+      1. Compute subject i's mixing proportions π_g(x_i) from baseline_X[i, :]
+         (V3.0: per-subject mixing covariates; reduces to a fixed π_g when
+         n_mix == 1, i.e. baseline_X is intercept-only).
+      2. For each group g, compute the conditional log-likelihood L_{ig} =
+         Σ_t log P(y_{it} | g, t) + (optional dropout terms), where the
+         linear predictor η includes an optional TVC deflection term
+         Σ_q δ_{g,q}·z_{i,q,t} (V3.0; vanishes when n_tvc == 0).
+      3. Compute the posterior probability P(g | i) ∝ π_g(x_i) · exp(L_{ig}).
+      4. Accumulate the total log-likelihood: ℓ += log Σ_g π_g(x_i) · exp(L_{ig}).
+      5. Compute the per-subject gradient contributions for all parameter blocks.
 
     The Jacobian (gradient of the NLL) is returned as both a flat vector
     (used directly by SciPy BFGS) and a per-subject matrix (used to build the
@@ -401,6 +478,7 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
 
     Args:
         params:      (p,) unconstrained parameter vector in scaled-time units.
+                     Layout (MATH.md §2): [Γ][β][δ][γ_drop][raw_σ or ζ].
         times:       (N_obs,) pre-scaled observation times (divided by scale_factor).
         outcomes:    (N_obs,) outcome values.
         dropouts:    (N_obs,) 1.0 at last obs of a dropout subject, else 0.0.
@@ -411,6 +489,14 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
         dist_code:   int  — distribution selector (0–3, see above).
         cnorm_min:   float — lower censoring bound (CNORM only; 0.0 otherwise).
         cnorm_max:   float — upper censoring bound (CNORM only; 0.0 otherwise).
+        baseline_X:  (N_subjects, n_mix) float64 — per-subject mixing-covariate
+                     design matrix, intercept-first. Pass ones((N,1)) for the
+                     no-covariate (V1.5.0-equivalent) case.
+        tvc_Z:       (N_obs, n_tvc) float64 — per-observation time-varying
+                     covariate matrix, same row order/alignment as times/outcomes.
+                     Pass zeros((N_obs, 0)) for the no-TVC case.
+        n_mix:       int — number of mixing-covariate columns (P+1, incl. intercept).
+        n_tvc:       int — number of time-varying covariates (Q).
 
     Returns:
         Tuple[float, np.ndarray, np.ndarray]:
@@ -457,30 +543,19 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
     # Therefore the accumulation line:
     #   grad_subj[i, sigma_idx] += -1.0 * err_aux_ig[g, obs] * posterior_ig[g]
     # is correct as written — NO additional sigma factor is needed.
-    # (Verified by finite-difference check against all three cases.)
+    # (Verified by finite-difference check against all three cases;
+    #  see tests/test_edge_cases.py::test_gradient_matches_finite_difference.)
     k = len(orders)
-    thetas = np.zeros(k)
-    if k > 1: thetas[1:] = params[0 : k-1]
-        
-    max_theta = np.max(thetas)
-    sum_exp_theta = 0.0
-    for i in range(k): sum_exp_theta += np.exp(thetas[i] - max_theta)
-    log_pis = thetas - (max_theta + np.log(sum_exp_theta))
-    
-    pis = np.empty(k)
-    pis_safe = np.empty(k)
-    for i in range(k):
-        p_val = np.exp(log_pis[i])
-        pis[i] = p_val
-        pis_safe[i] = 1e-15 if p_val < 1e-15 else p_val
-        
+
     n_subjects = len(subj_breaks) - 1
     grad_subj = np.zeros((n_subjects, len(params)))
-    
+
     num_betas = 0
     for g in range(k): num_betas += orders[g] + 1
-    gamma_start_idx = (k - 1) + num_betas
-    
+    # V3.0 layout: [Γ: (k-1)*n_mix] [β: num_betas] [δ: k*n_tvc] [γ_drop: 3k] [tail]
+    delta_start_idx = (k - 1) * n_mix + num_betas
+    gamma_start_idx = delta_start_idx + k * n_tvc
+
     sigma = 1.0
     var = 1.0
     sigma_idx = -1
@@ -495,14 +570,38 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
         zeta_start_idx = len(params) - k
 
     zeta_g = 0.0  # per-group zero-inflation logit; set inside group loop when dist_code == 3
-    
+
     total_ll = 0.0
-    
+
     for i in range(n_subjects):
         start = subj_breaks[i]
         end = subj_breaks[i+1]
         n_obs = end - start
-        
+
+        # ── PER-SUBJECT MIXING PROBABILITIES (V3.0) ─────────────────────────────
+        # theta_g(x_i) = Gamma_g . x_i for g>0; theta_0(x_i) ≡ 0 (reference group).
+        # With n_mix==1 and baseline_X[:, 0]==1 this reduces exactly to the
+        # V1.5.0 subject-invariant theta_g (MATH.md §2a).
+        thetas = np.zeros(k)
+        for g in range(1, k):
+            gamma_row_start = (g - 1) * n_mix
+            acc = 0.0
+            for p in range(n_mix):
+                acc += params[gamma_row_start + p] * baseline_X[i, p]
+            thetas[g] = acc
+
+        max_theta = np.max(thetas)
+        sum_exp_theta = 0.0
+        for g in range(k): sum_exp_theta += np.exp(thetas[g] - max_theta)
+        log_pis = thetas - (max_theta + np.log(sum_exp_theta))
+
+        pis = np.empty(k)
+        pis_safe = np.empty(k)
+        for g in range(k):
+            p_val = np.exp(log_pis[g])
+            pis[g] = p_val
+            pis_safe[g] = 1e-15 if p_val < 1e-15 else p_val
+
         # L_ig_log[g] = log P(y_i | group=g) accumulated over all time points
         L_ig_log = np.zeros(k)
         # err_mu_ig[g, obs]  = ∂ℓ_{g,obs}/∂μ  (distribution-specific score residual)
@@ -511,7 +610,7 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
         err_aux_ig = np.zeros((k, n_obs))
 
         # Pointer to the first beta of each group in params (advances inside loop)
-        current_beta_idx = k - 1
+        current_beta_idx = (k - 1) * n_mix
         current_gamma_idx = gamma_start_idx
 
         for g in range(k):
@@ -519,6 +618,9 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
             n_betas = order + 1
             group_betas = params[current_beta_idx : current_beta_idx + n_betas]
             current_beta_idx += n_betas
+            # TVC deltas: fixed-width n_tvc block per group (no cumulative advance
+            # needed since every group has the same width, unlike beta blocks).
+            group_delta = params[delta_start_idx + g * n_tvc : delta_start_idx + (g + 1) * n_tvc]
 
             if use_dropout:
                 # Three dropout coefficients per group: γ₀ (intercept), γ₁ (time), γ₂ (lag-y)
@@ -540,6 +642,8 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
                 # Evaluate polynomial: η = β₀ + β₁·t + β₂·t² + …
                 mu = 0.0
                 for p in range(order + 1): mu += group_betas[p] * (t_val ** p)
+                # V3.0: add TVC deflection Σ_q δ_{g,q}·z_{i,q,t} (no-op when n_tvc==0)
+                for q in range(n_tvc): mu += group_delta[q] * tvc_Z[idx, q]
 
                 if dist_code == 0: # LOGIT — binary outcomes
                     # Clamp linear predictor to prevent exp() overflow
@@ -644,23 +748,28 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
         posterior_ig = np.zeros(k)
         for g in range(k):
             posterior_ig[g] = np.exp(numerator_log[g] - (post_max + np.log(post_sum_exp)))
-            if k > 1 and g > 0:
-                # Theta gradient: ∂ℓ_i/∂θ_g = P(g|i) - π_g  for g > 0 (reference group fixed at 0)
-                # NLL sign: store as -(P(g|i) - π_g)
-                grad_subj[i, g - 1] = -1.0 * (posterior_ig[g] - pis[g])
+            if g > 0:
+                # Mixing-covariate gradient (MATH.md §4a): ∂ℓ_i/∂Γ_{g,p} = [P(g|i) - π_g(x_i)]·x_{i,p}
+                # for g > 0 (reference group fixed at 0). NLL sign: store as -(P(g|i) - π_g)·x_{i,p}.
+                # With n_mix==1, baseline_X[i,0]==1 this reduces exactly to the V1.5.0 theta gradient.
+                diff = -1.0 * (posterior_ig[g] - pis[g])
+                gamma_row_start = (g - 1) * n_mix
+                for p in range(n_mix):
+                    grad_subj[i, gamma_row_start + p] = diff * baseline_X[i, p]
 
         # Add log-marginal-likelihood for subject i to running total
         total_ll += (post_max + np.log(post_sum_exp))
 
-        # ── BETA / GAMMA / AUX GRADIENT ACCUMULATION ───────────────────────────
+        # ── BETA / DELTA / GAMMA / AUX GRADIENT ACCUMULATION ───────────────────
         # Second pass over groups: accumulate weighted score gradients now that
         # posterior_ig is available.
-        current_beta_idx = k - 1
+        current_beta_idx = (k - 1) * n_mix
         current_gamma_idx = gamma_start_idx
 
         for g in range(k):
             order = orders[g]
             n_betas = order + 1
+            delta_base = delta_start_idx + g * n_tvc
             if use_dropout:
                 gamma_0 = params[current_gamma_idx]
                 gamma_1 = params[current_gamma_idx + 1]
@@ -675,6 +784,10 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
                 weighted_err_mu = err_mu_ig[g, obs] * posterior_ig[g]
                 for p in range(order + 1):
                     grad_subj[i, current_beta_idx + p] += -1.0 * weighted_err_mu * (t_val ** p)
+                # TVC (delta) gradient (MATH.md §4c): structurally identical to the
+                # beta gradient with t^p replaced by z_{i,q,t}; reuses weighted_err_mu.
+                for q in range(n_tvc):
+                    grad_subj[i, delta_base + q] += -1.0 * weighted_err_mu * tvc_Z[idx, q]
 
                 if dist_code == 1: # CNORM: accumulate raw_sigma gradient
                     # ∂NLL_i/∂raw_σ = -Σ_{g,t} P(g|i) · err_aux_{g,t}
@@ -716,7 +829,29 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
     return -1.0 * total_ll, grad_flat, grad_subj
 
 
-def calc_nll_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max):
+def _resolve_covariate_arrays(n_subjects, n_obs, baseline_X, tvc_Z):
+    """Resolve optional baseline_X/tvc_Z to their no-covariate (V1.5.0-equivalent) defaults.
+
+    This is the single source of truth for V3.0's backward-compatibility guarantee
+    (MATH.md §2): baseline_X defaults to an intercept-only ones((n_subjects,1))
+    column and tvc_Z defaults to an empty zeros((n_obs,0)) array, so every caller
+    that omits these arguments gets numerically identical behaviour to V1.5.0.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: C-contiguous float64 (baseline_X, tvc_Z).
+    """
+    if baseline_X is None:
+        baseline_X = np.ones((n_subjects, 1), dtype=np.float64)
+    else:
+        baseline_X = np.ascontiguousarray(baseline_X, dtype=np.float64)
+    if tvc_Z is None:
+        tvc_Z = np.zeros((n_obs, 0), dtype=np.float64)
+    else:
+        tvc_Z = np.ascontiguousarray(tvc_Z, dtype=np.float64)
+    return baseline_X, tvc_Z
+
+
+def calc_nll_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None):
     """NLL-only callable for SciPy minimise (discards gradient and per-subject matrix).
 
     This wrapper has the exact signature expected by scipy.optimize.minimize
@@ -734,65 +869,92 @@ def calc_nll_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip
         dist_code:   int  — distribution selector (0–3).
         cnorm_min:   float — CNORM lower censoring bound.
         cnorm_max:   float — CNORM upper censoring bound.
+        baseline_X:  optional (N_subjects, n_mix) mixing-covariate design matrix
+                     (V3.0). Defaults to intercept-only (no covariates).
+        tvc_Z:       optional (N_obs, n_tvc) time-varying covariate matrix (V3.0).
+                     Defaults to empty (no TVCs).
 
     Returns:
         float: Negative log-likelihood (scalar to minimise).
     """
-    nll, _, _ = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max)
+    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
+    nll, _, _ = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1])
     return nll
 
-def calc_jac_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max):
+def calc_jac_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None):
     """Jacobian-only callable for SciPy minimise (discards NLL and per-subject matrix).
 
     Passed as the ``jac`` argument to scipy.optimize.minimize so that BFGS
     uses the analytical gradient rather than finite-difference approximation.
+    See calc_nll_wrapper for the meaning of baseline_X/tvc_Z (V3.0).
 
     Returns:
         np.ndarray: (p,) gradient of the NLL with respect to params.
     """
-    _, grad_flat, _ = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max)
+    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
+    _, grad_flat, _ = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1])
     return grad_flat
+
+def calc_grad_subj_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None):
+    """Per-subject-gradient-only callable (used to build the Huber-White sandwich G matrix).
+
+    See calc_nll_wrapper for the meaning of baseline_X/tvc_Z (V3.0).
+
+    Returns:
+        np.ndarray: (N_subjects, p) per-subject gradient matrix.
+    """
+    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
+    _, _, grad_subj = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1])
+    return grad_subj
 
 # --- DISTRIBUTION-SPECIFIC PUBLIC ALIASES ---
 # The universal engine (dist_code dispatch) handles all distributions.
 # These thin wrappers expose the expected function names for external consumers
 # (e.g. verification scripts, notebooks) without duplicating any math.
 
-def calc_poisson_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0):
+def calc_poisson_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0, baseline_X=None, tvc_Z=None):
     """NLL for Poisson trajectories — delegates to universal engine (dist_code=2)."""
+    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
     nll, _, _ = calc_universal_subject_gradients_jit(
         params, times, outcomes, dropouts, subj_breaks, orders,
-        int(zip_iorder), use_dropout, 2, float(cnorm_min), float(cnorm_max)
+        int(zip_iorder), use_dropout, 2, float(cnorm_min), float(cnorm_max),
+        baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1]
     )
     return nll
 
-def calc_poisson_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0):
+def calc_poisson_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0, baseline_X=None, tvc_Z=None):
     """Gradient for Poisson trajectories — delegates to universal engine (dist_code=2)."""
+    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
     _, grad, _ = calc_universal_subject_gradients_jit(
         params, times, outcomes, dropouts, subj_breaks, orders,
-        int(zip_iorder), use_dropout, 2, float(cnorm_min), float(cnorm_max)
+        int(zip_iorder), use_dropout, 2, float(cnorm_min), float(cnorm_max),
+        baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1]
     )
     return grad
 
-def calc_zip_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0):
+def calc_zip_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0, baseline_X=None, tvc_Z=None):
     """NLL for ZIP trajectories — delegates to universal engine (dist_code=3)."""
+    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
     nll, _, _ = calc_universal_subject_gradients_jit(
         params, times, outcomes, dropouts, subj_breaks, orders,
-        int(zip_iorder), use_dropout, 3, float(cnorm_min), float(cnorm_max)
+        int(zip_iorder), use_dropout, 3, float(cnorm_min), float(cnorm_max),
+        baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1]
     )
     return nll
 
-def calc_zip_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0):
+def calc_zip_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0, baseline_X=None, tvc_Z=None):
     """Gradient for ZIP trajectories — delegates to universal engine (dist_code=3)."""
+    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
     _, grad, _ = calc_universal_subject_gradients_jit(
         params, times, outcomes, dropouts, subj_breaks, orders,
-        int(zip_iorder), use_dropout, 3, float(cnorm_min), float(cnorm_max)
+        int(zip_iorder), use_dropout, 3, float(cnorm_min), float(cnorm_max),
+        baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1]
     )
     return grad
 
 # --- ENGINE WRAPPERS ---
 
-def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max):
+def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None):
     """Post-process a SciPy OptimizeResult: compute SEs, BIC/AIC, and mixture weights.
 
     This function is called immediately after each SciPy BFGS optimisation.
@@ -826,6 +988,10 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
         dist:         Distribution string 'LOGIT' | 'CNORM' | 'POISSON' | 'ZIP'.
         cnorm_min:    float — CNORM lower censoring bound.
         cnorm_max:    float — CNORM upper censoring bound.
+        baseline_X:   optional (N_subjects, n_mix) mixing-covariate design matrix
+                      (V3.0). Defaults to intercept-only (no covariates).
+        tvc_Z:        optional (N_obs, n_tvc) time-varying covariate matrix (V3.0).
+                      Defaults to empty (no TVCs).
 
     Returns:
         Tuple of 12 elements:
@@ -848,38 +1014,45 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     k = len(orders_list)
     dist_map = {'LOGIT': 0, 'CNORM': 1, 'POISSON': 2, 'ZIP': 3}
     dist_code = dist_map.get(dist, 0)
-    
+    baseline_X, tvc_Z = _resolve_covariate_arrays(n_subjects, n_obs, baseline_X, tvc_Z)
+    n_mix = baseline_X.shape[1]
+    n_tvc = tvc_Z.shape[1]
+    num_betas = sum(order + 1 for order in orders_list)
+
     if not (result.success or result.status == 2):
         return False, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, None, None, None, np.nan, None
-        
+
     D_diag = np.ones(num_params)
-    current_beta_idx = k - 1
+    current_beta_idx = (k - 1) * n_mix
     for g in range(k):
         for p in range(orders_list[g] + 1):
             D_diag[current_beta_idx + p] = 1.0 / (scale_factor ** p)
         current_beta_idx += orders_list[g] + 1
-        
+    # Gamma (mixing covariate) and delta (TVC) blocks are dimensionless — D=1.0
+    # (already the default), since they multiply arbitrary covariates, not
+    # powers of rescaled time (MATH.md §5b).
+
     if use_dropout:
-        current_gamma_idx = current_beta_idx
+        current_gamma_idx = current_beta_idx + k * n_tvc
         for g in range(k):
             D_diag[current_gamma_idx + 1] = 1.0 / scale_factor
             current_gamma_idx += 3
-            
+
     if dist == 'CNORM':
         D_diag[-1] = 1.0
     # ZIP zeta params are dimensionless logits — no time-unit scaling needed
 
     D = np.diag(D_diag)
-    
+
     try:
         times_scaled = times / scale_factor
-        args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max))
-        
+        args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max), baseline_X, tvc_Z)
+
         H_scaled = np.zeros((num_params, num_params))
         for i in range(num_params):
             eps_i = 1e-5 * max(1.0, abs(result.x[i]))
             if eps_i < 1e-8: eps_i = 1e-8
-            
+
             p_plus = np.copy(result.x)
             p_minus = np.copy(result.x)
             p_plus[i] += eps_i
@@ -887,31 +1060,31 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
             g_plus = calc_jac_wrapper(p_plus, *args)
             g_minus = calc_jac_wrapper(p_minus, *args)
             H_scaled[i, :] = (g_plus - g_minus) / (2.0 * eps_i)
-            
-        H_scaled = (H_scaled + H_scaled.T) / 2.0 
-        
+
+        H_scaled = (H_scaled + H_scaled.T) / 2.0
+
         try:
             cond_num = np.linalg.cond(H_scaled)
         except np.linalg.LinAlgError:
             cond_num = np.inf
-            
-        H_inv_scaled = np.linalg.pinv(H_scaled, rcond=1e-10) 
-        
-        _, _, grad_subj_scaled = calc_universal_subject_gradients_jit(result.x, *args)
+
+        H_inv_scaled = np.linalg.pinv(H_scaled, rcond=1e-10)
+
+        _, _, grad_subj_scaled = calc_universal_subject_gradients_jit(result.x, *args, n_mix, n_tvc)
         G_scaled = grad_subj_scaled.T @ grad_subj_scaled
         V_robust_scaled = H_inv_scaled @ G_scaled @ H_inv_scaled
     except Exception:
         H_inv_scaled = np.eye(num_params)
         V_robust_scaled = np.eye(num_params)
         cond_num = np.inf
-        
+
     params_unscaled = D @ result.x
     V_model_unscaled = D @ H_inv_scaled @ D
     V_robust_unscaled = D @ V_robust_scaled @ D
-    
+
     se_model = np.sqrt(np.abs(np.diag(V_model_unscaled)))
     se_robust = np.sqrt(np.abs(np.diag(V_robust_unscaled)))
-    
+
     ll = -1.0 * result.fun
     aic_nagin = ll - num_params
     bic_nagin = ll - 0.5 * num_params * np.log(n_subjects)
@@ -919,21 +1092,32 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     aic_standard = -2.0 * ll + 2.0 * num_params
     bic_standard = -2.0 * ll + num_params * np.log(n_subjects)
 
+    # Mixing proportions reported at the sample-mean covariate profile (MATH.md
+    # §7 OCC note). With n_mix==1 (intercept-only), x_bar==[1.0] and this
+    # reduces exactly to the V1.5.0 formula.
+    x_bar = baseline_X.mean(axis=0)
     thetas = np.zeros(k)
-    if k > 1: thetas[1:] = params_unscaled[0 : k-1]
+    for g in range(1, k):
+        thetas[g] = np.dot(params_unscaled[(g - 1) * n_mix : g * n_mix], x_bar)
     pis = np.exp(thetas - logsumexp(thetas))
 
     result.x = params_unscaled
     return True, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num, V_model_unscaled
 
-def sort_groups_by_intercept(result, orders_list, se_model, se_robust, pis, use_dropout, dist):
+def sort_groups_by_intercept(result, orders_list, se_model, se_robust, pis, use_dropout, dist, n_mix=1, n_tvc=0):
     """
     Sort groups by ascending intercept (beta_0) to eliminate label switching.
 
     After optimization the labelling of Group 1 / Group 2 / … is arbitrary —
     whichever local optimum the solver found determines which label goes where.
-    This function reorders all group-specific blocks in result.x (thetas, betas,
-    gammas) so that Group 1 always has the lowest intercept.
+    This function reorders all group-specific blocks in result.x (Gamma, betas,
+    delta, gammas) so that Group 1 always has the lowest intercept.
+
+    Args:
+        ... (existing) ...
+        n_mix: Mixing-covariate block width per group (P+1, incl. intercept;
+               V3.0). Default 1 = intercept-only (V1.5.0-equivalent).
+        n_tvc: Number of time-varying covariates (V3.0). Default 0 = none.
 
     Returns
     -------
@@ -945,9 +1129,13 @@ def sort_groups_by_intercept(result, orders_list, se_model, se_robust, pis, use_
 
     Notes
     -----
-    • The theta re-normalisation (subtracting new_thetas[0]) is exact for the
-      likelihood; the theta SEs are rearranged but NOT re-derived — they are
-      approximate after a change of reference group.  Beta / gamma SEs are exact.
+    • The Gamma re-normalisation (subtracting the new reference group's full
+      Gamma vector) is exact for the likelihood: θ_g(x) - θ_r(x) is invariant
+      to the choice of reference group for any x, so subtracting the same
+      vector from every group's Gamma preserves softmax(θ(x)) identically.
+      The Gamma SEs are rearranged but NOT re-derived — approximate after a
+      change of reference group, same caveat as the V1.5.0 theta SEs.
+      Beta / delta / gamma_drop SEs are exact.
     • CNORM log-sigma and ZIP alpha params sit at the tail and are not
       group-specific, so they are left untouched.
     """
@@ -959,17 +1147,19 @@ def sort_groups_by_intercept(result, orders_list, se_model, se_robust, pis, use_
     se_m   = se_model.copy()
     se_r   = se_robust.copy()
 
-    # Recover full k-length theta vector (theta[0] = 0 is the implicit reference)
-    thetas = np.zeros(k)
-    thetas[1:] = params[0:k - 1]
+    # Recover full (k, n_mix) Gamma matrix (row 0 = 0 is the implicit reference)
+    gammas = np.zeros((k, n_mix))
+    for g in range(1, k):
+        gammas[g] = params[(g - 1) * n_mix : g * n_mix]
 
     # Locate the start index of each group's beta block
     beta_starts = []
-    idx = k - 1
+    idx = (k - 1) * n_mix
     for g in range(k):
         beta_starts.append(idx)
         idx += orders_list[g] + 1
-    gamma_start = idx  # first index of gamma block (used only when use_dropout)
+    delta_start = idx           # first index of the delta (TVC) block
+    gamma_start = delta_start + k * n_tvc  # first index of gamma block (used only when use_dropout)
 
     # Intercepts are the first beta of each group
     intercepts   = np.array([params[beta_starts[g]] for g in range(k)])
@@ -982,22 +1172,27 @@ def sort_groups_by_intercept(result, orders_list, se_model, se_robust, pis, use_
     new_se_m   = se_m.copy()
     new_se_r   = se_r.copy()
 
-    # --- Rearrange theta params (indices 0..k-2) ---
-    new_thetas = thetas[sorted_idx]
-    new_thetas -= new_thetas[0]           # re-normalise: new group 0 becomes reference
-    new_params[0:k - 1] = new_thetas[1:]
+    # --- Rearrange Gamma blocks ---
+    new_gammas = gammas[sorted_idx]
+    new_gammas = new_gammas - new_gammas[0]   # re-reference: new group 0 becomes implicit zero
+    for g in range(1, k):
+        new_params[(g - 1) * n_mix : g * n_mix] = new_gammas[g]
 
-    # Approximate SE rearrangement for thetas
-    old_tse_m = np.concatenate(([0.0], se_m[0:k - 1]))
-    old_tse_r = np.concatenate(([0.0], se_r[0:k - 1]))
-    new_params_tse_m = old_tse_m[sorted_idx]
-    new_params_tse_r = old_tse_r[sorted_idx]
-    new_se_m[0:k - 1] = new_params_tse_m[1:]
-    new_se_r[0:k - 1] = new_params_tse_r[1:]
+    # Approximate SE rearrangement for Gamma (row 0 has no stored SE; treat as 0)
+    old_gse_m = np.zeros((k, n_mix))
+    old_gse_r = np.zeros((k, n_mix))
+    if k > 1:
+        old_gse_m[1:] = se_m[0:(k - 1) * n_mix].reshape(k - 1, n_mix)
+        old_gse_r[1:] = se_r[0:(k - 1) * n_mix].reshape(k - 1, n_mix)
+    new_gse_m = old_gse_m[sorted_idx]
+    new_gse_r = old_gse_r[sorted_idx]
+    for g in range(1, k):
+        new_se_m[(g - 1) * n_mix : g * n_mix] = new_gse_m[g]
+        new_se_r[(g - 1) * n_mix : g * n_mix] = new_gse_r[g]
 
     # --- Rearrange beta blocks ---
     new_orders = [orders_list[sorted_idx[g]] for g in range(k)]
-    write_idx  = k - 1
+    write_idx  = (k - 1) * n_mix
     for new_g in range(k):
         old_g   = sorted_idx[new_g]
         n_betas = orders_list[old_g] + 1
@@ -1006,6 +1201,16 @@ def sort_groups_by_intercept(result, orders_list, se_model, se_robust, pis, use_
         new_se_m[write_idx:write_idx + n_betas]   = se_m[src:src + n_betas]
         new_se_r[write_idx:write_idx + n_betas]   = se_r[src:src + n_betas]
         write_idx += n_betas
+
+    # --- Rearrange delta (TVC) blocks (n_tvc params per group, always) ---
+    if n_tvc > 0:
+        for new_g in range(k):
+            old_g = sorted_idx[new_g]
+            src   = delta_start + old_g * n_tvc
+            dst   = delta_start + new_g * n_tvc
+            new_params[dst:dst + n_tvc] = params[src:src + n_tvc]
+            new_se_m[dst:dst + n_tvc]   = se_m[src:src + n_tvc]
+            new_se_r[dst:dst + n_tvc]   = se_r[src:src + n_tvc]
 
     # --- Rearrange gamma blocks (3 params per group, always) ---
     if use_dropout:
@@ -1031,7 +1236,7 @@ def sort_groups_by_intercept(result, orders_list, se_model, se_robust, pis, use_
     return new_orders, new_se_m, new_se_r, pis[sorted_idx]
 
 
-def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=10):
+def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=10, n_mix=1, n_tvc=0):
     """Generate n_starts starting points for multi-start BFGS optimisation.
 
     The first starting point (index 0) is deterministic: intercepts are
@@ -1041,10 +1246,13 @@ def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outco
     parameter space without requiring a global random state.
 
     Initialisation strategy by parameter block:
-      - Thetas: equally spaced logit-quantiles (e.g. for k=3: logit(0.25),
-        logit(0.50), logit(0.75)) to start with dispersed mixing weights.
+      - Gamma (mixing covariates): intercepts equally spaced logit-quantiles
+        (e.g. for k=3: logit(0.25), logit(0.50), logit(0.75)) to start with
+        dispersed mixing weights; covariate-slope entries (p>0) at 0. With
+        n_mix=1 this is identical to the V1.5.0 theta initialisation.
       - Betas:  intercepts staggered; slopes at 0.
-      - Gammas: intercepts at −2 (≈ 12% dropout baseline); slopes at 0.
+      - Delta (TVC): all at 0 (no prior on deflection direction).
+      - Gammas (dropout): intercepts at −2 (≈ 12% dropout baseline); slopes at 0.
       - raw_sigma (CNORM): log(std(outcomes)) as a sensible starting scale.
       - zeta (ZIP): −1.0 per group (≈ 27% structural zeros baseline).
 
@@ -1056,14 +1264,20 @@ def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outco
         dist:        Distribution string 'LOGIT'|'CNORM'|'POISSON'|'ZIP'.
         outcomes:    (N_obs,) outcome array — used to set Poisson/CNORM baseline.
         n_starts:    Number of starting vectors to generate (default 10).
+        n_mix:       Mixing-covariate block width per group (P+1, incl. intercept;
+                     V3.0). Default 1 = intercept-only (V1.5.0-equivalent).
+        n_tvc:       Number of time-varying covariates (V3.0). Default 0 = none.
 
     Returns:
         List[np.ndarray]: List of n_starts parameter vectors, each of length p.
     """
-    num_params = (k - 1) + sum([order + 1 for order in orders_list])
+    num_betas = sum([order + 1 for order in orders_list])
+    num_params = (k - 1) * n_mix + num_betas + k * n_tvc
     if use_dropout: num_params += (3 * k)
     if dist == 'CNORM': num_params += 1
     if dist == 'ZIP': num_params += k  # one zeta per group
+
+    delta_start_idx = (k - 1) * n_mix + num_betas
 
     # --- deterministic base ---
     base = np.zeros(num_params)
@@ -1079,13 +1293,19 @@ def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outco
         p_init = np.linspace(1.0 / (k + 1.0), k * 1.0 / (k + 1.0), k) if k > 1 else [0.5]
         staggered_intercepts = np.log(p_init / (1.0 - np.array(p_init)))
 
-    current_beta_idx = k - 1
+    # Gamma (mixing covariate) block stays at 0 in the deterministic base start
+    # (equal a-priori mixing weights) — identical to the base model's theta
+    # initialisation. Only the perturbed starts below add noise to it.
+
+    current_beta_idx = (k - 1) * n_mix
     for g in range(k):
         base[current_beta_idx] = staggered_intercepts[g]
         current_beta_idx += orders_list[g] + 1
 
+    # delta (TVC) block stays at 0 — no prior on deflection direction.
+
     if use_dropout:
-        current_gamma_idx = current_beta_idx
+        current_gamma_idx = delta_start_idx + k * n_tvc
         for g in range(k):
             base[current_gamma_idx] = -2.0
             current_gamma_idx += 3
@@ -1103,20 +1323,30 @@ def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outco
         np.random.seed(42 + s)
         perturbed = base.copy()
 
-        # theta (group membership) params: indices 0..k-2
+        # Gamma (mixing covariate) params: intercepts get the same noise scale
+        # as the old theta perturbation; covariate slopes get smaller noise
+        # (no strong prior on their direction/magnitude).
         if k > 1:
-            perturbed[:k - 1] += np.random.normal(0, 0.5, k - 1)
+            for g in range(1, k):
+                row_start = (g - 1) * n_mix
+                perturbed[row_start] += np.random.normal(0, 0.5)
+                if n_mix > 1:
+                    perturbed[row_start + 1:row_start + n_mix] += np.random.normal(0, 0.3, n_mix - 1)
 
         # beta (trajectory) params
-        cb_idx = k - 1
+        cb_idx = (k - 1) * n_mix
         for g in range(k):
             n_betas = orders_list[g] + 1
             perturbed[cb_idx:cb_idx + n_betas] += np.random.normal(0, 0.3, n_betas)
             cb_idx += n_betas
 
+        # delta (TVC) params
+        if n_tvc > 0:
+            perturbed[delta_start_idx:delta_start_idx + k * n_tvc] += np.random.normal(0, 0.3, k * n_tvc)
+
         # gamma (dropout) params
         if use_dropout:
-            cg_idx = cb_idx
+            cg_idx = delta_start_idx + k * n_tvc
             for g in range(k):
                 perturbed[cg_idx:cg_idx + 3] += np.random.normal(0, 0.2, 3)
                 cg_idx += 3
@@ -1134,7 +1364,7 @@ def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outco
     return starts
 
 
-def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, n_starts=5):
+def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, n_starts=5, baseline_cov_cols=None, tvc_cols=None):
     """Fit a single GBTM model with a fixed group count and polynomial order specification.
 
     Runs n_starts independent BFGS optimisations from different starting
@@ -1152,6 +1382,12 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
         cnorm_min:   Lower censoring bound for CNORM (auto-set to min(y) if NaN).
         cnorm_max:   Upper censoring bound for CNORM (auto-set to max(y) if NaN).
         n_starts:    Number of multi-start random restarts (default 5).
+        baseline_cov_cols: optional list of column names in df to use as
+                     time-invariant baseline covariates for group membership
+                     (V3.0). None/[] = intercept-only (V1.5.0-equivalent).
+        tvc_cols:    optional list of column names in df to use as time-varying
+                     covariates in the trajectory equation (V3.0). None/[] =
+                     no TVCs (V1.5.0-equivalent).
 
     Returns:
         dict with keys:
@@ -1174,12 +1410,23 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
             'dist'               : distribution string.
             'cnorm_min/max'      : censoring bounds.
             'v_model'            : (p,p) model-based covariance matrix.
+            'baseline_cov_cols'  : list — mixing-covariate column names used (V3.0).
+            'tvc_cols'           : list — TVC column names used (V3.0).
+            'n_mix'              : int — mixing-covariate block width (P+1).
+            'n_tvc'              : int — number of TVCs (Q).
     """
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     n_subjects = len(subj_breaks) - 1
     n_obs = len(times)
     dist_map = {'LOGIT': 0, 'CNORM': 1, 'POISSON': 2, 'ZIP': 3}
     dist_code = dist_map.get(dist, 0)
+
+    baseline_cov_cols = list(baseline_cov_cols) if baseline_cov_cols else []
+    tvc_cols = list(tvc_cols) if tvc_cols else []
+    baseline_X = build_baseline_covariate_matrix(df, baseline_cov_cols)
+    tvc_Z = extract_tvc_array(df, tvc_cols)
+    n_mix = baseline_X.shape[1]
+    n_tvc = tvc_Z.shape[1]
 
     if dist == 'CNORM':
         if cnorm_min is None or np.isnan(cnorm_min): cnorm_min = np.min(outcomes)
@@ -1192,13 +1439,14 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
     orders_arr = np.array(orders_list, dtype=np.int32)
     k = len(orders_list)
 
-    args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max))
-    num_params = (k - 1) + sum([order + 1 for order in orders_list])
+    args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max), baseline_X, tvc_Z)
+    num_betas = sum(order + 1 for order in orders_list)
+    num_params = (k - 1) * n_mix + num_betas + k * n_tvc
     if use_dropout: num_params += (3 * k)
     if dist == 'CNORM': num_params += 1
     if dist == 'ZIP': num_params += k  # one zeta per group
 
-    starts = generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=n_starts)
+    starts = generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=n_starts, n_mix=n_mix, n_tvc=n_tvc)
 
     best_result = None
     best_nll = np.inf
@@ -1222,12 +1470,13 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
 
     result = best_result
     is_valid, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num, v_model = process_optimization_result(
-        result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max
+        result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max,
+        baseline_X, tvc_Z
     )
 
     if is_valid:
         orders_list, se_model, se_robust, pis = sort_groups_by_intercept(
-            result, orders_list, se_model, se_robust, pis, use_dropout, dist
+            result, orders_list, se_model, se_robust, pis, use_dropout, dist, n_mix=n_mix, n_tvc=n_tvc
         )
 
     min_group_size = np.min(pis) * 100 if is_valid else np.nan
@@ -1237,10 +1486,11 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
         'orders': orders_list, 'zip_iorder': zip_iorder, 'result': result, 'min_pct': min_group_size,
         'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust,
         'dof': n_obs - num_params, 'cond_num': cond_num, 'dist': dist, 'cnorm_min': cnorm_min, 'cnorm_max': cnorm_max,
-        'v_model': v_model
+        'v_model': v_model, 'baseline_cov_cols': baseline_cov_cols, 'tvc_cols': tvc_cols,
+        'n_mix': n_mix, 'n_tvc': n_tvc,
     }
 
-def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, zip_iorder=0, n_starts=3):
+def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, zip_iorder=0, n_starts=3, baseline_cov_cols=None, tvc_cols=None):
     """Exhaustive automated search over all (k, orders) combinations.
 
     Evaluates every combination of group count and polynomial orders within
@@ -1282,6 +1532,12 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         cnorm_max:     CNORM upper censoring bound.
         zip_iorder:    Legacy parameter (unused).
         n_starts:      Multi-start restarts per model (default 3).
+        baseline_cov_cols: optional list of column names in df to use as
+                       time-invariant baseline covariates for group membership
+                       (V3.0). None/[] = intercept-only (V1.5.0-equivalent).
+        tvc_cols:      optional list of column names in df to use as
+                       time-varying covariates in the trajectory equation
+                       (V3.0). None/[] = no TVCs (V1.5.0-equivalent).
 
     Returns:
         Tuple[List[dict], List[dict]]:
@@ -1297,6 +1553,13 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
     n_obs = len(times)
     dist_map = {'LOGIT': 0, 'CNORM': 1, 'POISSON': 2, 'ZIP': 3}
     dist_code = dist_map.get(dist, 0)
+
+    baseline_cov_cols = list(baseline_cov_cols) if baseline_cov_cols else []
+    tvc_cols = list(tvc_cols) if tvc_cols else []
+    baseline_X = build_baseline_covariate_matrix(df, baseline_cov_cols)
+    tvc_Z = extract_tvc_array(df, tvc_cols)
+    n_mix = baseline_X.shape[1]
+    n_tvc = tvc_Z.shape[1]
 
     if dist == 'CNORM':
         if cnorm_min is None or np.isnan(cnorm_min): cnorm_min = np.min(outcomes)
@@ -1315,13 +1578,14 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         orders_arr = np.array(orders_list, dtype=np.int32)
         k = len(orders_list)
 
-        num_params = (k - 1) + sum([order + 1 for order in orders_list])
+        num_betas = sum(order + 1 for order in orders_list)
+        num_params = (k - 1) * n_mix + num_betas + k * n_tvc
         if use_dropout: num_params += (3 * k)
         if dist == 'CNORM': num_params += 1
         if dist == 'ZIP': num_params += k  # one zeta per group
 
-        args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max))
-        starts = generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=n_starts)
+        args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max), baseline_X, tvc_Z)
+        starts = generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=n_starts, n_mix=n_mix, n_tvc=n_tvc)
 
         best_result = None
         best_nll = np.inf
@@ -1345,12 +1609,13 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
 
         result = best_result
         is_converged, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num, v_model = process_optimization_result(
-            result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max
+            result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max,
+            baseline_X, tvc_Z
         )
 
         if is_converged:
             orders_list, se_model, se_robust, pis = sort_groups_by_intercept(
-                result, orders_list, se_model, se_robust, pis, use_dropout, dist
+                result, orders_list, se_model, se_robust, pis, use_dropout, dist, n_mix=n_mix, n_tvc=n_tvc
             )
             min_group_size = np.min(pis) * 100
             status = ""
@@ -1363,12 +1628,12 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
             elif np.any(se_model < 1e-3) or np.any(se_model > 50):
                 status = "Rejected (Degenerate SE / Flat Likelihood)"
                 is_valid = False
-            elif min_group_size < min_group_pct: 
+            elif min_group_size < min_group_pct:
                 status = f"Rejected (Group Size < {min_group_pct}%)"
                 is_valid = False
             else:
                 all_significant = True
-                current_beta_idx = k - 1
+                current_beta_idx = (k - 1) * n_mix
                 for g in range(k):
                     n_betas = orders_list[g] + 1
                     highest_est = result.x[current_beta_idx + n_betas - 1]
@@ -1399,7 +1664,8 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                     'aic': aic_nagin, 'aic_nagin': aic_nagin, 'aic_standard': aic_standard, 'll': ll,
                     'orders': orders_list, 'zip_iorder': zip_iorder, 'result': result, 'min_pct': min_group_size,
                     'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust, 'dof': dof, 'cond_num': cond_num, 'dist': dist, 'cnorm_min': cnorm_min, 'cnorm_max': cnorm_max,
-                    'v_model': v_model
+                    'v_model': v_model, 'baseline_cov_cols': baseline_cov_cols, 'tvc_cols': tvc_cols,
+                    'n_mix': n_mix, 'n_tvc': n_tvc,
                 })
         else:
             all_evaluated_models.append({
@@ -1418,14 +1684,17 @@ def get_subject_assignments(model_dict, df):
 
     For each subject, evaluates the group-conditional log-likelihood
     L_{ig} = Σ_t log P(y_{it} | g, t) under the fitted model, then computes
-    the normalised posterior P(g | i) ∝ π_g · exp(L_{ig}).  The hard
+    the normalised posterior P(g | i) ∝ π_g(x_i) · exp(L_{ig}).  The hard
     assignment is argmax_g P(g | i).
 
     Args:
         model_dict: Model dict returned by run_single_model or run_autotraj
                     (must have keys 'orders', 'result', 'use_dropout', 'pis',
-                    'dist', 'cnorm_min', 'cnorm_max').
-        df:         Long-format DataFrame with columns ID, Time, Outcome.
+                    'dist', 'cnorm_min', 'cnorm_max'; optionally 'baseline_cov_cols',
+                    'tvc_cols', 'n_mix', 'n_tvc' for V3.0 — older model dicts
+                    without these keys default to the no-covariate case).
+        df:         Long-format DataFrame with columns ID, Time, Outcome (plus
+                    any baseline-covariate/TVC columns named in model_dict).
 
     Returns:
         pd.DataFrame: One row per subject with columns:
@@ -1442,42 +1711,57 @@ def get_subject_assignments(model_dict, df):
     dist_code = dist_map.get(dist, 0)
     min_val = float(model_dict.get('cnorm_min', 0.0))
     max_val = float(model_dict.get('cnorm_max', 0.0))
-    
+    baseline_cov_cols = model_dict.get('baseline_cov_cols') or []
+    tvc_cols = model_dict.get('tvc_cols') or []
+
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     ids = df['ID'].values
     subject_ids_unique = ids[subj_breaks[:-1]]
-    
+
+    baseline_X = build_baseline_covariate_matrix(df, baseline_cov_cols)
+    tvc_Z = extract_tvc_array(df, tvc_cols)
+    n_mix = model_dict.get('n_mix', baseline_X.shape[1])
+    n_tvc = model_dict.get('n_tvc', tvc_Z.shape[1])
+
     k = len(orders)
-    thetas = np.zeros(k)
-    if k > 1: thetas[1:] = params[0 : k-1]
-    pis = np.exp(thetas - logsumexp(thetas))
-    pis_safe = np.clip(pis, 1e-15, 1.0)
-    
+
     num_betas = 0
     for g in range(k): num_betas += orders[g] + 1
-    gamma_start_idx = (k - 1) + num_betas
-    
+    delta_start_idx = (k - 1) * n_mix + num_betas
+    gamma_start_idx = delta_start_idx + k * n_tvc
+
     if dist == 'CNORM':
         raw_sigma = params[-1]
         sigma = np.exp(raw_sigma) if raw_sigma < 20 else np.exp(20)
     elif dist == 'ZIP':
         zeta_start = len(params) - k
-    
+
     assignments = []
     n_subjects = len(subj_breaks) - 1
-    
+
     for i in range(n_subjects):
         start, end = subj_breaks[i], subj_breaks[i+1]
         n_obs = end - start
+
+        # Per-subject mixing probabilities (V3.0): theta_g(x_i) = Gamma_g . x_i
+        # for g > 0; theta_0(x_i) ≡ 0. Reduces to the fixed base-model pis when
+        # n_mix == 1 (baseline_X[i, 0] == 1).
+        thetas = np.zeros(k)
+        for g in range(1, k):
+            thetas[g] = np.dot(params[(g - 1) * n_mix : g * n_mix], baseline_X[i, :])
+        pis = np.exp(thetas - logsumexp(thetas))
+        pis_safe = np.clip(pis, 1e-15, 1.0)
+
         L_ig_log = np.zeros(k)
-        current_beta_idx = k - 1
+        current_beta_idx = (k - 1) * n_mix
         current_gamma_idx = gamma_start_idx
-        
+
         for g in range(k):
             n_betas = orders[g] + 1
             group_betas = params[current_beta_idx : current_beta_idx + n_betas]
             current_beta_idx += n_betas
-            
+            group_delta = params[delta_start_idx + g * n_tvc : delta_start_idx + (g + 1) * n_tvc]
+
             if use_dropout:
                 gamma_0 = params[current_gamma_idx]
                 gamma_1 = params[current_gamma_idx + 1]
@@ -1494,6 +1778,7 @@ def get_subject_assignments(model_dict, df):
                 y_val = outcomes[idx]
 
                 mu = sum(group_betas[p] * (t_val ** p) for p in range(orders[g] + 1))
+                mu += sum(group_delta[q] * tvc_Z[idx, q] for q in range(n_tvc))
 
                 if dist_code == 2: # POISSON
                     eta = mu

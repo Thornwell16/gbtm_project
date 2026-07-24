@@ -80,10 +80,15 @@ from main import (
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _beta_start_indices(orders_list):
-    """Return list of (start_idx, n_betas) tuples for each group's beta block."""
+def _beta_start_indices(orders_list, n_mix=1):
+    """Return list of (start_idx, n_betas) tuples for each group's beta block.
+
+    n_mix (V3.0): mixing-covariate block width per group (P+1, incl. intercept).
+    Default 1 = intercept-only (V1.5.0-equivalent), matching the old `k - 1`
+    Gamma/theta block size.
+    """
     k = len(orders_list)
-    idx = k - 1
+    idx = (k - 1) * n_mix
     out = []
     for g in range(k):
         n = orders_list[g] + 1
@@ -92,7 +97,20 @@ def _beta_start_indices(orders_list):
     return out
 
 
-def _compute_ci_band(smooth_times, g_betas, order, se_model, beta_start, n_betas, dist_type, z=1.96):
+def _delta_start_index(orders_list, n_mix=1):
+    """Return the flat-vector index where the TVC (delta) block begins (V3.0).
+
+    The delta block has fixed width n_tvc per group (all k groups, no
+    reference-group exclusion) — this returns only the *start* index; callers
+    slice model_dict['n_tvc'] * k entries from there, or per-group offsets of
+    `delta_start + g * n_tvc`.
+    """
+    k = len(orders_list)
+    num_betas = sum(o + 1 for o in orders_list)
+    return (k - 1) * n_mix + num_betas
+
+
+def _compute_ci_band(smooth_times, g_betas, order, se_model, beta_start, n_betas, dist_type, z=1.96, eta_offset=0.0):
     """Delta-method 95% CI band for a single group trajectory.
 
     Uses the diagonal of the model covariance (se_model^2) — a valid approximation
@@ -109,6 +127,11 @@ def _compute_ci_band(smooth_times, g_betas, order, se_model, beta_start, n_betas
     n_betas      : number of betas for this group
     dist_type    : 'LOGIT' | 'CNORM' | 'POISSON' | 'ZIP'
     z            : critical value (default 1.96 for 95 %)
+    eta_offset   : constant added to eta (V3.0: TVC deflection evaluated at the
+                   sample-mean TVC level, e.g. delta_g . mean(TVC); its own
+                   sampling variance is not incorporated into the band, a
+                   deliberate simplification — the band still reflects beta
+                   uncertainty exactly, just centred at a different eta).
 
     Returns
     -------
@@ -121,7 +144,7 @@ def _compute_ci_band(smooth_times, g_betas, order, se_model, beta_start, n_betas
     var_eta = np.clip(var_eta, 0.0, None)
     se_eta  = np.sqrt(var_eta)
 
-    eta = X @ g_betas
+    eta = X @ g_betas + eta_offset
 
     if dist_type == 'LOGIT':
         lo = 1.0 / (1.0 + np.exp(-(eta - z * se_eta)))
@@ -144,14 +167,43 @@ def get_parameter_estimates_for_ui(model_dict, group_names=None):
     use_dropout = model_dict['use_dropout']
     dof        = model_dict['dof']
     model_type = model_dict.get('dist', 'LOGIT')
+    n_mix      = model_dict.get('n_mix', 1)
+    n_tvc      = model_dict.get('n_tvc', 0)
+    baseline_cov_names = model_dict.get('baseline_cov_cols') or []
+    tvc_names          = model_dict.get('tvc_cols') or []
 
     k = len(orders)
     if group_names is None or len(group_names) != k:
         group_names = [f"Group {g+1}" for g in range(k)]
 
     data = []
-    current_beta_idx  = k - 1
-    current_gamma_idx = (k - 1) + sum([o + 1 for o in orders])
+
+    def _row(component, group, parameter, est, err_m, err_r):
+        t_stat = est / err_m if err_m > 0 else 0
+        p_val  = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+        return {
+            "Component": component, "Group": str(group), "Parameter": parameter,
+            "Estimate": round(est, 5), "Standard Error": round(err_m, 5),
+            "Robust SE": round(err_r, 5),
+            "T for H0: Param=0": round(t_stat, 3),
+            "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001",
+        }
+
+    # V3.0: Gamma (mixing covariate) rows — one per non-reference group x covariate.
+    # Row 0 (reference group) is implicit-zero and not shown.
+    mix_labels = ["Intercept"] + list(baseline_cov_names)
+    for g in range(1, k):
+        for p in range(n_mix):
+            idx = (g - 1) * n_mix + p
+            label = mix_labels[p] if p < len(mix_labels) else f"Covariate {p}"
+            data.append(_row(
+                "Mixing Covariate", str(group_names[g]), f"Gamma: {label}",
+                params[idx], se_model[idx], se_robust[idx],
+            ))
+
+    current_beta_idx  = (k - 1) * n_mix
+    delta_start_idx    = (k - 1) * n_mix + sum(o + 1 for o in orders)
+    current_gamma_idx = delta_start_idx + k * n_tvc
     labels       = ["Intercept", "Linear", "Quadratic", "Cubic", "Quartic", "Quintic"]
     gamma_labels = ["Dropout: Intercept", "Dropout: Time", "Dropout: Prev Outcome"]
 
@@ -161,33 +213,24 @@ def get_parameter_estimates_for_ui(model_dict, group_names=None):
             est   = params[current_beta_idx + b_idx]
             err_m = se_model[current_beta_idx + b_idx]
             err_r = se_robust[current_beta_idx + b_idx]
-            t_stat = est / err_m if err_m > 0 else 0
-            p_val  = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
-            data.append({
-                "Component": "Trajectory", "Group": str(group_names[g]),
-                "Parameter": labels[b_idx],
-                "Estimate": round(est, 5), "Standard Error": round(err_m, 5),
-                "Robust SE": round(err_r, 5),
-                "T for H0: Param=0": round(t_stat, 3),
-                "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
-            })
+            data.append(_row("Trajectory", group_names[g], labels[b_idx], est, err_m, err_r))
         current_beta_idx += n_betas
+
+        # V3.0: delta (TVC) rows — fixed n_tvc-width block per group.
+        for q in range(n_tvc):
+            idx = delta_start_idx + g * n_tvc + q
+            label = tvc_names[q] if q < len(tvc_names) else f"TVC {q}"
+            data.append(_row(
+                "TVC Deflection", str(group_names[g]), f"Delta: {label}",
+                params[idx], se_model[idx], se_robust[idx],
+            ))
 
         if use_dropout:
             for gam_idx in range(3):
                 est   = params[current_gamma_idx + gam_idx]
                 err_m = se_model[current_gamma_idx + gam_idx]
                 err_r = se_robust[current_gamma_idx + gam_idx]
-                t_stat = est / err_m if err_m > 0 else 0
-                p_val  = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
-                data.append({
-                    "Component": "Dropout", "Group": str(group_names[g]),
-                    "Parameter": gamma_labels[gam_idx],
-                    "Estimate": round(est, 5), "Standard Error": round(err_m, 5),
-                    "Robust SE": round(err_r, 5),
-                    "T for H0: Param=0": round(t_stat, 3),
-                    "Prob > |T|": f"{p_val:.4f}" if p_val >= 0.0001 else "< 0.0001"
-                })
+                data.append(_row("Dropout", group_names[g], gamma_labels[gam_idx], est, err_m, err_r))
             current_gamma_idx += 3
 
     if model_type == 'CNORM':
@@ -227,8 +270,14 @@ def get_parameter_estimates_for_ui(model_dict, group_names=None):
     return pd.DataFrame(data)
 
 
-def _build_equation_latex(g_betas, order, dist_type, group_name, g_idx, winning_result, winning_orders):
-    """Return a LaTeX string for one group's fitted equation."""
+def _build_equation_latex(g_betas, order, dist_type, group_name, g_idx, winning_result, winning_orders,
+                           g_delta=None, tvc_names=None):
+    """Return a LaTeX string for one group's fitted equation.
+
+    g_delta/tvc_names (V3.0): if TVCs are present, append their deflection
+    terms symbolically (using the covariate's name, not a numeric value,
+    since the term's contribution varies per subject/time).
+    """
     terms = []
     poly_terms = []
     coeff_labels = ["", "t", "t^2", "t^3", "t^4", "t^5"]
@@ -241,6 +290,13 @@ def _build_equation_latex(g_betas, order, dist_type, group_name, g_idx, winning_
         else:
             poly_terms.append(f"{coeff_str}{coeff_labels[p]}")
     poly = " ".join(poly_terms)
+
+    if g_delta is not None and len(g_delta) > 0:
+        for q, d in enumerate(g_delta):
+            name = tvc_names[q] if tvc_names and q < len(tvc_names) else f"z_{{{q+1}}}"
+            safe_name = str(name).replace("_", r"\_")
+            sign = "+" if d >= 0 else ""
+            poly += rf" {sign}{d:.3f}\cdot\text{{{safe_name}}}"
 
     if dist_type == 'LOGIT':
         lhs = r"\text{logit}(p)"
@@ -260,6 +316,34 @@ def _build_equation_latex(g_betas, order, dist_type, group_name, g_idx, winning_
         extra = ""
 
     return rf"\text{{{group_name}}}: \; {lhs} = {poly}{extra}"
+
+
+def _build_mixing_equation_latex(gamma_matrix, group_names, baseline_cov_names):
+    """Return LaTeX strings for the V3.0 mixing-covariate equation, one line
+    per non-reference group: theta_g(x) = Gamma_g0 + Gamma_g1*x1 + ...
+
+    gamma_matrix: (k, n_mix) array, row 0 (reference) is all zeros and skipped.
+    Returns [] when there are no baseline covariates (n_mix == 1) — callers
+    should skip rendering this equation entirely in that case, since it adds
+    no information beyond the group proportion table.
+    """
+    k, n_mix = gamma_matrix.shape
+    if n_mix <= 1:
+        return []
+    labels = ["1"] + [str(c).replace("_", r"\_") for c in baseline_cov_names]
+    lines = []
+    for g in range(1, k):
+        terms = []
+        for p in range(n_mix):
+            c = gamma_matrix[g, p]
+            sign = "+" if c >= 0 and p > 0 else ""
+            coeff_str = f"{sign}{c:.3f}"
+            if p == 0:
+                terms.append(coeff_str)
+            else:
+                terms.append(rf"{coeff_str}\cdot\text{{{labels[p]}}}")
+        lines.append(rf"\text{{{group_names[g]}}}: \; \theta = {' '.join(terms)}")
+    return lines
 
 
 def _make_model_summary_txt(winning_model, group_names, rel_entropy):
@@ -288,7 +372,7 @@ def _make_model_summary_txt(winning_model, group_names, rel_entropy):
     lines.append("Parameter Estimates (Trajectory Betas):")
     params    = winning_model['result'].x
     se_model  = winning_model['se_model']
-    beta_info = _beta_start_indices(orders)
+    beta_info = _beta_start_indices(orders, n_mix=winning_model.get('n_mix', 1))
     for g in range(k):
         start, n = beta_info[g]
         lines.append(f"  {group_names[g]}:")
@@ -365,7 +449,7 @@ def _obs_vs_est_figure(long_df, assignments_df, winning_model, group_names, dist
     """
     orders         = winning_model['orders']
     winning_result = winning_model['result']
-    beta_info      = _beta_start_indices(orders)
+    beta_info      = _beta_start_indices(orders, n_mix=winning_model.get('n_mix', 1))
     k              = len(orders)
     prob_cols      = [f'Group_{g+1}_Prob' for g in range(k)]
     colors         = ['#2B6083', '#B5373A', '#D4A843', '#2E7D52', '#7B4F8A', '#C97B2A']
@@ -428,7 +512,7 @@ def _residual_analysis(long_df, assignments_df, winning_model, group_names, dist
     """
     orders         = winning_model['orders']
     winning_result = winning_model['result']
-    beta_info      = _beta_start_indices(orders)
+    beta_info      = _beta_start_indices(orders, n_mix=winning_model.get('n_mix', 1))
 
     all_obs_resid = []   # flat list of all observation-level residuals
     subj_records  = []
@@ -1000,7 +1084,37 @@ else:
         except Exception as e:
             st.error("Could not locate cambridge.txt in the repository.")
 
+    baseline_cov_cols = []
+    tvc_cols = []
     if raw_df is not None:
+        reserved_cols = {str(id_col), str(outcome_col), str(time_col)}
+        candidate_cols = [c for c in raw_df.columns if str(c) not in reserved_cols]
+
+        with st.expander("V3.0: Covariate Architecture (optional)"):
+            st.markdown(
+                "**Baseline covariates** predict group membership (multinomial "
+                "logit on mixing proportions). Must be time-invariant (constant "
+                "per subject) — works for both Wide and Long format, since "
+                "wide-format extra columns carry through unchanged."
+            )
+            baseline_cov_cols = st.multiselect(
+                "Baseline covariates for group membership:", candidate_cols,
+                key="baseline_cov_cols_select",
+            )
+            if data_format == "Long Format":
+                st.markdown(
+                    "**Time-varying covariates (TVC)** deflect the trajectory "
+                    "equation itself and may vary within subject over time."
+                )
+                tvc_cols = st.multiselect(
+                    "Time-varying covariates for trajectory:",
+                    [c for c in candidate_cols if c not in baseline_cov_cols],
+                    key="tvc_cols_select",
+                )
+            else:
+                st.caption(
+                    "Time-varying covariates currently require Long format input."
+                )
 
         button_label = "Run AutoTraj Search" if app_mode == "AutoTraj Search" else "Run Single Model"
 
@@ -1027,8 +1141,9 @@ else:
                 if data_format == "Wide Format" or st.session_state.use_sample_data:
                     long_df = prep_trajectory_data(raw_df, id_col, outcome_col, time_col).dropna(subset=['Time', 'Outcome'])
                 else:
+                    keep_cols = ['ID', 'Time', 'Outcome'] + list(baseline_cov_cols) + list(tvc_cols)
                     long_df = raw_df.rename(columns={id_col: 'ID', outcome_col: 'Outcome', time_col: 'Time'})
-                    long_df = long_df[['ID', 'Time', 'Outcome']].dropna(subset=['Time', 'Outcome'])
+                    long_df = long_df[keep_cols].dropna(subset=['Time', 'Outcome'] + list(tvc_cols))
                     long_df['Time']    = pd.to_numeric(long_df['Time'])
                     long_df['Outcome'] = pd.to_numeric(long_df['Outcome'])
                     long_df = long_df.sort_values(by=['ID', 'Time'])
@@ -1079,13 +1194,15 @@ else:
                         min_order=order_range[0], max_order=order_range[1],
                         min_group_pct=min_pct, p_val_thresh=p_val, use_dropout=use_dropout,
                         dist=dist_flag, cnorm_min=cnorm_min, cnorm_max=cnorm_max,
-                        zip_iorder=0, n_starts=n_starts
+                        zip_iorder=0, n_starts=n_starts,
+                        baseline_cov_cols=baseline_cov_cols, tvc_cols=tvc_cols,
                     )
                 else:
                     single_res = run_single_model(
                         long_df, orders_single, zip_iorder=0,
                         use_dropout=use_dropout, dist=dist_flag,
-                        cnorm_min=cnorm_min, cnorm_max=cnorm_max, n_starts=n_starts
+                        cnorm_min=cnorm_min, cnorm_max=cnorm_max, n_starts=n_starts,
+                        baseline_cov_cols=baseline_cov_cols, tvc_cols=tvc_cols,
                     )
                     top_models   = [single_res] if single_res['result'].success or single_res['result'].status == 2 else []
                     all_evaluated = []
@@ -1201,31 +1318,51 @@ else:
                 obs_means       = merged_for_plot.groupby(['Assigned_Group', 'Time'])['Outcome'].mean().reset_index()
 
                 # Pre-compute beta indices once (used by both Plotly and Matplotlib)
-                beta_info   = _beta_start_indices(winning_orders)
+                beta_info   = _beta_start_indices(winning_orders, n_mix=winning_model.get('n_mix', 1))
                 k_plot      = len(winning_orders)
+                tvc_names_plot = winning_model.get('tvc_cols') or []
+                n_tvc_plot     = winning_model.get('n_tvc', 0)
+                delta_start_plot = _delta_start_index(winning_orders, n_mix=winning_model.get('n_mix', 1))
+                if n_tvc_plot > 0:
+                    tvc_means_plot = long_df[tvc_names_plot].mean().values
+                else:
+                    tvc_means_plot = np.zeros(0)
 
                 _BRAND_COLORS    = ['#2B6083', '#B5373A', '#D4A843', '#2E7D52', '#7B4F8A', '#C97B2A']
                 plotly_colors    = _BRAND_COLORS
                 mpl_colors_color = _BRAND_COLORS
                 mpl_colors_gray  = ['black', 'dimgray', 'darkgray', 'lightgray', 'slategray', 'silver']
 
+                # ── helper: TVC deflection evaluated at the sample-mean TVC level
+                # (V3.0). Returns 0.0 when no TVCs are present.
+                def _tvc_offset(g_idx):
+                    if n_tvc_plot == 0:
+                        return 0.0
+                    g_delta = winning_result.x[delta_start_plot + g_idx * n_tvc_plot: delta_start_plot + (g_idx + 1) * n_tvc_plot]
+                    return float(np.dot(g_delta, tvc_means_plot))
+
                 # ── helper: compute trajectory curve for one group
+                # V3.0: if TVCs are present, the curve is plotted "at mean TVC
+                # level" — a constant offset (delta_g . mean(TVC)) is added to
+                # eta, since the trajectory is no longer a function of t alone.
                 def _group_curve(g_idx):
                     beta_start, n_betas = beta_info[g_idx]
                     g_betas = winning_result.x[beta_start:beta_start + n_betas]
                     order   = winning_orders[g_idx]
                     X_smooth = create_design_matrix_jit(smooth_times, order)
+                    tvc_offset = _tvc_offset(g_idx)
                     if dist_type == 'LOGIT':
-                        y_hat = calc_logit_prob_jit(g_betas, X_smooth)
+                        y_hat = calc_logit_prob_jit(g_betas, X_smooth) if tvc_offset == 0.0 else \
+                            1.0 / (1.0 + np.exp(-(X_smooth @ g_betas + tvc_offset)))
                     elif dist_type == 'POISSON':
-                        y_hat = np.exp(X_smooth @ g_betas)
+                        y_hat = np.exp(X_smooth @ g_betas + tvc_offset)
                     elif dist_type == 'ZIP':
-                        lam     = np.exp(X_smooth @ g_betas)
+                        lam     = np.exp(X_smooth @ g_betas + tvc_offset)
                         zeta_g  = winning_result.x[len(winning_result.x) - k_plot + g_idx]
                         omega_g = 1.0 / (1.0 + np.exp(-zeta_g))
                         y_hat   = lam * (1.0 - omega_g)
                     else:
-                        y_hat = X_smooth @ g_betas
+                        y_hat = X_smooth @ g_betas + tvc_offset
                     return g_betas, order, y_hat, beta_start, n_betas
 
                 with col_viz1:
@@ -1260,7 +1397,7 @@ else:
                             if show_ci:
                                 lo, hi = _compute_ci_band(
                                     smooth_times, g_betas, order, se_model_arr,
-                                    beta_start, n_betas, dist_type
+                                    beta_start, n_betas, dist_type, eta_offset=_tvc_offset(g)
                                 )
                                 fig.add_trace(go.Scatter(
                                     x=np.concatenate([smooth_times, smooth_times[::-1]]),
@@ -1326,7 +1463,7 @@ else:
                             if show_ci:
                                 lo, hi = _compute_ci_band(
                                     smooth_times, g_betas, order, se_model_arr,
-                                    beta_start, n_betas, dist_type
+                                    beta_start, n_betas, dist_type, eta_offset=_tvc_offset(g)
                                 )
                                 ax.fill_between(smooth_times, lo, hi, color=color, alpha=0.15)
 
@@ -1357,11 +1494,30 @@ else:
                 for g in range(k_plot):
                     beta_start, n_betas = beta_info[g]
                     g_betas = winning_result.x[beta_start:beta_start + n_betas]
+                    g_delta = (
+                        winning_result.x[delta_start_plot + g * n_tvc_plot: delta_start_plot + (g + 1) * n_tvc_plot]
+                        if n_tvc_plot > 0 else None
+                    )
                     eq = _build_equation_latex(
                         g_betas, winning_orders[g], dist_type,
-                        group_names[g], g, winning_result, winning_orders
+                        group_names[g], g, winning_result, winning_orders,
+                        g_delta=g_delta, tvc_names=tvc_names_plot,
                     )
                     st.latex(eq)
+
+                # V3.0: mixing-covariate equation (theta_g(x) = Gamma_g . x), only
+                # shown when baseline covariates were used for group membership.
+                n_mix_plot = winning_model.get('n_mix', 1)
+                if n_mix_plot > 1:
+                    gamma_block = winning_result.x[0:(k_plot - 1) * n_mix_plot].reshape(k_plot - 1, n_mix_plot)
+                    gamma_matrix_plot = np.vstack([np.zeros((1, n_mix_plot)), gamma_block])
+                    mix_eqs = _build_mixing_equation_latex(
+                        gamma_matrix_plot, group_names, winning_model.get('baseline_cov_cols') or []
+                    )
+                    if mix_eqs:
+                        st.markdown("**Group Membership Equation** (multinomial logit on mixing proportions)")
+                        for eq in mix_eqs:
+                            st.latex(eq)
 
                 # ── DOWNLOAD BUTTONS ──────────────────────────────────────────
                 st.markdown("**Download Plot**")
@@ -1514,7 +1670,14 @@ else:
                     if data_format == "Wide Format" or st.session_state.use_sample_data:
                         potential_covariates = [col for col in raw_df.columns.tolist()
                                                 if not col.startswith((outcome_col, time_col))]
-                        selected_vars   = st.multiselect("Variables to include:", potential_covariates)
+                        selected_vars   = st.multiselect(
+                            "Additional descriptive variables (not used in model):",
+                            potential_covariates,
+                            help="Purely descriptive — for baseline-characteristics reporting only. "
+                                 "This does NOT feed the model; use the 'V3.0: Covariate Architecture' "
+                                 "expander in the sidebar to add covariates that affect group membership "
+                                 "or the trajectory equation.",
+                        )
                         categorical_vars = st.multiselect("Which of these are categorical?", selected_vars)
                         if selected_vars and st.button("Generate Table 1"):
                             merged_df = pd.merge(raw_df, assignments_df[['ID', 'Assigned_Group']],

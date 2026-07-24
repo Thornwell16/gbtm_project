@@ -82,7 +82,7 @@ AutoTraj is actively maintained. Upcoming architecture upgrades include:
 
 * ✅ **Alternative Distributions (V2.0):** Censored Normal (Tobit) for continuous biomarkers and Poisson/ZIP for count data. — *Completed in V2.0*
 
-* **Covariate Architecture (V3.0):** Multinomial baseline risk factors for group membership prediction and Time-Varying Covariates (TVC) for trajectory deflection.
+* ✅ **Covariate Architecture (V3.0):** Multinomial baseline risk factors for group membership prediction and Time-Varying Covariates (TVC) for trajectory deflection. — *Engine and UI complete; see CHANGELOG.md*
 
 * **Survey Weights (V4.0):** Inverse probability sampling weights for complex stratified national surveys.
 

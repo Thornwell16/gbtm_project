@@ -86,6 +86,13 @@ def _build_df(records: List[dict]) -> LongDF:
     return df
 
 
+def _build_df_with_extra(records: List[dict], extra_cols: Sequence[str]) -> LongDF:
+    """Like _build_df but preserves additional columns (V3.0 covariate/TVC simulators)."""
+    df = pd.DataFrame(records, columns=['ID', 'Time', 'Outcome'] + list(extra_cols))
+    df = df.sort_values(['ID', 'Time']).reset_index(drop=True)
+    return df
+
+
 # ---------------------------------------------------------------------------
 # 1. LOGIT (binary)
 # ---------------------------------------------------------------------------
@@ -461,6 +468,208 @@ def simulate_dropout_data(
         'proportions':    props_norm.tolist(),
         'dropout_gammas': list(dropout_gammas),
         'dropout_rates':  n_dropouts / n_subjects,
+    }
+    return long_df, truth
+
+
+# ---------------------------------------------------------------------------
+# V3.0: mixing covariates (Gamma) and time-varying covariates (delta)
+# ---------------------------------------------------------------------------
+
+def simulate_logit_with_mixing_covariates(
+    n_subjects: int,
+    time_points: Sequence[float],
+    group_params: List[Dict],
+    gamma_matrix: Sequence[Sequence[float]],
+    cov_mean: float = 0.0,
+    cov_sd: float = 1.0,
+    missing_rate: float = 0.0,
+    seed: int = 42,
+) -> Tuple[LongDF, TruthDict]:
+    """Simulate LOGIT outcomes where group membership depends on a baseline covariate X1.
+
+    theta_g(x_i) = Gamma_{g,0} + Gamma_{g,1}*x_i for g>0; theta_0(x_i) = 0.
+    pi_g(x_i) = softmax(theta(x_i))_g. Group assignment is drawn per-subject from
+    this covariate-dependent distribution (not from a fixed proportions vector).
+
+    Parameters
+    ----------
+    gamma_matrix : (k, 2) array-like; row g = [Gamma_g0, Gamma_g1] for g=1..k-1.
+                   Row 0 (reference group) is ignored — treated as zeros.
+
+    Returns
+    -------
+    long_df : DataFrame [ID, Time, Outcome, X1]  (X1 is the time-invariant covariate)
+    truth   : {'assignments', 'group_params', 'gamma_matrix', 'baseline_cov': {id: x}}
+    """
+    rng = np.random.default_rng(seed)
+    times = np.asarray(time_points, dtype=float)
+    k = len(group_params)
+    gamma = np.asarray(gamma_matrix, dtype=float)
+
+    x = rng.normal(cov_mean, cov_sd, size=n_subjects)
+
+    thetas = np.zeros((n_subjects, k))
+    for g in range(1, k):
+        thetas[:, g] = gamma[g, 0] + gamma[g, 1] * x
+    max_t = thetas.max(axis=1, keepdims=True)
+    exp_t = np.exp(thetas - max_t)
+    pis = exp_t / exp_t.sum(axis=1, keepdims=True)
+
+    records: List[dict] = []
+    assignments: Dict[int, int] = {}
+    baseline_cov: Dict[int, float] = {}
+
+    for i in range(n_subjects):
+        sid = i + 1
+        g = int(rng.choice(k, p=pis[i]))
+        betas = group_params[g]['betas']
+        assignments[sid] = g + 1
+        baseline_cov[sid] = float(x[i])
+
+        for t in times:
+            eta = _poly_eval(betas, t)
+            p = float(_logistic(eta))
+            y = float(rng.binomial(1, p))
+            records.append({'ID': sid, 'Time': float(t), 'Outcome': y, 'X1': float(x[i])})
+
+    records = _apply_mcar(records, missing_rate, rng)
+    long_df = _build_df_with_extra(records, ['X1'])
+
+    truth: TruthDict = {
+        'assignments':  assignments,
+        'group_params': group_params,
+        'gamma_matrix': gamma.tolist(),
+        'baseline_cov': baseline_cov,
+    }
+    return long_df, truth
+
+
+def simulate_logit_with_tvc(
+    n_subjects: int,
+    time_points: Sequence[float],
+    group_params: List[Dict],
+    group_proportions: Sequence[float],
+    delta_per_group: Sequence[float],
+    tvc_sd: float = 1.0,
+    missing_rate: float = 0.0,
+    seed: int = 42,
+) -> Tuple[LongDF, TruthDict]:
+    """Simulate LOGIT outcomes with one time-varying covariate Z1 deflecting eta.
+
+    eta_igt = poly_eval(betas_g, t) + delta_g * z_it, with z_it ~ N(0, tvc_sd)
+    drawn independently per (subject, time) — genuinely time-varying by
+    construction (non-trivial within-subject variance).
+
+    Returns
+    -------
+    long_df : DataFrame [ID, Time, Outcome, Z1]
+    truth   : {'assignments', 'group_params', 'proportions', 'delta_per_group'}
+    """
+    if len(delta_per_group) != len(group_params):
+        raise ValueError("delta_per_group must have one entry per group.")
+
+    rng = np.random.default_rng(seed)
+    times = np.asarray(time_points, dtype=float)
+    group_idx = _assign_groups(n_subjects, group_proportions, rng)
+    props_norm = np.asarray(group_proportions, dtype=float)
+    props_norm = props_norm / props_norm.sum()
+
+    records: List[dict] = []
+    assignments: Dict[int, int] = {}
+
+    for i in range(n_subjects):
+        sid = i + 1
+        g = int(group_idx[i])
+        betas = group_params[g]['betas']
+        delta_g = float(delta_per_group[g])
+        assignments[sid] = g + 1
+
+        for t in times:
+            z = float(rng.normal(0.0, tvc_sd))
+            eta = _poly_eval(betas, t) + delta_g * z
+            p = float(_logistic(eta))
+            y = float(rng.binomial(1, p))
+            records.append({'ID': sid, 'Time': float(t), 'Outcome': y, 'Z1': z})
+
+    records = _apply_mcar(records, missing_rate, rng)
+    long_df = _build_df_with_extra(records, ['Z1'])
+
+    truth: TruthDict = {
+        'assignments':     assignments,
+        'group_params':    group_params,
+        'proportions':     props_norm.tolist(),
+        'delta_per_group': [float(d) for d in delta_per_group],
+    }
+    return long_df, truth
+
+
+def simulate_logit_with_covariates_and_tvc(
+    n_subjects: int,
+    time_points: Sequence[float],
+    group_params: List[Dict],
+    gamma_matrix: Sequence[Sequence[float]],
+    delta_per_group: Sequence[float],
+    cov_mean: float = 0.0,
+    cov_sd: float = 1.0,
+    tvc_sd: float = 1.0,
+    missing_rate: float = 0.0,
+    seed: int = 42,
+) -> Tuple[LongDF, TruthDict]:
+    """Combined simulator: mixing covariate X1 (group membership) + TVC Z1
+    (trajectory deflection) together, for a joint-recovery regression test that
+    catches parameter-vector index cross-talk bugs between the two new blocks.
+
+    Returns
+    -------
+    long_df : DataFrame [ID, Time, Outcome, X1, Z1]
+    truth   : {'assignments', 'group_params', 'gamma_matrix', 'delta_per_group',
+               'baseline_cov'}
+    """
+    if len(delta_per_group) != len(group_params):
+        raise ValueError("delta_per_group must have one entry per group.")
+
+    rng = np.random.default_rng(seed)
+    times = np.asarray(time_points, dtype=float)
+    k = len(group_params)
+    gamma = np.asarray(gamma_matrix, dtype=float)
+
+    x = rng.normal(cov_mean, cov_sd, size=n_subjects)
+    thetas = np.zeros((n_subjects, k))
+    for g in range(1, k):
+        thetas[:, g] = gamma[g, 0] + gamma[g, 1] * x
+    max_t = thetas.max(axis=1, keepdims=True)
+    exp_t = np.exp(thetas - max_t)
+    pis = exp_t / exp_t.sum(axis=1, keepdims=True)
+
+    records: List[dict] = []
+    assignments: Dict[int, int] = {}
+    baseline_cov: Dict[int, float] = {}
+
+    for i in range(n_subjects):
+        sid = i + 1
+        g = int(rng.choice(k, p=pis[i]))
+        betas = group_params[g]['betas']
+        delta_g = float(delta_per_group[g])
+        assignments[sid] = g + 1
+        baseline_cov[sid] = float(x[i])
+
+        for t in times:
+            z = float(rng.normal(0.0, tvc_sd))
+            eta = _poly_eval(betas, t) + delta_g * z
+            p = float(_logistic(eta))
+            y = float(rng.binomial(1, p))
+            records.append({'ID': sid, 'Time': float(t), 'Outcome': y, 'X1': float(x[i]), 'Z1': z})
+
+    records = _apply_mcar(records, missing_rate, rng)
+    long_df = _build_df_with_extra(records, ['X1', 'Z1'])
+
+    truth: TruthDict = {
+        'assignments':     assignments,
+        'group_params':    group_params,
+        'gamma_matrix':    gamma.tolist(),
+        'delta_per_group': [float(d) for d in delta_per_group],
+        'baseline_cov':    baseline_cov,
     }
     return long_df, truth
 

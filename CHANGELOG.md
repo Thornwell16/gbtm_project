@@ -5,11 +5,30 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
-## Unreleased — Mathematical Audit
+## V3.0 (Unreleased) — Covariate Architecture
 
-A full audit cross-checking `MATH.md` against `main.py`'s JIT kernel for every
-distribution, the dropout sub-model, and the theta/mixing gradient. All
-formulas matched exactly. Two issues were found and fixed:
+### New Features
+
+- **Multinomial baseline covariates for group membership** — mixing proportions
+  generalize from a fixed constant per group to a per-subject multinomial logit
+  θ_g(x_i) = Γ_g · x_i on user-supplied time-invariant covariates. Setting no
+  covariates (P=0) reproduces V1.5.0 exactly.
+- **Time-varying covariates (TVC) for trajectory deflection** — the trajectory
+  linear predictor gains an optional Σ_q δ_{g,q}·z_{i,q,t} term, letting
+  per-timepoint covariates deflect the fitted curve. Setting no TVCs (Q=0)
+  reproduces V1.5.0 exactly.
+- Both extensions apply uniformly across all four distributions (LOGIT, CNORM,
+  Poisson, ZIP) and are compatible with the informative-dropout sub-model
+  (which remains itself independent of the new covariates/TVCs by design).
+- New identifiability guard: baseline covariates that vary within subject are
+  rejected with a clear error (they should be supplied as a TVC instead).
+- Streamlit UI: new "V3.0: Covariate Architecture" sidebar section for
+  selecting baseline covariates / TVCs; parameter-estimate table, fitted
+  equations, and CI bands updated to display the new Γ/δ blocks.
+- 6 new parameter-recovery tests (mixing-covariate recovery, TVC recovery,
+  joint recovery, backward-compatibility, null-covariate stability,
+  constancy-guard) plus a new automated finite-difference gradient regression
+  test covering all 4 distributions and the dropout sub-model.
 
 ### Bug Fixes
 
@@ -20,18 +39,13 @@ formulas matched exactly. Two issues were found and fixed:
   assignment/adequacy reporting, not model fitting itself. Added a permanent
   order-invariance regression test.
 
-### Testing
-
-- **New automated finite-difference gradient regression test** covering all
-  four distributions and the dropout sub-model — the permanent, automated
-  version of the manual verification previously only claimed in a code
-  comment.
-
 ### Documentation
 
-- **MATH.md** — fixed a stale reference to "L-BFGS-B"; the engine has always
-  used plain unconstrained BFGS, since all constraints (σ>0, softmax) are
-  handled via reparameterization rather than box constraints.
+- **MATH.md** — extended with the full V3.0 parameter layout, log-likelihood,
+  and gradient derivations for the mixing-covariate (Γ) and TVC (δ) blocks.
+  Also fixed a stale reference to "L-BFGS-B" (the engine has always used
+  plain unconstrained BFGS, since all constraints are handled via
+  reparameterization).
 
 ---
 

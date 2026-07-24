@@ -570,7 +570,8 @@ def test_gradient_matches_finite_difference(dist_name, dist_code, use_dropout):
 
     This is the permanent, automated version of the manual verification claimed
     in main.py's module docstring/comments (no such automated test previously
-    existed). Any future parameter-vector extension must keep passing this test.
+    existed). Any future parameter-vector extension (e.g. V3.0 mixing-covariate
+    and TVC blocks) must keep passing this test.
     """
     k = 2
     orders_list = [1, 1]

@@ -34,6 +34,9 @@ from tests.simulate import (
     simulate_logit_trajectories,
     simulate_cnorm_trajectories,
     simulate_poisson_trajectories,
+    simulate_logit_with_mixing_covariates,
+    simulate_logit_with_tvc,
+    simulate_logit_with_covariates_and_tvc,
     make_two_group_logit,
     make_two_group_poisson,
     make_two_group_cnorm,
@@ -462,3 +465,171 @@ def test_single_group_data_selects_1():
         f"This is the Skardhamar over-grouping problem. "
         f"BIC (Nagin): {best['bic_nagin']:.2f}"
     )
+
+
+# ---------------------------------------------------------------------------
+# V3.0: mixing covariates (Gamma) and time-varying covariates (delta)
+# ---------------------------------------------------------------------------
+
+def test_logit_2group_mixing_covariate_recovery():
+    """Recovered Gamma (mixing-covariate coefficients) matches ground truth,
+    and pi_g(x) evaluated at representative covariate values matches the
+    simulated covariate-dependent group probabilities (not just point-estimate
+    closeness on Gamma itself, since pi is the user-facing quantity)."""
+    true_params = [
+        {'betas': [-1.5]},          # Group 1 (lower intercept -> sorted first)
+        {'betas': [1.0, -0.3]},     # Group 2
+    ]
+    gamma_matrix = [[0.0, 0.0], [0.2, 1.2]]  # theta_1(x) = 0.2 + 1.2*x
+    df, truth = simulate_logit_with_mixing_covariates(
+        n_subjects=800, time_points=T15, group_params=true_params,
+        gamma_matrix=gamma_matrix, cov_mean=0.0, cov_sd=1.0, seed=11,
+    )
+
+    m = run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=N_STARTS,
+                          baseline_cov_cols=['X1'])
+
+    assert m['result'].success or m['result'].status == 2
+    assert m['n_mix'] == 2
+
+    gamma_est = m['result'].x[0:2]  # (k-1)*n_mix = 1*2 = 2 params: [intercept, slope]
+    assert abs(gamma_est[0] - 0.2) < 0.5, f"Gamma intercept off: {gamma_est[0]:.3f} (true 0.2)"
+    assert abs(gamma_est[1] - 1.2) < 0.5, f"Gamma slope off: {gamma_est[1]:.3f} (true 1.2)"
+
+    # pi_1(x) at representative x values (k=2 -> softmax reduces to logistic(theta_1))
+    for x_val in (-1.0, 0.0, 1.0):
+        true_theta1 = 0.2 + 1.2 * x_val
+        true_pi1 = 1.0 / (1.0 + np.exp(-true_theta1))
+        est_theta1 = gamma_est[0] + gamma_est[1] * x_val
+        est_pi1 = 1.0 / (1.0 + np.exp(-est_theta1))
+        assert abs(est_pi1 - true_pi1) < 0.15, (
+            f"pi_1(x={x_val}) off: est={est_pi1:.3f}, true={true_pi1:.3f}"
+        )
+
+
+def test_logit_2group_tvc_recovery():
+    """Recovered delta (TVC deflection) matches ground truth per group, and
+    beta/assignment recovery is not degraded by the added TVC term (guards
+    against gradient-slot mix-ups between the beta and delta blocks)."""
+    true_params = [
+        {'betas': [-1.5]},
+        {'betas': [1.0, -0.3]},
+    ]
+    delta_true = [0.8, -1.0]
+    df, truth = simulate_logit_with_tvc(
+        n_subjects=800, time_points=T15, group_params=true_params,
+        group_proportions=[0.6, 0.4], delta_per_group=delta_true, tvc_sd=1.0, seed=13,
+    )
+
+    m = run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=N_STARTS, tvc_cols=['Z1'])
+
+    assert m['result'].success or m['result'].status == 2
+    assert m['n_tvc'] == 1
+
+    k, n_mix = 2, 1
+    num_betas = 1 + 2  # orders [0, 1] -> group0 has 1 coef, group1 has 2 coefs
+    delta_start = (k - 1) * n_mix + num_betas
+    delta_est = m['result'].x[delta_start: delta_start + k]
+
+    assert abs(delta_est[0] - delta_true[0]) < 0.5, f"delta_1 off: {delta_est[0]:.3f} (true {delta_true[0]})"
+    assert abs(delta_est[1] - delta_true[1]) < 0.5, f"delta_2 off: {delta_est[1]:.3f} (true {delta_true[1]})"
+
+    # Beta/assignment recovery not degraded by the added TVC term
+    assignments = get_subject_assignments(m, df)
+    acc = _assignment_accuracy(assignments, truth)
+    assert acc >= 0.80, f"Assignment accuracy degraded by TVC term: {acc:.1%}"
+
+
+def test_logit_2group_covariate_and_tvc_joint_recovery():
+    """Both new V3.0 blocks (Gamma and delta) recovered simultaneously — a
+    direct regression test for index-arithmetic bugs from inserting two new
+    blocks into the flat parameter vector at once."""
+    true_params = [
+        {'betas': [-1.5]},
+        {'betas': [1.0, -0.3]},
+    ]
+    gamma_matrix = [[0.0, 0.0], [0.2, 1.2]]
+    delta_true = [0.8, -1.0]
+    df, truth = simulate_logit_with_covariates_and_tvc(
+        n_subjects=1000, time_points=T15, group_params=true_params,
+        gamma_matrix=gamma_matrix, delta_per_group=delta_true,
+        cov_mean=0.0, cov_sd=1.0, tvc_sd=1.0, seed=17,
+    )
+
+    m = run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=N_STARTS,
+                          baseline_cov_cols=['X1'], tvc_cols=['Z1'])
+
+    assert m['result'].success or m['result'].status == 2
+    assert m['n_mix'] == 2 and m['n_tvc'] == 1
+
+    gamma_est = m['result'].x[0:2]
+    assert abs(gamma_est[0] - 0.2) < 0.6
+    assert abs(gamma_est[1] - 1.2) < 0.6
+
+    k, n_mix = 2, 2
+    num_betas = 1 + 2
+    delta_start = (k - 1) * n_mix + num_betas
+    delta_est = m['result'].x[delta_start: delta_start + k]
+    assert abs(delta_est[0] - delta_true[0]) < 0.6
+    assert abs(delta_est[1] - delta_true[1]) < 0.6
+
+
+def test_backward_compat_zero_covariates_matches_v15():
+    """Fitting with no covariates (default) vs. explicit empty covariate lists
+    must produce bit-identical results — the concrete regression guard for
+    V3.0's 'P=0, Q=0 reduces to V1.5.0 exactly' design invariant."""
+    df, _ = simulate_logit_trajectories(
+        n_subjects=300, time_points=T15,
+        group_params=[{'betas': [-1.5]}, {'betas': [1.0, -0.3]}],
+        group_proportions=[0.6, 0.4], seed=21,
+    )
+
+    m_old = run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=N_STARTS)
+    m_new = run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=N_STARTS,
+                              baseline_cov_cols=[], tvc_cols=[])
+
+    assert m_old['ll'] == pytest.approx(m_new['ll'], abs=1e-8)
+    assert np.allclose(m_old['result'].x, m_new['result'].x, atol=1e-8), (
+        "Parameter vectors differ between implicit and explicit no-covariate calls"
+    )
+    assert np.allclose(m_old['se_model'], m_new['se_model'], atol=1e-6)
+
+
+def test_null_mixing_covariate_does_not_destabilize():
+    """An irrelevant baseline covariate (no true effect on group membership)
+    should recover a near-zero Gamma slope and must not destabilize
+    convergence or assignment accuracy."""
+    df, truth = simulate_logit_trajectories(
+        n_subjects=500, time_points=T15,
+        group_params=[{'betas': [-1.5]}, {'betas': [1.0, -0.3]}],
+        group_proportions=[0.6, 0.4], seed=31,
+    )
+    rng = np.random.default_rng(999)
+    noise_by_id = {sid: rng.normal() for sid in df['ID'].unique()}
+    df = df.copy()
+    df['Noise'] = df['ID'].map(noise_by_id)
+
+    m = run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=N_STARTS,
+                          baseline_cov_cols=['Noise'])
+
+    assert m['result'].success or m['result'].status == 2
+    gamma_slope = m['result'].x[1]  # (k-1)*n_mix=2 params: [intercept, slope]
+    assert abs(gamma_slope) < 0.6, f"Null covariate slope spuriously large: {gamma_slope:.3f}"
+
+    assignments = get_subject_assignments(m, df)
+    acc = _assignment_accuracy(assignments, truth)
+    assert acc >= 0.80, f"Null covariate destabilized assignment accuracy: {acc:.1%}"
+
+
+def test_baseline_covariate_constancy_guard():
+    """A covariate that genuinely varies within subject must be rejected with
+    a clear error when supplied as a baseline covariate — it should be
+    supplied as a TVC instead. Regression test for the identifiability
+    guard in build_baseline_covariate_matrix."""
+    df, _ = simulate_logit_with_tvc(
+        n_subjects=50, time_points=T15,
+        group_params=[{'betas': [-1.5]}, {'betas': [1.0, -0.3]}],
+        group_proportions=[0.6, 0.4], delta_per_group=[0.5, -0.5], seed=41,
+    )
+    with pytest.raises(ValueError, match="varies within subject"):
+        run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=1, baseline_cov_cols=['Z1'])
