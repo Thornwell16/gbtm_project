@@ -7,6 +7,44 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### New Features
+
+- **~2.3x faster fitting via parallel multi-start restarts.** The three fitting entry points
+  (`run_single_model`, `run_autotraj`, `run_joint_dual_trajectory_model`) now run their multi-start
+  BFGS restarts concurrently via a thread pool instead of sequentially. Real parallelism (not just
+  concurrency) required marking the two top-level JIT kernels `nogil=True` so Numba actually
+  releases the GIL during each restart's optimization. Verified: 130s → 57s on a Cambridge
+  4-group/order-2 search with 5 restarts (8 CPUs) — full test suite still 52/52 passing, confirming
+  the parallel and sequential paths produce identical results.
+- **Live progress bar + Fit Log** for AutoTraj Search (model-by-model progress, not just a bare
+  spinner) and a "Fit Log" expander (in both AutoTraj/Single Model and Dual-Trajectory modes)
+  showing which multi-start restart won for each model — previously only visible via `print()` to
+  a console the deployed app's users never see.
+- **Data Quality Preview** — an expander shown right after column mapping (before running a
+  possibly slow fit) with subject/observation counts, wave-count balance, and an observations-per-
+  subject histogram, so problems are caught before waiting on a fit rather than after.
+- **Save/Reload Fitted Model** — a "💾 Save Fitted Model" download button bundles the fitted
+  model(s), data, and settings into a `.atmodel` file; a "Reload a previously saved model" uploader
+  restores full results instantly without refitting.
+- **One-click HTML report** — a self-contained, shareable HTML file (model summary, fitted
+  equations, parameter table, adequacy diagnostics, trajectory plot) generated alongside the
+  existing CSV/ZIP exports.
+- **Model comparison view** (AutoTraj Search) — a side-by-side comparison table across the top 10
+  valid models (BIC/AIC/groups/orders/condition number), plus a "pin models to compare" view that
+  renders selected models' trajectory plots side by side.
+- **Joint Mode exports** — CSV download buttons for the π matrix, contingency table, parameter
+  estimates, and subject assignments (previously only available for single-outcome models).
+- **Input-size guardrails** — warnings when a dataset is very large, or when an AutoTraj Search
+  specification implies a very large number of total optimizer runs, so users can rescope before
+  waiting on a long fit.
+- **Guided walkthroughs** — a collapsed "New here? 60-second walkthrough" panel in each mode with
+  mode-specific numbered steps.
+- **Pip-installable `autotraj` package** (`pyproject.toml` + `autotraj/__init__.py`) exposing the
+  engine's public API (`run_single_model`, `run_autotraj`, `run_joint_dual_trajectory_model`, etc.)
+  for use in scripts/notebooks without Streamlit — `pip install .` for the engine alone, or
+  `pip install ".[ui]"` to include the Streamlit app's dependencies. `main.py` itself is untouched
+  and remains directly importable exactly as before (no breaking change to existing tests/app.py).
+
 ### Fixes
 
 - **Critical: CNORM auto-detect bounds were silently broken in the UI.** The sidebar's CNORM

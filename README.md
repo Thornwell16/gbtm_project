@@ -56,6 +56,26 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Programmatic Usage (No UI)
+The engine has zero Streamlit dependency and is pip-installable on its own — useful for scripts,
+notebooks, or batch jobs that don't need the web UI:
+```bash
+pip install .              # installs the `autotraj` package (engine only: pandas/numpy/scipy/numba)
+pip install ".[ui]"        # add this instead if you also want to run the Streamlit app
+```
+```python
+import autotraj
+
+long_df = autotraj.prep_trajectory_data(wide_format_df)          # or build a long-format df directly
+model = autotraj.run_single_model(long_df, orders_list=[1, 1])   # 2-group linear LOGIT model
+assignments = autotraj.get_subject_assignments(model, long_df)
+
+# Dual-trajectory (joint) model:
+joint_model = autotraj.run_joint_dual_trajectory_model(df_y, df_z, orders_y=[1, 1], orders_z=[1, 1])
+```
+See MATH.md for the full mathematical reference and `autotraj/__init__.py` for the complete public
+API surface.
+
 ## Running Tests
 AutoTraj ships with a comprehensive pytest suite covering parameter recovery,
 the Cambridge benchmark, edge cases, and internal consistency.

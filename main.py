@@ -94,6 +94,8 @@ from scipy.stats import t as t_dist
 import itertools
 from numba import njit
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 # --- C-LEVEL MATH HELPERS FOR CNORM ---
 
@@ -820,7 +822,7 @@ def accumulate_single_outcome_gradient_jit(grad_outcome_row, params_outcome, tim
 
 # --- CORE LIKELIHOOD/GRADIENT ENGINE (UNIVERSAL) ---
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, n_mix, n_tvc, weights):
     """Compute total NLL, flat gradient, and per-subject gradient matrix in one pass.
 
@@ -1033,7 +1035,7 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
 
 # --- JOINT DUAL-TRAJECTORY ENGINE (V5.0) ---
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def calc_joint_dual_outcome_gradients_jit(
     params,
     times_y, outcomes_y, dropouts_y, subj_breaks_y, orders_y, use_dropout_y, dist_code_y, cnorm_min_y, cnorm_max_y,
@@ -2143,7 +2145,53 @@ def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outco
     return starts
 
 
-def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, n_starts=5, baseline_cov_cols=None, tvc_cols=None, weight_col=None):
+def _run_multistart(nll_fn, jac_fn, starts, args, max_workers=None):
+    """Run BFGS from every start in ``starts`` and return the best result.
+
+    Restarts are independent (each ``minimize`` call only touches its own
+    local state and the shared, read-only ``args`` tuple), so they run
+    concurrently via a thread pool. Real parallelism (not just concurrency)
+    requires the underlying JIT kernel to release the GIL during the call —
+    ``calc_universal_subject_gradients_jit``/``calc_joint_dual_outcome_gradients_jit``
+    are decorated ``nogil=True`` for exactly this reason. Falls back to
+    ``os.cpu_count()`` workers (capped at ``len(starts)``) when max_workers
+    is None.
+
+    Returns:
+        Tuple[OptimizeResult, float, int]: (best_result, best_nll, best_start_idx).
+        best_result is the last-attempted result if no start converged
+        (mirrors the previous sequential fallback behavior).
+    """
+    def _one(s_idx):
+        return s_idx, minimize(
+            nll_fn, starts[s_idx], args=args,
+            method='BFGS', jac=jac_fn, options={'maxiter': 3000, 'gtol': 1e-6}
+        )
+
+    n_workers = max_workers or min(len(starts), os.cpu_count() or 1)
+    best_result, best_nll, best_start_idx = None, np.inf, 0
+    last_result = None
+
+    if n_workers <= 1 or len(starts) <= 1:
+        for s_idx in range(len(starts)):
+            _, res = _one(s_idx)
+            last_result = res
+            if (res.success or res.status == 2) and res.fun < best_nll:
+                best_nll, best_result, best_start_idx = res.fun, res, s_idx
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            for s_idx, res in pool.map(_one, range(len(starts))):
+                last_result = res
+                if (res.success or res.status == 2) and res.fun < best_nll:
+                    best_nll, best_result, best_start_idx = res.fun, res, s_idx
+
+    if best_result is None:
+        best_result = last_result  # fallback: last attempted result
+
+    return best_result, best_nll, best_start_idx
+
+
+def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, n_starts=5, baseline_cov_cols=None, tvc_cols=None, weight_col=None, log_callback=None):
     """Fit a single GBTM model with a fixed group count and polynomial order specification.
 
     Runs n_starts independent BFGS optimisations from different starting
@@ -2171,6 +2219,8 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
                      sampling weight (V4.0). None = unweighted (V3.0-equivalent).
                      Robust (Huber-White) SEs are the valid inference basis
                      once weights are used; model-based SEs are reference only.
+        log_callback: optional callable(str) invoked with progress messages
+                     (e.g. which multi-start restart won) instead of print().
 
     Returns:
         dict with keys:
@@ -2233,25 +2283,13 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
 
     starts = generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=n_starts, n_mix=n_mix, n_tvc=n_tvc)
 
-    best_result = None
-    best_nll = np.inf
-    best_start_idx = 0
+    best_result, best_nll, best_start_idx = _run_multistart(calc_nll_wrapper, calc_jac_wrapper, starts, args)
 
-    for s_idx, initial_guess in enumerate(starts):
-        res = minimize(
-            calc_nll_wrapper, initial_guess, args=args,
-            method='BFGS', jac=calc_jac_wrapper, options={'maxiter': 3000, 'gtol': 1e-6}
-        )
-        if (res.success or res.status == 2) and res.fun < best_nll:
-            best_nll = res.fun
-            best_result = res
-            best_start_idx = s_idx
-
-    if best_result is None:
-        best_result = res  # fallback: last attempted result
-
+    msg = None
     if best_start_idx > 0:
-        print(f"  [multi-start] single model {orders_list}: best on start {best_start_idx + 1}/{n_starts} (NLL={best_nll:.4f})")
+        msg = f"  [multi-start] single model {orders_list}: best on start {best_start_idx + 1}/{n_starts} (NLL={best_nll:.4f})"
+    if log_callback and msg: log_callback(msg)
+    elif msg: print(msg)
 
     result = best_result
     is_valid, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num, v_model = process_optimization_result(
@@ -2275,7 +2313,7 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
         'n_mix': n_mix, 'n_tvc': n_tvc, 'weight_col': weight_col,
     }
 
-def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, zip_iorder=0, n_starts=3, baseline_cov_cols=None, tvc_cols=None, weight_col=None):
+def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, zip_iorder=0, n_starts=3, baseline_cov_cols=None, tvc_cols=None, weight_col=None, progress_callback=None, log_callback=None):
     """Exhaustive automated search over all (k, orders) combinations.
 
     Evaluates every combination of group count and polynomial orders within
@@ -2326,6 +2364,11 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         weight_col:    optional column name in df giving a per-subject survey/
                        sampling weight (V4.0). None = unweighted
                        (V3.0-equivalent).
+        progress_callback: optional callable(current, total, orders_list)
+                       invoked after each (k, orders) combination is
+                       evaluated, for driving a UI progress bar.
+        log_callback:  optional callable(str) invoked with progress messages
+                       instead of print().
 
     Returns:
         Tuple[List[dict], List[dict]]:
@@ -2376,25 +2419,14 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max), baseline_X, tvc_Z, weights)
         starts = generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=n_starts, n_mix=n_mix, n_tvc=n_tvc)
 
-        best_result = None
-        best_nll = np.inf
-        best_start_idx = 0
-
-        for s_idx, initial_guess in enumerate(starts):
-            res = minimize(
-                calc_nll_wrapper, initial_guess, args=args,
-                method='BFGS', jac=calc_jac_wrapper, options={'maxiter': 3000, 'gtol': 1e-6}
-            )
-            if (res.success or res.status == 2) and res.fun < best_nll:
-                best_nll = res.fun
-                best_result = res
-                best_start_idx = s_idx
-
-        if best_result is None:
-            best_result = res  # fallback: last attempted result
+        best_result, best_nll, best_start_idx = _run_multistart(calc_nll_wrapper, calc_jac_wrapper, starts, args)
 
         if best_start_idx > 0:
-            print(f"  [multi-start] autotraj {orders_list}: best on start {best_start_idx + 1}/{n_starts} (NLL={best_nll:.4f})")
+            msg = f"  [multi-start] autotraj {orders_list}: best on start {best_start_idx + 1}/{n_starts} (NLL={best_nll:.4f})"
+            if log_callback: log_callback(msg)
+            else: print(msg)
+
+        if progress_callback: progress_callback(i + 1, len(all_combinations), orders_list)
 
         result = best_result
         is_converged, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num, v_model = process_optimization_result(
@@ -2577,7 +2609,7 @@ def generate_joint_initial_params(k_y, k_z, orders_y, orders_z, use_dropout_y, d
 def run_joint_dual_trajectory_model(df_y, df_z, orders_y, orders_z, dist_y='LOGIT', dist_z='LOGIT',
                                      use_dropout_y=False, use_dropout_z=False,
                                      cnorm_min_y=0.0, cnorm_max_y=0.0, cnorm_min_z=0.0, cnorm_max_z=0.0,
-                                     n_starts=5):
+                                     n_starts=5, log_callback=None):
     """Fit a V5.0 Nagin-style joint dual-trajectory model.
 
     Two outcomes Y and Z, each with its own independent GBTM structure (own
@@ -2601,6 +2633,8 @@ def run_joint_dual_trajectory_model(df_y, df_z, orders_y, orders_z, dist_y='LOGI
                      (auto-set to observed min/max if NaN, same as
                      run_single_model).
         n_starts:    multi-start random restarts (default 5).
+        log_callback: optional callable(str) invoked with progress messages
+                     instead of print().
 
     Returns:
         dict with keys:
@@ -2648,25 +2682,12 @@ def run_joint_dual_trajectory_model(df_y, df_z, orders_y, orders_z, dist_y='LOGI
     starts = generate_joint_initial_params(k_y, k_z, orders_y, orders_z, use_dropout_y, dist_y, outcomes_y,
                                             use_dropout_z, dist_z, outcomes_z, n_starts=n_starts)
 
-    best_result = None
-    best_nll = np.inf
-    best_start_idx = 0
-
-    for s_idx, initial_guess in enumerate(starts):
-        res = minimize(
-            calc_joint_nll_wrapper, initial_guess, args=args,
-            method='BFGS', jac=calc_joint_jac_wrapper, options={'maxiter': 3000, 'gtol': 1e-6}
-        )
-        if (res.success or res.status == 2) and res.fun < best_nll:
-            best_nll = res.fun
-            best_result = res
-            best_start_idx = s_idx
-
-    if best_result is None:
-        best_result = res  # fallback: last attempted result
+    best_result, best_nll, best_start_idx = _run_multistart(calc_joint_nll_wrapper, calc_joint_jac_wrapper, starts, args)
 
     if best_start_idx > 0:
-        print(f"  [multi-start] joint model Y{orders_y}/Z{orders_z}: best on start {best_start_idx + 1}/{n_starts} (NLL={best_nll:.4f})")
+        msg = f"  [multi-start] joint model Y{orders_y}/Z{orders_z}: best on start {best_start_idx + 1}/{n_starts} (NLL={best_nll:.4f})"
+        if log_callback: log_callback(msg)
+        else: print(msg)
 
     result = best_result
     is_valid, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis_joint, cond_num, v_model = process_joint_optimization_result(
