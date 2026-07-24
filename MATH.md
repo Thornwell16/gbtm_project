@@ -8,6 +8,11 @@ predictor to include time-varying covariates (TVC). Setting the number of baseli
 $P=0$ and the number of TVCs $Q=0$ recovers the V1.5.0 model **exactly** (same parameter count,
 same values) — V3.0 is a strict superset, not a breaking change.
 
+**V4.0 note:** Section 1 also describes an optional per-subject survey/sampling weight $w_i$,
+scaling each subject's contribution to the log-likelihood (and hence the gradient). Unlike V3.0,
+this adds **no new parameters** to $\theta$ — it is a pure likelihood-level device. Setting
+$w_i \equiv 1$ for all subjects recovers the unweighted (V3.0) model **exactly**.
+
 ---
 
 ## Table of Contents
@@ -69,6 +74,22 @@ $$\ell(\theta) = \sum_{i=1}^{N} \log P(\mathbf{y}_i) = \sum_{i=1}^{N} \log \left
 
 This is the objective function maximised by the BFGS optimizer.
 
+**V4.0 extension — survey/sampling weights.** When each subject $i$ carries a survey/sampling
+weight $w_i > 0$ (e.g. an inverse-probability-of-selection weight), the objective generalizes to
+the **weighted** total log-likelihood:
+
+$$\ell_w(\theta) = \sum_{i=1}^{N} w_i \cdot \log P(\mathbf{y}_i)$$
+
+By linearity of differentiation, $\partial \ell_w / \partial\theta = \sum_i w_i \cdot \partial \ell_i/\partial\theta$
+— every gradient formula in Section 4 applies **completely unchanged** to each subject's own
+contribution $\ell_i$; only the per-subject contribution (both to the objective and to the
+gradient) is scaled by $w_i$ before summing. Setting $w_i \equiv 1$ for all subjects recovers
+$\ell(\theta)$ exactly. This is a weighted **pseudo-MLE** (Binder, 1983) — see Section 5d for the
+corresponding variance estimator, which is the *required* basis for inference under weighting, not
+merely an optional cross-check. AutoTraj does not model stratification or clustering (PSU) design
+effects — only independent-observations inverse-probability weighting is supported; this is a
+documented limitation, not a solved problem.
+
 ### Posterior Group Probabilities
 
 By Bayes' theorem, the posterior probability that subject $i$ belongs to group $g$ given their observed trajectory is:
@@ -76,6 +97,9 @@ By Bayes' theorem, the posterior probability that subject $i$ belongs to group $
 $$P(g \mid i) = \frac{\pi_g(x_i) \cdot P(\mathbf{y}_i \mid g)}{\sum_{g'=0}^{K-1} \pi_{g'}(x_i) \cdot P(\mathbf{y}_i \mid g')}$$
 
 These posterior probabilities are used in gradient computations and all post-estimation adequacy metrics.
+Note that $P(g\mid i)$ itself does **not** depend on $w_i$ — survey weights only affect
+*estimation* of $\theta$ (via the weighted objective above), not the Bayes'-rule posterior formula
+evaluated at a given $\theta$.
 
 ---
 
@@ -265,6 +289,12 @@ $$L_i = \log \sum_{g=0}^{K-1} \exp\!\left(\log \pi_g(x_i) + \sum_t \ell_{igt}\ri
 
 Gradients of $L_i$ with respect to $\theta$ propagate through the softmax and the per-observation likelihoods via the posterior weights $P(g \mid i)$.
 
+**V4.0 note:** every gradient formula below is a formula for $\partial \ell_i/\partial\theta$ (a
+single subject's contribution). Under survey weighting (Section 1), the total gradient is
+$\sum_i w_i \cdot \partial \ell_i/\partial\theta$ — each subject's *entire* gradient row (every
+block: $\Gamma$, $\beta$, $\delta$, dropout $\gamma$, $\text{raw}\_\sigma$/$\zeta$) is scaled by
+that subject's $w_i$ once, after being fully assembled; no per-block formula below changes.
+
 ---
 
 ### 4a. Mixing Covariate (Gamma) Gradient
@@ -414,6 +444,13 @@ $$\mathrm{SE}_{\text{model}} = \sqrt{\left|\operatorname{diag}(V_{\text{model}})
 
 The absolute value is taken element-wise to guard against small negative diagonal entries due to numerical imprecision.
 
+**V4.0 note:** under survey weighting, $H$ is the Hessian of the *weighted* NLL
+$-\ell_w(\theta)$, so $V_{\text{model}}$ is a weighted information-matrix inverse — but this
+naive "model-based" SE is **not** a valid/consistent variance estimator under weighting (Binder,
+1983; Skinner, Holt & Smith, 1989), since it ignores the weighting design entirely. It is
+retained here only for reference/diagnostic display; see Section 5d for the required estimator
+once weights are used.
+
 ---
 
 ### 5d. Huber-White Sandwich Estimator (Robust SEs)
@@ -432,6 +469,19 @@ $$\mathrm{SE}_{\text{robust}} = \sqrt{\operatorname{diag}(V_{\text{robust}})}$$
 
 The sandwich estimator is consistent under misspecification of the within-subject correlation structure and heteroskedasticity (White, 1980).
 
+**V4.0 extension — weighted sandwich variance.** Under survey weighting (Section 1), the
+implementation's per-subject score $\mathbf{g}_i$ is *already* the weighted score
+$w_i \cdot \nabla_\theta \ell_i(\hat\theta)$ (Section 4's weighting note), so the same formula
+above automatically yields:
+
+$$G = \sum_{i=1}^{N} (w_i \mathbf{g}_i)(w_i \mathbf{g}_i)^\top = \sum_{i=1}^{N} w_i^2\, \mathbf{g}_i \mathbf{g}_i^\top$$
+
+— exactly the standard Binder-type weighted-pseudo-MLE sandwich ("meat"), with **no separate
+computation required**. This is the *required* basis for valid inference once weights are used
+(see the Section 5c note); AutoTraj does not implement the additional stratum/PSU Taylor-series
+linearization terms of a full complex-survey design (`svydesign`-style variance) — only
+independent-observations IPW is supported.
+
 ---
 
 ## 6. BIC and AIC Formulas
@@ -439,9 +489,17 @@ The sandwich estimator is consistent under misspecification of the within-subjec
 AutoTraj reports **two parallel conventions**. They are equivalent for model selection (same ordering) but differ in sign and scaling.
 
 Let:
-- $\ell = \ell(\hat\theta)$ — maximised log-likelihood
+- $\ell = \ell(\hat\theta)$ — maximised log-likelihood (or $\ell_w(\hat\theta)$, the weighted
+  log-likelihood, when survey weights are used — see V4.0 note below)
 - $p$ — total number of free parameters (dimension of $\theta$; as of V3.0 this includes the $\Gamma$ and $\delta$ blocks when present)
 - $N$ — number of **subjects** (not observations)
+
+**V4.0 note:** under survey weighting, AutoTraj plugs the *weighted* $\ell_w$ directly into the
+formulas below with $N$ and $p$ left as the raw (unweighted) subject count and parameter count —
+a simplification consistent with common practice in weighted-GBTM software, not a fully resolved
+theoretical question (an "effective sample size" adjustment, e.g. Kish's design effect, is a
+documented open alternative AutoTraj does not implement). BIC/AIC-based model selection under
+weighting should be interpreted with this caveat in mind.
 
 ---
 

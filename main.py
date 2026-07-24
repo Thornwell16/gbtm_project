@@ -377,6 +377,57 @@ def build_baseline_covariate_matrix(df, baseline_cov_cols, id_col='ID'):
     return np.ascontiguousarray(X, dtype=np.float64)
 
 
+def extract_weights_array(df, weight_col, id_col='ID'):
+    """Build the (N_subjects,) per-subject survey/sampling weight array (V4.0).
+
+    Row order matches subj_breaks from extract_flat_arrays: subjects in order of
+    first appearance in the (already ID-sorted, contiguous-per-subject) df.
+
+    Survey weights are inherently per-subject (each sampled unit gets one weight),
+    so — like baseline covariates — a weight column is validated to be
+    time-invariant (constant within each subject), and strictly positive (an
+    inverse-probability weight of zero or less is not meaningful; users who want
+    to exclude a subject should filter that row out instead).
+
+    Args:
+        df:         Long-format DataFrame (same one passed to extract_flat_arrays).
+        weight_col: Column name to use as the survey weight, or None for the
+                    unweighted (all-ones) case.
+        id_col:     Name of the subject-ID column (default 'ID').
+
+    Returns:
+        np.ndarray: (N_subjects,) C-contiguous float64 weight array. With
+            weight_col=None, returns ones(N_subjects) — the V3.0-equivalent
+            default consumed by calc_universal_subject_gradients_jit.
+    """
+    ids = df[id_col].values
+    subject_order = pd.unique(ids)  # order of first appearance (matches subj_breaks)
+    n_subjects = len(subject_order)
+
+    if weight_col is None:
+        return np.ones(n_subjects, dtype=np.float64)
+
+    grouped = df.groupby(id_col, sort=False)
+    n_unique = grouped[weight_col].nunique(dropna=True)
+    offending = n_unique.index[n_unique > 1].tolist()
+    if offending:
+        raise ValueError(
+            f"Weight column '{weight_col}' varies within subject for "
+            f"{len(offending)} subject(s) (e.g. ID={offending[0]!r}) — survey "
+            f"weights must be time-invariant (one weight per sampled subject)."
+        )
+
+    weights = grouped[weight_col].first().reindex(subject_order).values.astype(np.float64)
+    if np.any(weights <= 0.0) or np.any(np.isnan(weights)):
+        bad_ids = subject_order[np.where((weights <= 0.0) | np.isnan(weights))[0]][:5].tolist()
+        raise ValueError(
+            f"Weight column '{weight_col}' must be strictly positive for every "
+            f"subject; found non-positive or missing values (e.g. ID(s)={bad_ids})."
+        )
+
+    return np.ascontiguousarray(weights, dtype=np.float64)
+
+
 @njit(cache=True)
 def create_design_matrix_jit(times, order):
     """Build a polynomial design matrix X of shape (n, order+1).
@@ -444,7 +495,7 @@ def logsumexp_jit(a):
 # --- CORE LIKELIHOOD/GRADIENT ENGINE (UNIVERSAL) ---
 
 @njit(cache=True)
-def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, n_mix, n_tvc):
+def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, n_mix, n_tvc, weights):
     """Compute total NLL, flat gradient, and per-subject gradient matrix in one pass.
 
     This is the single performance-critical kernel that drives every model fit.
@@ -497,6 +548,10 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
                      Pass zeros((N_obs, 0)) for the no-TVC case.
         n_mix:       int — number of mixing-covariate columns (P+1, incl. intercept).
         n_tvc:       int — number of time-varying covariates (Q).
+        weights:     (N_subjects,) float64 — per-subject survey/sampling weight (V4.0).
+                     Pass ones(N_subjects) for the unweighted (V3.0-equivalent) case.
+                     Scales subject i's entire NLL and gradient-row contribution;
+                     adds no new parameters to theta (MATH.md §1 weighted-likelihood note).
 
     Returns:
         Tuple[float, np.ndarray, np.ndarray]:
@@ -757,8 +812,9 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
                 for p in range(n_mix):
                     grad_subj[i, gamma_row_start + p] = diff * baseline_X[i, p]
 
-        # Add log-marginal-likelihood for subject i to running total
-        total_ll += (post_max + np.log(post_sum_exp))
+        # Add log-marginal-likelihood for subject i to running total, scaled by
+        # the subject's survey/sampling weight (V4.0; weights[i]==1.0 by default)
+        total_ll += weights[i] * (post_max + np.log(post_sum_exp))
 
         # ── BETA / DELTA / GAMMA / AUX GRADIENT ACCUMULATION ───────────────────
         # Second pass over groups: accumulate weighted score gradients now that
@@ -818,7 +874,16 @@ def calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj
                     grad_subj[i, current_gamma_idx + 2] += -1.0 * err_drop * y_last
                 current_gamma_idx += 3
             current_beta_idx += n_betas
-            
+
+        # V4.0: scale subject i's ENTIRE gradient row by its survey/sampling weight,
+        # once, after all blocks (Gamma, beta, delta, aux, dropout) have been
+        # accumulated above. Scaling once here (rather than threading weights[i]
+        # into every accumulation site) is deliberate: the Gamma-block line
+        # (main.py ~758) uses assignment (=) not +=, so a single post-hoc
+        # row-scale is the only safe way to guarantee every block is covered.
+        for j in range(len(params)):
+            grad_subj[i, j] *= weights[i]
+
     # Sum per-subject gradients into the flat Jacobian vector
     grad_flat = np.zeros(len(params))
     for i in range(grad_subj.shape[0]):
@@ -851,7 +916,22 @@ def _resolve_covariate_arrays(n_subjects, n_obs, baseline_X, tvc_Z):
     return baseline_X, tvc_Z
 
 
-def calc_nll_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None):
+def _resolve_weights_array(n_subjects, weights):
+    """Resolve an optional per-subject weight array to its unweighted (V3.0-equivalent) default.
+
+    This is the single source of truth for V4.0's backward-compatibility guarantee:
+    omitting weights (or passing None) defaults to ones(n_subjects), so every caller
+    that doesn't supply weights gets numerically identical behaviour to V3.0.
+
+    Returns:
+        np.ndarray: (n_subjects,) C-contiguous float64 weight array.
+    """
+    if weights is None:
+        return np.ones(n_subjects, dtype=np.float64)
+    return np.ascontiguousarray(weights, dtype=np.float64)
+
+
+def calc_nll_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None, weights=None):
     """NLL-only callable for SciPy minimise (discards gradient and per-subject matrix).
 
     This wrapper has the exact signature expected by scipy.optimize.minimize
@@ -873,38 +953,46 @@ def calc_nll_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip
                      (V3.0). Defaults to intercept-only (no covariates).
         tvc_Z:       optional (N_obs, n_tvc) time-varying covariate matrix (V3.0).
                      Defaults to empty (no TVCs).
+        weights:     optional (N_subjects,) survey/sampling weight array (V4.0).
+                     Defaults to ones (unweighted).
 
     Returns:
         float: Negative log-likelihood (scalar to minimise).
     """
-    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
-    nll, _, _ = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1])
+    n_subjects = len(subj_breaks) - 1
+    baseline_X, tvc_Z = _resolve_covariate_arrays(n_subjects, len(times), baseline_X, tvc_Z)
+    weights = _resolve_weights_array(n_subjects, weights)
+    nll, _, _ = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1], weights)
     return nll
 
-def calc_jac_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None):
+def calc_jac_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None, weights=None):
     """Jacobian-only callable for SciPy minimise (discards NLL and per-subject matrix).
 
     Passed as the ``jac`` argument to scipy.optimize.minimize so that BFGS
     uses the analytical gradient rather than finite-difference approximation.
-    See calc_nll_wrapper for the meaning of baseline_X/tvc_Z (V3.0).
+    See calc_nll_wrapper for the meaning of baseline_X/tvc_Z (V3.0) and weights (V4.0).
 
     Returns:
         np.ndarray: (p,) gradient of the NLL with respect to params.
     """
-    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
-    _, grad_flat, _ = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1])
+    n_subjects = len(subj_breaks) - 1
+    baseline_X, tvc_Z = _resolve_covariate_arrays(n_subjects, len(times), baseline_X, tvc_Z)
+    weights = _resolve_weights_array(n_subjects, weights)
+    _, grad_flat, _ = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1], weights)
     return grad_flat
 
-def calc_grad_subj_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None):
+def calc_grad_subj_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None, weights=None):
     """Per-subject-gradient-only callable (used to build the Huber-White sandwich G matrix).
 
-    See calc_nll_wrapper for the meaning of baseline_X/tvc_Z (V3.0).
+    See calc_nll_wrapper for the meaning of baseline_X/tvc_Z (V3.0) and weights (V4.0).
 
     Returns:
         np.ndarray: (N_subjects, p) per-subject gradient matrix.
     """
-    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
-    _, _, grad_subj = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1])
+    n_subjects = len(subj_breaks) - 1
+    baseline_X, tvc_Z = _resolve_covariate_arrays(n_subjects, len(times), baseline_X, tvc_Z)
+    weights = _resolve_weights_array(n_subjects, weights)
+    _, _, grad_subj = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1], weights)
     return grad_subj
 
 # --- DISTRIBUTION-SPECIFIC PUBLIC ALIASES ---
@@ -912,49 +1000,57 @@ def calc_grad_subj_wrapper(params, times, outcomes, dropouts, subj_breaks, order
 # These thin wrappers expose the expected function names for external consumers
 # (e.g. verification scripts, notebooks) without duplicating any math.
 
-def calc_poisson_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0, baseline_X=None, tvc_Z=None):
+def calc_poisson_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0, baseline_X=None, tvc_Z=None, weights=None):
     """NLL for Poisson trajectories — delegates to universal engine (dist_code=2)."""
-    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
+    n_subjects = len(subj_breaks) - 1
+    baseline_X, tvc_Z = _resolve_covariate_arrays(n_subjects, len(times), baseline_X, tvc_Z)
+    weights = _resolve_weights_array(n_subjects, weights)
     nll, _, _ = calc_universal_subject_gradients_jit(
         params, times, outcomes, dropouts, subj_breaks, orders,
         int(zip_iorder), use_dropout, 2, float(cnorm_min), float(cnorm_max),
-        baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1]
+        baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1], weights
     )
     return nll
 
-def calc_poisson_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0, baseline_X=None, tvc_Z=None):
+def calc_poisson_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0, baseline_X=None, tvc_Z=None, weights=None):
     """Gradient for Poisson trajectories — delegates to universal engine (dist_code=2)."""
-    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
+    n_subjects = len(subj_breaks) - 1
+    baseline_X, tvc_Z = _resolve_covariate_arrays(n_subjects, len(times), baseline_X, tvc_Z)
+    weights = _resolve_weights_array(n_subjects, weights)
     _, grad, _ = calc_universal_subject_gradients_jit(
         params, times, outcomes, dropouts, subj_breaks, orders,
         int(zip_iorder), use_dropout, 2, float(cnorm_min), float(cnorm_max),
-        baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1]
+        baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1], weights
     )
     return grad
 
-def calc_zip_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0, baseline_X=None, tvc_Z=None):
+def calc_zip_dynamic_nll_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0, baseline_X=None, tvc_Z=None, weights=None):
     """NLL for ZIP trajectories — delegates to universal engine (dist_code=3)."""
-    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
+    n_subjects = len(subj_breaks) - 1
+    baseline_X, tvc_Z = _resolve_covariate_arrays(n_subjects, len(times), baseline_X, tvc_Z)
+    weights = _resolve_weights_array(n_subjects, weights)
     nll, _, _ = calc_universal_subject_gradients_jit(
         params, times, outcomes, dropouts, subj_breaks, orders,
         int(zip_iorder), use_dropout, 3, float(cnorm_min), float(cnorm_max),
-        baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1]
+        baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1], weights
     )
     return nll
 
-def calc_zip_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0, baseline_X=None, tvc_Z=None):
+def calc_zip_dynamic_jacobian_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, cnorm_min=0.0, cnorm_max=0.0, baseline_X=None, tvc_Z=None, weights=None):
     """Gradient for ZIP trajectories — delegates to universal engine (dist_code=3)."""
-    baseline_X, tvc_Z = _resolve_covariate_arrays(len(subj_breaks) - 1, len(times), baseline_X, tvc_Z)
+    n_subjects = len(subj_breaks) - 1
+    baseline_X, tvc_Z = _resolve_covariate_arrays(n_subjects, len(times), baseline_X, tvc_Z)
+    weights = _resolve_weights_array(n_subjects, weights)
     _, grad, _ = calc_universal_subject_gradients_jit(
         params, times, outcomes, dropouts, subj_breaks, orders,
         int(zip_iorder), use_dropout, 3, float(cnorm_min), float(cnorm_max),
-        baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1]
+        baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1], weights
     )
     return grad
 
 # --- ENGINE WRAPPERS ---
 
-def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None):
+def process_optimization_result(result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None, weights=None):
     """Post-process a SciPy OptimizeResult: compute SEs, BIC/AIC, and mixture weights.
 
     This function is called immediately after each SciPy BFGS optimisation.
@@ -992,6 +1088,8 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
                       (V3.0). Defaults to intercept-only (no covariates).
         tvc_Z:        optional (N_obs, n_tvc) time-varying covariate matrix (V3.0).
                       Defaults to empty (no TVCs).
+        weights:      optional (N_subjects,) survey/sampling weight array (V4.0).
+                      Defaults to ones (unweighted).
 
     Returns:
         Tuple of 12 elements:
@@ -1015,6 +1113,7 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
     dist_map = {'LOGIT': 0, 'CNORM': 1, 'POISSON': 2, 'ZIP': 3}
     dist_code = dist_map.get(dist, 0)
     baseline_X, tvc_Z = _resolve_covariate_arrays(n_subjects, n_obs, baseline_X, tvc_Z)
+    weights = _resolve_weights_array(n_subjects, weights)
     n_mix = baseline_X.shape[1]
     n_tvc = tvc_Z.shape[1]
     num_betas = sum(order + 1 for order in orders_list)
@@ -1057,8 +1156,8 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
             p_minus = np.copy(result.x)
             p_plus[i] += eps_i
             p_minus[i] -= eps_i
-            g_plus = calc_jac_wrapper(p_plus, *args)
-            g_minus = calc_jac_wrapper(p_minus, *args)
+            g_plus = calc_jac_wrapper(p_plus, *args, weights=weights)
+            g_minus = calc_jac_wrapper(p_minus, *args, weights=weights)
             H_scaled[i, :] = (g_plus - g_minus) / (2.0 * eps_i)
 
         H_scaled = (H_scaled + H_scaled.T) / 2.0
@@ -1070,7 +1169,7 @@ def process_optimization_result(result, num_params, times, outcomes, dropouts, s
 
         H_inv_scaled = np.linalg.pinv(H_scaled, rcond=1e-10)
 
-        _, _, grad_subj_scaled = calc_universal_subject_gradients_jit(result.x, *args, n_mix, n_tvc)
+        _, _, grad_subj_scaled = calc_universal_subject_gradients_jit(result.x, *args, n_mix, n_tvc, weights)
         G_scaled = grad_subj_scaled.T @ grad_subj_scaled
         V_robust_scaled = H_inv_scaled @ G_scaled @ H_inv_scaled
     except Exception:
@@ -1364,7 +1463,7 @@ def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outco
     return starts
 
 
-def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, n_starts=5, baseline_cov_cols=None, tvc_cols=None):
+def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, n_starts=5, baseline_cov_cols=None, tvc_cols=None, weight_col=None):
     """Fit a single GBTM model with a fixed group count and polynomial order specification.
 
     Runs n_starts independent BFGS optimisations from different starting
@@ -1388,6 +1487,10 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
         tvc_cols:    optional list of column names in df to use as time-varying
                      covariates in the trajectory equation (V3.0). None/[] =
                      no TVCs (V1.5.0-equivalent).
+        weight_col:  optional column name in df giving a per-subject survey/
+                     sampling weight (V4.0). None = unweighted (V3.0-equivalent).
+                     Robust (Huber-White) SEs are the valid inference basis
+                     once weights are used; model-based SEs are reference only.
 
     Returns:
         dict with keys:
@@ -1414,6 +1517,7 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
             'tvc_cols'           : list — TVC column names used (V3.0).
             'n_mix'              : int — mixing-covariate block width (P+1).
             'n_tvc'              : int — number of TVCs (Q).
+            'weight_col'         : str or None — survey weight column used (V4.0).
     """
     times, outcomes, dropouts, subj_breaks = extract_flat_arrays(df)
     n_subjects = len(subj_breaks) - 1
@@ -1425,6 +1529,7 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
     tvc_cols = list(tvc_cols) if tvc_cols else []
     baseline_X = build_baseline_covariate_matrix(df, baseline_cov_cols)
     tvc_Z = extract_tvc_array(df, tvc_cols)
+    weights = extract_weights_array(df, weight_col)
     n_mix = baseline_X.shape[1]
     n_tvc = tvc_Z.shape[1]
 
@@ -1439,7 +1544,7 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
     orders_arr = np.array(orders_list, dtype=np.int32)
     k = len(orders_list)
 
-    args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max), baseline_X, tvc_Z)
+    args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max), baseline_X, tvc_Z, weights)
     num_betas = sum(order + 1 for order in orders_list)
     num_params = (k - 1) * n_mix + num_betas + k * n_tvc
     if use_dropout: num_params += (3 * k)
@@ -1471,7 +1576,7 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
     result = best_result
     is_valid, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num, v_model = process_optimization_result(
         result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max,
-        baseline_X, tvc_Z
+        baseline_X, tvc_Z, weights
     )
 
     if is_valid:
@@ -1487,10 +1592,10 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
         'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust,
         'dof': n_obs - num_params, 'cond_num': cond_num, 'dist': dist, 'cnorm_min': cnorm_min, 'cnorm_max': cnorm_max,
         'v_model': v_model, 'baseline_cov_cols': baseline_cov_cols, 'tvc_cols': tvc_cols,
-        'n_mix': n_mix, 'n_tvc': n_tvc,
+        'n_mix': n_mix, 'n_tvc': n_tvc, 'weight_col': weight_col,
     }
 
-def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, zip_iorder=0, n_starts=3, baseline_cov_cols=None, tvc_cols=None):
+def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_group_pct=5.0, p_val_thresh=0.05, use_dropout=False, dist='LOGIT', cnorm_min=0.0, cnorm_max=0.0, zip_iorder=0, n_starts=3, baseline_cov_cols=None, tvc_cols=None, weight_col=None):
     """Exhaustive automated search over all (k, orders) combinations.
 
     Evaluates every combination of group count and polynomial orders within
@@ -1538,6 +1643,9 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         tvc_cols:      optional list of column names in df to use as
                        time-varying covariates in the trajectory equation
                        (V3.0). None/[] = no TVCs (V1.5.0-equivalent).
+        weight_col:    optional column name in df giving a per-subject survey/
+                       sampling weight (V4.0). None = unweighted
+                       (V3.0-equivalent).
 
     Returns:
         Tuple[List[dict], List[dict]]:
@@ -1558,6 +1666,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
     tvc_cols = list(tvc_cols) if tvc_cols else []
     baseline_X = build_baseline_covariate_matrix(df, baseline_cov_cols)
     tvc_Z = extract_tvc_array(df, tvc_cols)
+    weights = extract_weights_array(df, weight_col)
     n_mix = baseline_X.shape[1]
     n_tvc = tvc_Z.shape[1]
 
@@ -1584,7 +1693,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         if dist == 'CNORM': num_params += 1
         if dist == 'ZIP': num_params += k  # one zeta per group
 
-        args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max), baseline_X, tvc_Z)
+        args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max), baseline_X, tvc_Z, weights)
         starts = generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=n_starts, n_mix=n_mix, n_tvc=n_tvc)
 
         best_result = None
@@ -1610,7 +1719,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         result = best_result
         is_converged, ll, aic_nagin, bic_nagin, bic_obs, aic_standard, bic_standard, se_model, se_robust, pis, cond_num, v_model = process_optimization_result(
             result, num_params, times, outcomes, dropouts, subj_breaks, orders_list, zip_iorder, use_dropout, scale_factor, dist, cnorm_min, cnorm_max,
-            baseline_X, tvc_Z
+            baseline_X, tvc_Z, weights
         )
 
         if is_converged:
@@ -1665,7 +1774,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
                     'orders': orders_list, 'zip_iorder': zip_iorder, 'result': result, 'min_pct': min_group_size,
                     'pis': pis, 'use_dropout': use_dropout, 'se_model': se_model, 'se_robust': se_robust, 'dof': dof, 'cond_num': cond_num, 'dist': dist, 'cnorm_min': cnorm_min, 'cnorm_max': cnorm_max,
                     'v_model': v_model, 'baseline_cov_cols': baseline_cov_cols, 'tvc_cols': tvc_cols,
-                    'n_mix': n_mix, 'n_tvc': n_tvc,
+                    'n_mix': n_mix, 'n_tvc': n_tvc, 'weight_col': weight_col,
                 })
         else:
             all_evaluated_models.append({

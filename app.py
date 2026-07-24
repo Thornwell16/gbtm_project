@@ -1086,9 +1086,18 @@ else:
 
     baseline_cov_cols = []
     tvc_cols = []
+    weight_col = None
     if raw_df is not None:
-        reserved_cols = {str(id_col), str(outcome_col), str(time_col)}
-        candidate_cols = [c for c in raw_df.columns if str(c) not in reserved_cols]
+        if data_format == "Wide Format" or st.session_state.use_sample_data:
+            # outcome_col/time_col are stub *prefixes* in wide format (e.g. "C" -> C1..C23),
+            # so exclude by prefix, not exact match, or every reshaped column leaks through.
+            candidate_cols = [
+                c for c in raw_df.columns
+                if str(c) != str(id_col) and not str(c).startswith((str(outcome_col), str(time_col)))
+            ]
+        else:
+            reserved_cols = {str(id_col), str(outcome_col), str(time_col)}
+            candidate_cols = [c for c in raw_df.columns if str(c) not in reserved_cols]
 
         with st.expander("V3.0: Covariate Architecture (optional)"):
             st.markdown(
@@ -1116,6 +1125,19 @@ else:
                     "Time-varying covariates currently require Long format input."
                 )
 
+        with st.expander("V4.0: Survey Weights (optional)"):
+            st.markdown(
+                "**Sampling weight** (e.g. inverse-probability-of-selection weight) applied "
+                "per subject. Must be time-invariant and strictly positive. Robust "
+                "(Huber-White sandwich) standard errors become the valid basis for inference "
+                "once a weight is used — model-based SEs are shown for reference only."
+            )
+            weight_col_choice = st.selectbox(
+                "Sampling weight column:", ["(None)"] + candidate_cols,
+                key="weight_col_select",
+            )
+            weight_col = None if weight_col_choice == "(None)" else weight_col_choice
+
         button_label = "Run AutoTraj Search" if app_mode == "AutoTraj Search" else "Run Single Model"
 
         if st.button(button_label, type="primary", use_container_width=True):
@@ -1141,7 +1163,8 @@ else:
                 if data_format == "Wide Format" or st.session_state.use_sample_data:
                     long_df = prep_trajectory_data(raw_df, id_col, outcome_col, time_col).dropna(subset=['Time', 'Outcome'])
                 else:
-                    keep_cols = ['ID', 'Time', 'Outcome'] + list(baseline_cov_cols) + list(tvc_cols)
+                    weight_cols_list = [weight_col] if weight_col else []
+                    keep_cols = ['ID', 'Time', 'Outcome'] + list(baseline_cov_cols) + list(tvc_cols) + weight_cols_list
                     long_df = raw_df.rename(columns={id_col: 'ID', outcome_col: 'Outcome', time_col: 'Time'})
                     long_df = long_df[keep_cols].dropna(subset=['Time', 'Outcome'] + list(tvc_cols))
                     long_df['Time']    = pd.to_numeric(long_df['Time'])
@@ -1176,6 +1199,14 @@ else:
                     elif long_df['Outcome'].dropna().apply(lambda x: float(x) == int(x)).all():
                         st.warning("⚠️ All Outcome values appear to be whole numbers. If binary, consider LOGIT instead.")
 
+                if weight_col:
+                    if not pd.api.types.is_numeric_dtype(long_df[weight_col]):
+                        st.error(f"🚨 **Sampling weight column '{weight_col}' must be numeric.**")
+                        st.stop()
+                    elif (long_df[weight_col] <= 0).any() or long_df[weight_col].isna().any():
+                        st.error(f"🚨 **Sampling weight column '{weight_col}' must be strictly positive for every subject** (found zero, negative, or missing values).")
+                        st.stop()
+
                 n_timepoints      = len(long_df['Time'].unique())
                 max_order_attempted = max(orders_single) if app_mode == "Single Model Mode" else order_range[1]
                 if max_order_attempted >= n_timepoints:
@@ -1196,6 +1227,7 @@ else:
                         dist=dist_flag, cnorm_min=cnorm_min, cnorm_max=cnorm_max,
                         zip_iorder=0, n_starts=n_starts,
                         baseline_cov_cols=baseline_cov_cols, tvc_cols=tvc_cols,
+                        weight_col=weight_col,
                     )
                 else:
                     single_res = run_single_model(
@@ -1203,6 +1235,7 @@ else:
                         use_dropout=use_dropout, dist=dist_flag,
                         cnorm_min=cnorm_min, cnorm_max=cnorm_max, n_starts=n_starts,
                         baseline_cov_cols=baseline_cov_cols, tvc_cols=tvc_cols,
+                        weight_col=weight_col,
                     )
                     top_models   = [single_res] if single_res['result'].success or single_res['result'].status == 2 else []
                     all_evaluated = []
@@ -1552,6 +1585,13 @@ else:
             # ── EXACT ESTIMATES TAB ───────────────────────────────────────────
 
             with tab_est:
+                if winning_model.get('weight_col'):
+                    st.warning(
+                        f"⚠️ **Survey weights active** (column: `{winning_model['weight_col']}`). "
+                        "Use the **Robust SE** column as the valid basis for inference — "
+                        "**Standard Error** (model-based) is shown for reference only and is not "
+                        "a consistent variance estimator under survey weighting."
+                    )
                 estimates_df = get_parameter_estimates_for_ui(winning_model, group_names)
                 st.dataframe(estimates_df, use_container_width=True, hide_index=True)
                 st.download_button(

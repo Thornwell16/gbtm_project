@@ -541,7 +541,7 @@ def test_wide_vs_long_format():
 # TEST: analytical gradient matches central finite-difference (all distributions)
 # ---------------------------------------------------------------------------
 
-def _central_finite_diff_gradient(params, args, rel_step=1e-6, abs_step=1e-8):
+def _central_finite_diff_gradient(params, args, rel_step=1e-6, abs_step=1e-8, weights=None):
     """Central finite-difference gradient of calc_nll_wrapper w.r.t. params."""
     grad = np.zeros_like(params)
     for j in range(len(params)):
@@ -550,8 +550,8 @@ def _central_finite_diff_gradient(params, args, rel_step=1e-6, abs_step=1e-8):
         p_plus[j] += step
         p_minus = params.copy()
         p_minus[j] -= step
-        f_plus = calc_nll_wrapper(p_plus, *args)
-        f_minus = calc_nll_wrapper(p_minus, *args)
+        f_plus = calc_nll_wrapper(p_plus, *args, weights=weights)
+        f_minus = calc_nll_wrapper(p_minus, *args, weights=weights)
         grad[j] = (f_plus - f_minus) / (2.0 * step)
     return grad
 
@@ -637,6 +637,51 @@ def test_gradient_matches_finite_difference(dist_name, dist_code, use_dropout):
     assert max_rel_err < 1e-3, (
         f"{dist_name} (dropout={use_dropout}): analytical vs finite-difference "
         f"gradient mismatch. max_abs_err={max_abs_err:.3e}, "
+        f"max_rel_err={max_rel_err:.3e}\n"
+        f"analytical: {analytical_grad}\n"
+        f"numerical:  {numerical_grad}"
+    )
+
+
+def test_gradient_matches_finite_difference_with_weights():
+    """Analytical Jacobian must match central finite-difference under
+    non-trivial survey weights (V4.0) too — weights touch the core kernel
+    directly (both the total_ll accumulator and the per-subject gradient row
+    are scaled by weights[i]), so this is the primary regression guard for
+    that change."""
+    k = 2
+    orders_list = [1, 1]
+    long_df, _ = simulate_logit_trajectories(
+        n_subjects=80,
+        time_points=np.linspace(-1, 1, 6),
+        group_params=[{'betas': [-1.0, 1.0]}, {'betas': [0.5, -0.8]}],
+        group_proportions=[0.6, 0.4],
+        seed=321,
+    )
+    times, outcomes, dropouts, subj_breaks = extract_flat_arrays(long_df)
+    orders = np.array(orders_list, dtype=np.int32)
+    n_subjects = len(subj_breaks) - 1
+
+    rng = np.random.default_rng(99)
+    weights = rng.uniform(0.5, 3.0, size=n_subjects)
+
+    starts = generate_initial_params(
+        k=k, orders_list=orders_list, zip_iorder=0, use_dropout=False,
+        dist="LOGIT", outcomes=outcomes, n_starts=2,
+    )
+    params = starts[1]
+
+    args = (times, outcomes, dropouts, subj_breaks, orders, 0, False, 0, 0.0, 0.0)
+
+    analytical_grad = calc_jac_wrapper(params, *args, weights=weights)
+    numerical_grad = _central_finite_diff_gradient(params, args, weights=weights)
+
+    diff = np.abs(analytical_grad - numerical_grad)
+    max_abs_err = np.max(diff)
+    max_rel_err = np.max(diff / np.maximum(1.0, np.abs(numerical_grad)))
+
+    assert max_rel_err < 1e-3, (
+        f"Weighted gradient mismatch. max_abs_err={max_abs_err:.3e}, "
         f"max_rel_err={max_rel_err:.3e}\n"
         f"analytical: {analytical_grad}\n"
         f"numerical:  {numerical_grad}"

@@ -5,6 +5,39 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## V4.0 (Unreleased) — Survey (Sampling) Weights
+
+### New Features
+
+- **Per-subject survey/sampling weights** — a new optional `weight_col` lets each subject carry
+  an inverse-probability (or other survey) weight; the objective becomes the weighted
+  pseudo-log-likelihood ℓ_w(θ) = Σ_i w_i·log P(y_i). Unlike V3.0's covariates, weights add **no
+  new parameters** — every existing gradient formula applies unchanged, with each subject's
+  contribution scaled by w_i before summing. Setting w_i≡1 (or omitting weight_col) reproduces
+  V3.0 exactly — verified by a bit-identical regression test.
+- **Weighted Huber-White sandwich SEs fall out automatically** — since the per-subject gradient
+  row is already w_i-scaled, the existing sandwich "meat" Σ g_i g_iᵀ becomes Σ w_i²g_i g_iᵀ, the
+  standard Binder-type weighted-pseudo-MLE variance, with no new computation required. Model-based
+  (Hessian-only) SEs are retained for reference but are not a valid inference basis under
+  weighting — the UI now warns when a weight column is active.
+- New identifiability guards: a weight column that varies within subject, or contains zero,
+  negative, or missing values, is rejected with a clear error.
+- Streamlit UI: new "V4.0: Survey Weights" sidebar section for selecting a sampling-weight
+  column, with input validation and an inference-guidance warning in the estimates tab.
+- 4 new tests: a weighted-recovery test demonstrating weights correct sampling bias (recovers
+  true population proportions from a deliberately biased/undersampled dataset better than an
+  unweighted fit), a backward-compatibility test (all-ones weights ≡ unweighted), and two
+  validation-guard tests. Plus a new finite-difference gradient test covering the weighted case.
+
+### Documentation
+
+- **MATH.md** — extended with the weighted log-likelihood, the note that all existing gradient
+  formulas apply unchanged per-subject before the w_i scale, the automatic weighted-sandwich
+  derivation, and documented limitations (no strata/PSU/design-effect variance; BIC/AIC use raw
+  N and p, a simplification consistent with common practice, not a fully resolved question).
+
+---
+
 ## V3.0 (Unreleased) — Covariate Architecture
 
 ### New Features

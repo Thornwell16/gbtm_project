@@ -84,7 +84,7 @@ AutoTraj is actively maintained. Upcoming architecture upgrades include:
 
 * ✅ **Covariate Architecture (V3.0):** Multinomial baseline risk factors for group membership prediction and Time-Varying Covariates (TVC) for trajectory deflection. — *Engine and UI complete; see CHANGELOG.md*
 
-* **Survey Weights (V4.0):** Inverse probability sampling weights for complex stratified national surveys.
+* ✅ **Survey Weights (V4.0):** Inverse probability sampling weights for complex stratified national surveys. — *Engine and UI complete; see CHANGELOG.md*
 
 * **Joint Trajectories (V5.0):** Dual-trajectory FMM architecture for modeling interacting longitudinal outcomes.
 

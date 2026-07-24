@@ -37,6 +37,7 @@ from tests.simulate import (
     simulate_logit_with_mixing_covariates,
     simulate_logit_with_tvc,
     simulate_logit_with_covariates_and_tvc,
+    simulate_logit_with_biased_sampling_weights,
     make_two_group_logit,
     make_two_group_poisson,
     make_two_group_cnorm,
@@ -633,3 +634,92 @@ def test_baseline_covariate_constancy_guard():
     )
     with pytest.raises(ValueError, match="varies within subject"):
         run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=1, baseline_cov_cols=['Z1'])
+
+
+# ---------------------------------------------------------------------------
+# V4.0: survey (sampling) weights
+# ---------------------------------------------------------------------------
+
+def test_weighted_recovery_corrects_sampling_bias():
+    """Weighted fit on a biased (informatively undersampled) sample must recover
+    the TRUE population group proportions more closely than an unweighted fit
+    on the same biased sample — the test that demonstrates weights are
+    actually doing something, not just plumbing."""
+    true_params = [
+        {'betas': [-1.5]},
+        {'betas': [1.0, -0.3]},
+    ]
+    df, truth = simulate_logit_with_biased_sampling_weights(
+        n_population=3000, time_points=T15, group_params=true_params,
+        group_proportions=[0.5, 0.5], keep_probs=[1.0, 0.3], seed=51,
+    )
+
+    m_unweighted = run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=N_STARTS)
+    m_weighted = run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=N_STARTS,
+                                   weight_col='Weight')
+
+    true_prop = 0.5
+    # Label switching may put either group first; compare against the closer match.
+    unweighted_err = min(abs(p - true_prop) for p in m_unweighted['pis'])
+    weighted_err = min(abs(p - true_prop) for p in m_weighted['pis'])
+
+    assert weighted_err < unweighted_err, (
+        f"Weighted fit should recover the true 50/50 population split better than "
+        f"unweighted: unweighted pis={m_unweighted['pis']}, weighted pis={m_weighted['pis']}"
+    )
+    assert weighted_err < 0.15, f"Weighted proportion recovery too far off: {m_weighted['pis']}"
+
+
+def test_backward_compat_uniform_weights_matches_unweighted():
+    """Fitting with weight_col=None vs. an all-1.0 weight column must produce
+    bit-identical results — the concrete regression guard for V4.0's
+    'w_i=1 reduces to V3.0 exactly' design invariant."""
+    df, _ = simulate_logit_trajectories(
+        n_subjects=300, time_points=T15,
+        group_params=[{'betas': [-1.5]}, {'betas': [1.0, -0.3]}],
+        group_proportions=[0.6, 0.4], seed=61,
+    )
+    df = df.copy()
+    df['W'] = 1.0
+
+    m_unweighted = run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=N_STARTS)
+    m_weighted = run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=N_STARTS,
+                                   weight_col='W')
+
+    assert m_unweighted['ll'] == pytest.approx(m_weighted['ll'], abs=1e-8)
+    assert np.allclose(m_unweighted['result'].x, m_weighted['result'].x, atol=1e-8), (
+        "Parameter vectors differ between unweighted and all-ones-weighted calls"
+    )
+    assert np.allclose(m_unweighted['se_model'], m_weighted['se_model'], atol=1e-6)
+    assert np.allclose(m_unweighted['se_robust'], m_weighted['se_robust'], atol=1e-6)
+
+
+def test_weight_column_constancy_guard():
+    """A weight column that varies within subject must be rejected with a clear
+    error — survey weights are inherently one-per-subject."""
+    df, _ = simulate_logit_trajectories(
+        n_subjects=50, time_points=T15,
+        group_params=[{'betas': [-1.5]}, {'betas': [1.0, -0.3]}],
+        group_proportions=[0.6, 0.4], seed=71,
+    )
+    rng = np.random.default_rng(0)
+    df = df.copy()
+    df['W'] = rng.uniform(0.5, 2.0, size=len(df))  # varies row-by-row, not per subject
+    with pytest.raises(ValueError, match="varies within subject"):
+        run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=1, weight_col='W')
+
+
+def test_non_positive_weight_rejected():
+    """A weight column containing zero, negative, or missing values must be
+    rejected with a clear error."""
+    df, _ = simulate_logit_trajectories(
+        n_subjects=50, time_points=T15,
+        group_params=[{'betas': [-1.5]}, {'betas': [1.0, -0.3]}],
+        group_proportions=[0.6, 0.4], seed=72,
+    )
+    df = df.copy()
+    first_id = df['ID'].unique()[0]
+    weight_by_id = {sid: (0.0 if sid == first_id else 1.0) for sid in df['ID'].unique()}
+    df['W'] = df['ID'].map(weight_by_id)
+    with pytest.raises(ValueError, match="strictly positive"):
+        run_single_model(df, orders_list=[0, 1], dist='LOGIT', n_starts=1, weight_col='W')

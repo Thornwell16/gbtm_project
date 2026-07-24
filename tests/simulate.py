@@ -675,6 +675,84 @@ def simulate_logit_with_covariates_and_tvc(
 
 
 # ---------------------------------------------------------------------------
+# V4.0: survey/sampling weights
+# ---------------------------------------------------------------------------
+
+def simulate_logit_with_biased_sampling_weights(
+    n_population: int,
+    time_points: Sequence[float],
+    group_params: List[Dict],
+    group_proportions: Sequence[float],
+    keep_probs: Sequence[float],
+    seed: int = 42,
+) -> Tuple[LongDF, TruthDict]:
+    """Simulate a full population, then draw a biased sample where each group is
+    retained with a different (known) probability, attaching the correct
+    inverse-probability weight per sampled subject.
+
+    This models informative sampling: e.g. keep_probs=[1.0, 0.3] always keeps
+    group-1 population members but discards 70% of group-2 members, so an
+    unweighted fit on the resulting sample sees a group split badly biased
+    away from the true population proportions. The correct survey weight for
+    a sampled subject in group g is w = 1 / keep_probs[g] (Horvitz-Thompson);
+    a correctly weighted fit should recover the true population proportions
+    despite the biased sample.
+
+    Parameters
+    ----------
+    keep_probs : per-group probability that a population subject of that group
+                 is retained in the sample.
+
+    Returns
+    -------
+    long_df : DataFrame [ID, Time, Outcome, Weight] for SAMPLED subjects only
+              (IDs are renumbered 1..n_sampled in sampling order).
+    truth   : {'assignments', 'group_params', 'proportions' (true population
+              proportions, NOT the biased sample's), 'keep_probs'}
+    """
+    if len(keep_probs) != len(group_params):
+        raise ValueError("keep_probs must have one entry per group.")
+
+    rng = np.random.default_rng(seed)
+    times = np.asarray(time_points, dtype=float)
+    group_idx = _assign_groups(n_population, group_proportions, rng)
+    props_norm = np.asarray(group_proportions, dtype=float)
+    props_norm = props_norm / props_norm.sum()
+
+    records: List[dict] = []
+    assignments: Dict[int, int] = {}
+    next_sid = 1
+
+    for i in range(n_population):
+        g = int(group_idx[i])
+        keep_prob = float(keep_probs[g])
+        if rng.random() >= keep_prob:
+            continue  # not sampled
+
+        sid = next_sid
+        next_sid += 1
+        betas = group_params[g]['betas']
+        assignments[sid] = g + 1
+        weight = 1.0 / keep_prob
+
+        for t in times:
+            eta = _poly_eval(betas, t)
+            p = float(_logistic(eta))
+            y = float(rng.binomial(1, p))
+            records.append({'ID': sid, 'Time': float(t), 'Outcome': y, 'Weight': weight})
+
+    long_df = _build_df_with_extra(records, ['Weight'])
+
+    truth: TruthDict = {
+        'assignments':  assignments,
+        'group_params': group_params,
+        'proportions':  props_norm.tolist(),
+        'keep_probs':   [float(p) for p in keep_probs],
+    }
+    return long_df, truth
+
+
+# ---------------------------------------------------------------------------
 # Convenience: canonical test-case presets
 # ---------------------------------------------------------------------------
 
