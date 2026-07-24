@@ -5,6 +5,47 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## Unreleased
+
+### Fixes
+
+- **Critical: CNORM auto-detect bounds were silently broken in the UI.** The sidebar's CNORM
+  Min/Max fields told users to "leave blank to automatically use the dataset's observed min/max,"
+  but blank fields defaulted to `0.0`/`0.0` in `app.py`, not `NaN` — and the engine's auto-detect
+  logic (`main.py`, all three fitting entry points) only triggers on `None`/`NaN`, never on a
+  literal `0.0`. In practice, leaving the bounds blank for any CNORM outcome that doesn't naturally
+  span across 0 silently fit a degenerate model (effectively all-censored at a single point), with
+  no error raised. Fixed by defaulting the UI's blank state to `np.nan` in all three places
+  (single-outcome, and both outcomes in Dual-Trajectory mode) so the engine's existing auto-detect
+  behaves as documented. Also added the same "leave blank to auto-detect" caption to the
+  Dual-Trajectory Mode CNORM fields, which previously had no such hint at all.
+- **MATH.md §3e (informative dropout)** described the dropout hazard as a simple per-wave
+  replacement ("last observed time gets `log P(drop)` instead of `log(1-P(drop))`"), which doesn't
+  match the actual (correct, gradient-verified) implementation: every observed wave after the first
+  contributes an unconditional survival factor, and — only for subjects actually lost to
+  follow-up — one *additional* hazard factor is added for the interval just past the last observed
+  wave, using the last observed outcome as the lag. Corrected the prose (and the matching §4f
+  gradient description) to describe this standard discrete-time-survival structure accurately;
+  no code changes were needed, since the implementation was already correct.
+- **MATH.md §6** stated the relationship between the two BIC/AIC conventions as
+  $\text{BIC}_S = -2\cdot\text{BIC}_N - p\log N$ ("not a simple sign flip") — this is algebraically
+  wrong; substituting the definitions shows $\text{BIC}_S = -2\cdot\text{BIC}_N$ exactly (and
+  likewise $\text{AIC}_S = -2\cdot\text{AIC}_N$), i.e. it *is* a simple scalar rescaling. Corrected
+  the formula; the engine computes both conventions independently and was never affected.
+
+### Documentation
+
+- Removed internal version-milestone labels ("V3.0", "V4.0", "V5.0") from user-facing text
+  (README roadmap, in-app sidebar/caption text, MATH.md section headers and prose) — these
+  capabilities are now presented as plain features of the product rather than sequential
+  milestones. This file (CHANGELOG.md) keeps its version-numbered history, per standard changelog
+  convention; only the *forward-facing* narrative changed.
+- Added `joint_trajectory_sample.csv`, a synthetic illustrative dataset for trying out
+  Dual-Trajectory (Joint) Mode, with a "Load Joint-Trajectory Sample Data" button mirroring the
+  existing Cambridge-sample-data pattern. See README's Sample Datasets section.
+
+---
+
 ## V5.0 (Unreleased) — Joint Trajectories
 
 ### New Features

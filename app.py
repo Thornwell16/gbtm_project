@@ -994,6 +994,7 @@ if 'run_complete' not in st.session_state:
     st.session_state.long_df     = None
     st.session_state.raw_df      = None
     st.session_state.use_sample_data = False
+    st.session_state.use_joint_sample_data = False
 
 with st.sidebar:
     st.markdown("""
@@ -1030,8 +1031,8 @@ with st.sidebar:
         ])
         dist_flag = selected_dist.split(" ")[0]
 
-        cnorm_min = 0.0
-        cnorm_max = 0.0
+        cnorm_min = np.nan
+        cnorm_max = np.nan
         if dist_flag == "CNORM":
             st.markdown("*CNORM Scale Limits (Optional)*")
             st.info("Leave blank to automatically use the dataset's observed min/max.")
@@ -1073,7 +1074,7 @@ with st.sidebar:
 
     elif app_mode == "Dual-Trajectory (Joint) Mode":
         st.caption(
-            "V5.0: two outcomes (Y, Z) linked by a joint latent-class probability "
+            "Two outcomes (Y, Z) linked by a joint latent-class probability "
             "matrix, instead of assuming independent group membership. Long format "
             "only — single model specification (no AutoTraj-style search over both "
             "outcomes' group/order grids)."
@@ -1081,16 +1082,17 @@ with st.sidebar:
         st.markdown('<span class="sidebar-section-header">1. Data Mapping (Long Format)</span>', unsafe_allow_html=True)
         joint_id_col = st.text_input("ID Col", value="ID", key="joint_id_col")
         col_jy1, col_jy2 = st.columns(2)
-        with col_jy1: joint_outcome_y_col = st.text_input("Outcome Y Col", value="Outcome_Y", key="joint_out_y")
-        with col_jy2: joint_time_y_col = st.text_input("Time Y Col", value="Time_Y", key="joint_time_y")
+        with col_jy1: joint_outcome_y_col = st.text_input("Outcome Y Col", value="Aggression", key="joint_out_y")
+        with col_jy2: joint_time_y_col = st.text_input("Time Y Col", value="Age", key="joint_time_y")
         col_jz1, col_jz2 = st.columns(2)
-        with col_jz1: joint_outcome_z_col = st.text_input("Outcome Z Col", value="Outcome_Z", key="joint_out_z")
-        with col_jz2: joint_time_z_col = st.text_input("Time Z Col", value="Time_Z", key="joint_time_z")
+        with col_jz1: joint_outcome_z_col = st.text_input("Outcome Z Col", value="EmotionalSymptoms", key="joint_out_z")
+        with col_jz2: joint_time_z_col = st.text_input("Time Z Col", value="Age", key="joint_time_z")
 
         st.markdown('<span class="sidebar-section-header">2. Outcome Y</span>', unsafe_allow_html=True)
         joint_dist_y = st.selectbox("Distribution:", ["LOGIT", "CNORM", "POISSON", "ZIP"], key="joint_dist_y")
-        joint_cnorm_min_y, joint_cnorm_max_y = 0.0, 0.0
+        joint_cnorm_min_y, joint_cnorm_max_y = np.nan, np.nan
         if joint_dist_y == "CNORM":
+            st.caption("Leave blank to automatically use the dataset's observed min/max.")
             c1, c2 = st.columns(2)
             miny = c1.text_input("Min", value="", key="joint_cmin_y")
             maxy = c2.text_input("Max", value="", key="joint_cmax_y")
@@ -1105,8 +1107,9 @@ with st.sidebar:
 
         st.markdown('<span class="sidebar-section-header">3. Outcome Z</span>', unsafe_allow_html=True)
         joint_dist_z = st.selectbox("Distribution:", ["LOGIT", "CNORM", "POISSON", "ZIP"], key="joint_dist_z")
-        joint_cnorm_min_z, joint_cnorm_max_z = 0.0, 0.0
+        joint_cnorm_min_z, joint_cnorm_max_z = np.nan, np.nan
         if joint_dist_z == "CNORM":
+            st.caption("Leave blank to automatically use the dataset's observed min/max.")
             c1, c2 = st.columns(2)
             minz = c1.text_input("Min", value="", key="joint_cmin_z")
             maxz = c2.text_input("Max", value="", key="joint_cmax_z")
@@ -1174,7 +1177,7 @@ if app_mode == "About & Docs":
     * Nagin, D. S. (1999). Analyzing developmental trajectories: a semiparametric, group-based approach. *Psychological Methods*, 4(2), 139-157.
     """)
     st.divider()
-    st.markdown('<div class="app-footer">AutoTraj v1.5 &nbsp;&middot;&nbsp; Built by Donald E. Warden, PhD, MPH &nbsp;&middot;&nbsp; <em>Sapientia Veritatem Parit</em> &nbsp;&middot;&nbsp; MIT License</div>', unsafe_allow_html=True)
+    st.markdown('<div class="app-footer">AutoTraj &nbsp;&middot;&nbsp; Built by Donald E. Warden, PhD, MPH &nbsp;&middot;&nbsp; <em>Sapientia Veritatem Parit</em> &nbsp;&middot;&nbsp; MIT License</div>', unsafe_allow_html=True)
 
 # ── Dual-Trajectory (Joint) mode ───────────────────────────────────────────────
 
@@ -1189,6 +1192,17 @@ elif app_mode == "Dual-Trajectory (Joint) Mode":
     uploaded_file_j = st.file_uploader(
         "Upload Long-Format Dataset (.csv, .txt, .xlsx)", type=["csv", "txt", "xlsx"], key="joint_uploader"
     )
+    st.markdown(
+        "*Or, just here to try out dual-trajectory modeling? Click below to load a simulated "
+        "illustrative dataset (synthetic — not real published data) tracking two co-developing "
+        "adolescent outcomes.*"
+    )
+    if st.button("Load Joint-Trajectory Sample Data", use_container_width=False):
+        st.session_state.use_joint_sample_data = True
+
+    if uploaded_file_j is not None:
+        st.session_state.use_joint_sample_data = False
+
     raw_df_j = None
     if uploaded_file_j is not None:
         try:
@@ -1203,6 +1217,17 @@ elif app_mode == "Dual-Trajectory (Joint) Mode":
             st.success("Custom file uploaded successfully!")
         except Exception as e:
             st.error(f"Error loading file: {e}")
+    elif st.session_state.use_joint_sample_data:
+        try:
+            raw_df_j = pd.read_csv("joint_trajectory_sample.csv", encoding='utf-8-sig')
+            raw_df_j.columns = [str(c).strip() for c in raw_df_j.columns]
+            st.success(
+                "Joint-trajectory sample dataset loaded! (700 simulated subjects, ages 10-16. "
+                "Use ID='ID', Outcome Y='Aggression', Time Y='Age', Outcome Z='EmotionalSymptoms', "
+                "Time Z='Age' — Outcome Y is LOGIT, Outcome Z is CNORM with bounds 0-10.)"
+            )
+        except Exception as e:
+            st.error("Could not locate joint_trajectory_sample.csv in the repository.")
 
     if raw_df_j is not None:
         required_cols_j = [joint_id_col, joint_outcome_y_col, joint_time_y_col, joint_outcome_z_col, joint_time_z_col]
@@ -1414,7 +1439,7 @@ else:
             reserved_cols = {str(id_col), str(outcome_col), str(time_col)}
             candidate_cols = [c for c in raw_df.columns if str(c) not in reserved_cols]
 
-        with st.expander("V3.0: Covariate Architecture (optional)"):
+        with st.expander("Covariate Architecture (optional)"):
             st.markdown(
                 "**Baseline covariates** predict group membership (multinomial "
                 "logit on mixing proportions). Must be time-invariant (constant "
@@ -1440,7 +1465,7 @@ else:
                     "Time-varying covariates currently require Long format input."
                 )
 
-        with st.expander("V4.0: Survey Weights (optional)"):
+        with st.expander("Survey Weights (optional)"):
             st.markdown(
                 "**Sampling weight** (e.g. inverse-probability-of-selection weight) applied "
                 "per subject. Must be time-invariant and strictly positive. Robust "
@@ -2029,7 +2054,7 @@ else:
                             "Additional descriptive variables (not used in model):",
                             potential_covariates,
                             help="Purely descriptive — for baseline-characteristics reporting only. "
-                                 "This does NOT feed the model; use the 'V3.0: Covariate Architecture' "
+                                 "This does NOT feed the model; use the 'Covariate Architecture' "
                                  "expander in the sidebar to add covariates that affect group membership "
                                  "or the trajectory equation.",
                         )
@@ -2227,7 +2252,7 @@ else:
             st.error("Model Failed to Converge or was rejected based on heuristic rules.")
 
     st.markdown(
-        '<div class="app-footer">AutoTraj v1.5 &nbsp;&middot;&nbsp; '
+        '<div class="app-footer">AutoTraj &nbsp;&middot;&nbsp;'
         'Built by Donald E. Warden, PhD, MPH &nbsp;&middot;&nbsp; '
         '<em>Sapientia Veritatem Parit</em></div>',
         unsafe_allow_html=True,

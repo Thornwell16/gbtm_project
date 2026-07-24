@@ -30,9 +30,22 @@ This document is the technical appendix for the validation paper and covers:
 ## Quick Start (Web App)
 You do not need to install Python to use this engine.
 1. Click the **Streamlit App** badge above to launch the web interface.
-2. Click **"Load Cambridge Sample Data"** to test the engine immediately, or upload your own longitudinal dataset.
+2. Click **"Load Cambridge Sample Data"** to test the engine immediately, or upload your own longitudinal dataset. (In Dual-Trajectory Mode, click **"Load Joint-Trajectory Sample Data"** instead — see [Sample Datasets](#sample-datasets) below.)
 3. Select your data format (Wide vs. Long) and map your variables in the sidebar.
 4. Click **Run AutoTraj Search**.
+
+## Sample Datasets
+* **`cambridge.txt`** — the Cambridge Study of Delinquent Development (Nagin, 1999), used as the
+  package's real-data validation benchmark (see `tests/test_cambridge_benchmark.py`, which checks
+  AutoTraj's output against the original published results). This is genuine historical data, kept
+  in place as the authoritative regression/benchmark dataset — not something to swap out.
+* **`joint_trajectory_sample.csv`** — a **synthetic, illustrative** dataset for trying out
+  Dual-Trajectory (Joint) Mode: 700 simulated subjects followed ages 10-16, with a binary
+  `Aggression` outcome (LOGIT) and a continuous `EmotionalSymptoms` outcome (CNORM, bounded 0-10),
+  whose latent group memberships are deliberately non-independent — subjects in the chronic-high
+  aggression trajectory are disproportionately likely to also follow the high-symptoms trajectory,
+  a classic comorbidity pattern the joint model is designed to surface. This is **not** real
+  clinical data; it exists purely to demonstrate the feature.
 
 ## Local Installation
 If you prefer to run the engine locally:
@@ -77,16 +90,18 @@ Test suites:
 | Cambridge Benchmark | `tests/test_cambridge_benchmark.py` | 7 tests: validate against Nagin (1999) published results |
 | Edge Cases | `tests/test_edge_cases.py` | 21 tests: pathological inputs, boundary conditions, reproducibility, label-switching invariance |
 
-## Future Roadmap
-AutoTraj is actively maintained. Upcoming architecture upgrades include:
+## Architecture Capabilities
+AutoTraj is actively maintained. Beyond the core GBTM engine, it includes:
 
-* ✅ **Alternative Distributions (V2.0):** Censored Normal (Tobit) for continuous biomarkers and Poisson/ZIP for count data. — *Completed in V2.0*
+* **Alternative Distributions:** Censored Normal (Tobit) for continuous biomarkers and Poisson/ZIP for count data, alongside the base LOGIT model.
 
-* ✅ **Covariate Architecture (V3.0):** Multinomial baseline risk factors for group membership prediction and Time-Varying Covariates (TVC) for trajectory deflection. — *Engine and UI complete; see CHANGELOG.md*
+* **Covariate Architecture:** Multinomial baseline risk factors for group membership prediction and Time-Varying Covariates (TVC) for trajectory deflection.
 
-* ✅ **Survey Weights (V4.0):** Inverse probability sampling weights for complex stratified national surveys. — *Engine and UI complete; see CHANGELOG.md*
+* **Survey Weights:** Inverse probability sampling weights for complex stratified national surveys, with Huber-White sandwich standard errors as the valid inference basis.
 
-* ✅ **Joint Trajectories (V5.0):** Nagin-style dual-trajectory FMM architecture — two outcomes with independent group structures linked by a joint latent-class probability matrix, for modeling interacting longitudinal outcomes. — *Engine and UI complete; see CHANGELOG.md*
+* **Joint Trajectories:** Nagin-style dual-trajectory FMM architecture — two outcomes with independent group structures linked by a joint latent-class probability matrix, for modeling interacting longitudinal outcomes.
+
+See CHANGELOG.md for the detailed history of when each capability was added.
 
 ## Methodology & Attribution
 Code architecture and UI generation were assisted by Large Language Models, under the strict mathematical direction and validation of the author to ensure alignment with established FMM and GBTM statistical formulas.

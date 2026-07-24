@@ -2,22 +2,23 @@
 
 This document is the complete technical reference for every formula implemented in AutoTraj. It serves as the mathematical appendix for the validation paper. All notation follows Nagin (1999, 2005) except where extensions are noted explicitly.
 
-**V3.0 note:** Sections 1–4 below describe the model as of V3.0, which generalizes the mixing
-proportions to depend on subject-level baseline covariates and generalizes the trajectory linear
-predictor to include time-varying covariates (TVC). Setting the number of baseline covariates
-$P=0$ and the number of TVCs $Q=0$ recovers the V1.5.0 model **exactly** (same parameter count,
-same values) — V3.0 is a strict superset, not a breaking change.
+**Note on Sections 1–4:** the model supports mixing proportions that depend on subject-level
+baseline covariates, and a trajectory linear predictor that includes time-varying covariates
+(TVC). Setting the number of baseline covariates $P=0$ and the number of TVCs $Q=0$ recovers the
+simple intercept-only-mixing, polynomial-only-trajectory model **exactly** (same parameter count,
+same values) — the covariate machinery is a strict superset, not a separate code path.
 
-**V4.0 note:** Section 1 also describes an optional per-subject survey/sampling weight $w_i$,
-scaling each subject's contribution to the log-likelihood (and hence the gradient). Unlike V3.0,
-this adds **no new parameters** to $\theta$ — it is a pure likelihood-level device. Setting
-$w_i \equiv 1$ for all subjects recovers the unweighted (V3.0) model **exactly**.
+**Note on Section 1 (survey weights):** an optional per-subject survey/sampling weight $w_i$
+scales each subject's contribution to the log-likelihood (and hence the gradient). This adds
+**no new parameters** to $\theta$ — it is a pure likelihood-level device. Setting $w_i \equiv 1$
+for all subjects recovers the unweighted model **exactly**.
 
-**V5.0 note:** Section 9 (additive — does not modify §1-§8) describes a wholly separate model
-family, the Nagin-style **joint dual-trajectory** model: two outcomes Y and Z, each with its own
-independent single-outcome GBTM structure, linked by a joint latent-class probability matrix
-instead of assuming independence. It does not compose with V3.0's mixing-covariates/TVC or V4.0's
-survey weights in this pass (both are deferred future extensions).
+**Note on Section 9 (joint dual-trajectory model):** this section (additive — does not modify
+§1-§8) describes a separate model family, the Nagin-style **joint dual-trajectory** model: two
+outcomes Y and Z, each with its own independent single-outcome GBTM structure, linked by a joint
+latent-class probability matrix instead of assuming independence. It does not compose with the
+mixing-covariates/TVC or survey-weight machinery in this pass (both are deferred future
+extensions).
 
 ---
 
@@ -31,7 +32,7 @@ survey weights in this pass (both are deferred future extensions).
 6. [BIC and AIC Formulas](#6-bic-and-aic-formulas)
 7. [Model Adequacy Metrics](#7-model-adequacy-metrics)
 8. [References](#8-references)
-9. [Joint Dual-Trajectory Model (V5.0)](#9-joint-dual-trajectory-model-v50)
+9. [Joint Dual-Trajectory Model](#9-joint-dual-trajectory-model)
 
 ---
 
@@ -47,7 +48,7 @@ In the base model, mixing proportions are subject-invariant constants satisfying
 
 $$\pi_g \geq 0, \qquad \sum_{g=0}^{K-1} \pi_g = 1$$
 
-**V3.0 extension.** When $P \geq 1$ baseline (time-invariant) covariates are supplied, the mixing
+**Covariate-dependent mixing.** When $P \geq 1$ baseline (time-invariant) covariates are supplied, the mixing
 proportion becomes a function of subject $i$'s covariate row $x_i = (1, x_{i,1}, \dots, x_{i,P})$
 (intercept prepended), via a multinomial logit:
 
@@ -65,7 +66,7 @@ Let $\mathbf{y}_i = (y_{i1}, \dots, y_{iT_i})$ denote the observed trajectory fo
 
 $$P(\mathbf{y}_i \mid g) = \prod_{t=1}^{T_i} P(y_{it} \mid g, t)$$
 
-where $P(y_{it} \mid g, t)$ is the group- and distribution-specific likelihood contribution at time $t$ (detailed in Section 3), evaluated at the linear predictor $\eta_{igt}$ which (as of V3.0) may include time-varying covariate terms in addition to the polynomial-in-time terms.
+where $P(y_{it} \mid g, t)$ is the group- and distribution-specific likelihood contribution at time $t$ (detailed in Section 3), evaluated at the linear predictor $\eta_{igt}$ which may include time-varying covariate terms in addition to the polynomial-in-time terms.
 
 ### Marginal Likelihood
 
@@ -81,7 +82,7 @@ $$\ell(\theta) = \sum_{i=1}^{N} \log P(\mathbf{y}_i) = \sum_{i=1}^{N} \log \left
 
 This is the objective function maximised by the BFGS optimizer.
 
-**V4.0 extension — survey/sampling weights.** When each subject $i$ carries a survey/sampling
+**Survey/sampling weights.** When each subject $i$ carries a survey/sampling
 weight $w_i > 0$ (e.g. an inverse-probability-of-selection weight), the objective generalizes to
 the **weighted** total log-likelihood:
 
@@ -168,7 +169,7 @@ One logit-scale parameter per group, appended after the beta/TVC/dropout blocks 
 
 ## 3. Log-Likelihood by Distribution
 
-All distributions share the linear predictor (generalized as of V3.0 to include TVC terms):
+All distributions share the linear predictor (which may include TVC terms):
 
 $$\eta_{igt} = \underbrace{\sum_{p=0}^{p_g} \beta_{g,p} \, t^p}_{\text{polynomial-in-time}} \;+\; \underbrace{\sum_{q=1}^{Q} \delta_{g,q} \, z_{i,q,t}}_{\text{TVC deflection}}$$
 
@@ -268,21 +269,44 @@ Define $p_0 \equiv \omega_g + (1 - \omega_g) e^{-\lambda}$ for notational conven
 
 ### 3e. Informative Dropout — MNAR Model
 
-When `use_dropout=True`, AutoTraj augments the likelihood with a **logistic dropout sub-model** that accounts for Missing Not At Random (MNAR) attrition. For each group $g$ and each time point $t > t_0$ (where $t_0$ is the first observed time), the probability of dropout is:
+When `use_dropout=True`, AutoTraj augments the likelihood with a **discrete-time logistic hazard
+sub-model** that accounts for Missing Not At Random (MNAR) attrition. This is a standard
+discrete-time survival specification: a subject observed at $t_0 < t_1 < \dots < t_m$ contributes
+one "survived this interval" factor for every observed wave after the first, plus (only if they
+are subsequently lost to follow-up) one additional "hazard of dropping in the next interval"
+factor evaluated at their last observed wave. Concretely, the hazard at wave $t$ (given the
+subject was observed there, using the *previous* wave's outcome as predictor) is:
 
 $$P(\text{drop}_{it} = 1 \mid g, t, y_{i,t-1}) = \sigma\!\left(\gamma_{g,0} + \gamma_{g,1} \cdot t + \gamma_{g,2} \cdot y_{i,t-1}\right)$$
 
-**V3.0 boundary note:** this dropout hazard is defined purely in terms of $t$ and the lagged outcome — it does **not** depend on $\eta_{igt}$, TVCs, or mixing covariates. This is a deliberate scope boundary for V3.0, not an oversight: allowing TVCs to also deflect the dropout hazard is a reasonable future extension but is out of scope here.
+**Scope boundary:** this dropout hazard is defined purely in terms of $t$ and the lagged outcome —
+it does **not** depend on $\eta_{igt}$, TVCs, or mixing covariates. This is a deliberate design
+choice, not an oversight: allowing TVCs to also deflect the dropout hazard is a reasonable future
+extension but is out of scope here.
 
-Let $d_{it}$ denote the dropout indicator ($d_{it} = 1$ if $t$ is the last observed time for subject $i$, $d_{it} = 0$ for all preceding observed times).
+**Per-wave survival term.** For every observed wave $t_j$, $j = 1, \dots, m$ (i.e. every wave after
+the first), being observed at $t_j$ is direct evidence the subject had not yet dropped, so each
+contributes a factor $1 - P(\text{drop}_{i,t_j} \mid g, t_j, y_{i,t_{j-1}})$ — **unconditionally**,
+regardless of whether $t_m$ (the last observed wave) turns out to be a true dropout or the end of
+follow-up:
 
-**Log-likelihood contribution of the dropout process:**
+$$\ell^{\text{surv}}_{ig} = \sum_{j=1}^{m} \log\!\bigl(1 - P(\text{drop}_{i,t_j} \mid g, t_j, y_{i,t_{j-1}})\bigr)$$
 
-$$\ell^{\text{drop}}_{igt} = \begin{cases} \log\!\bigl(1 - P(\text{drop}_{it})\bigr) & \text{if } d_{it} = 0 \quad (\text{subject not yet dropped}) \\ \log P(\text{drop}_{it}) & \text{if } d_{it} = 1 \quad (\text{last observed time}) \end{cases}$$
+**Dropout-event term (additional, only if the subject is truly lost to follow-up).** Let $d_i = 1$
+if subject $i$'s last observed time $t_m$ is strictly before the maximum study time (i.e. they were
+lost to follow-up), $d_i = 0$ if they were observed through the end of the study (right-censored,
+no further term). When $d_i = 1$, AutoTraj adds **one more** hazard factor for the interval just
+after $t_m$, using the subject's own last observed outcome $y_{i,t_m}$ as the lag (the most recent
+information available) and $t_m$ itself as a practical stand-in for the unobserved next wave's
+time:
 
-The total log-likelihood becomes:
+$$\ell^{\text{drop}}_{ig} = \ell^{\text{surv}}_{ig} + d_i \cdot \log P(\text{drop} \mid g, t_m, y_{i,t_m})$$
 
-$$\ell(\theta) = \sum_{i=1}^{N} \log \left[ \sum_{g=0}^{K-1} \pi_g(x_i) \prod_{t} P(y_{it} \mid g, t) \cdot \prod_{t > t_0} P(\text{drop}_{it} \mid g, t, y_{i,t-1})^{1} \right]$$
+This is the standard discrete-time-hazard likelihood for panel attrition (survival factors for
+every interval reached, plus one event factor if/when the event — dropout — actually occurs), not
+a per-wave case-split. Total log-likelihood:
+
+$$\ell(\theta) = \sum_{i=1}^{N} \log \left[ \sum_{g=0}^{K-1} \pi_g(x_i) \Bigl(\prod_{t} P(y_{it} \mid g, t)\Bigr) \cdot \exp\bigl(\ell^{\text{drop}}_{ig}\bigr) \right]$$
 
 ---
 
@@ -296,7 +320,7 @@ $$L_i = \log \sum_{g=0}^{K-1} \exp\!\left(\log \pi_g(x_i) + \sum_t \ell_{igt}\ri
 
 Gradients of $L_i$ with respect to $\theta$ propagate through the softmax and the per-observation likelihoods via the posterior weights $P(g \mid i)$.
 
-**V4.0 note:** every gradient formula below is a formula for $\partial \ell_i/\partial\theta$ (a
+**Survey weighting note:** every gradient formula below is a formula for $\partial \ell_i/\partial\theta$ (a
 single subject's contribution). Under survey weighting (Section 1), the total gradient is
 $\sum_i w_i \cdot \partial \ell_i/\partial\theta$ — each subject's *entire* gradient row (every
 block: $\Gamma$, $\beta$, $\delta$, dropout $\gamma$, $\text{raw}\_\sigma$/$\zeta$) is scaled by
@@ -393,21 +417,20 @@ $$\frac{\partial \ell_i}{\partial \zeta_g} = P(g \mid i) \sum_{t=1}^{T_i} \frac{
 
 ### 4f. Dropout Gamma Gradient
 
-Let $q_{igt} = P(\text{drop}_{it} = 1 \mid g, t, y_{i,t-1}) = \sigma(\gamma_{g,0} + \gamma_{g,1} t + \gamma_{g,2} y_{i,t-1})$.
+Let $q(t, y) = P(\text{drop} = 1 \mid g, t, y) = \sigma(\gamma_{g,0} + \gamma_{g,1} t + \gamma_{g,2} y)$.
+Following §3e's two-term structure, the gradient has a **survival part** (summed over every
+observed wave $t_j$, $j=1,\dots,m$, using $-q$ — the derivative of $\log(1-q)$) plus an
+**additional event part** (only when $d_i=1$, using $1-q$ — the derivative of $\log q$ — evaluated
+at the last wave $t_m$ with the subject's own last observed outcome $y_{i,t_m}$ as the lag):
 
-Define the **dropout score** $\varepsilon_{\text{drop}}^{(g,t)}$:
+$$\frac{\partial \ell_i}{\partial \gamma_{g,k}} = P(g \mid i) \left[ \sum_{j=1}^{m} \bigl(-q(t_j, y_{i,t_{j-1}})\bigr) \cdot r_k(t_j, y_{i,t_{j-1}}) \;+\; d_i \cdot \bigl(1 - q(t_m, y_{i,t_m})\bigr) \cdot r_k(t_m, y_{i,t_m}) \right]$$
 
-$$\varepsilon_{\text{drop}}^{(g,t)} = \begin{cases} -q_{igt} & \text{if } d_{it} = 0 \quad \text{(not dropped; penalise dropout probability)} \\ 1 - q_{igt} & \text{if } d_{it} = 1 \quad \text{(dropped; reward dropout probability)} \end{cases}$$
+where $r_0 = 1$, $r_1 = t$, $r_2 = y$ select the regressor for each of the three gamma parameters
+$k=0,1,2$. The implementation computes this as one running sum per subject: every iteration of the
+per-wave loop adds the survival term with weight $-q$, and — only for subjects with $d_i=1$ — one
+extra term with weight $1-q$ is added after the loop, evaluated at $(t_m, y_{i,t_m})$.
 
-The gradients with respect to the three gamma parameters for group $g$ are:
-
-$$\frac{\partial \ell_i}{\partial \gamma_{g,0}} = P(g \mid i) \sum_{t > t_0} \varepsilon_{\text{drop}}^{(g,t)} \cdot 1$$
-
-$$\frac{\partial \ell_i}{\partial \gamma_{g,1}} = P(g \mid i) \sum_{t > t_0} \varepsilon_{\text{drop}}^{(g,t)} \cdot t$$
-
-$$\frac{\partial \ell_i}{\partial \gamma_{g,2}} = P(g \mid i) \sum_{t > t_0} \varepsilon_{\text{drop}}^{(g,t)} \cdot y_{i,t-1}$$
-
-As noted in Section 3e, these dropout gradients do not involve $\Gamma$ or $\delta$ at all — the dropout sub-model is unaffected by the V3.0 extension.
+As noted in Section 3e, these dropout gradients do not involve $\Gamma$ or $\delta$ at all — the dropout sub-model is entirely independent of the mixing-covariate/TVC machinery.
 
 ---
 
@@ -437,7 +460,7 @@ Because betas are estimated in **scaled time** $t' = t/s$, a polynomial coeffici
 
 $$D_{jj} = \begin{cases} s^{-p} & \text{if parameter } j \text{ is } \beta_{g,p} \text{ (polynomial coefficient of degree } p\text{)} \\ 1 & \text{for all other parameters (Gamma, delta, gamma\_drop, raw\_}\sigma\text{, zeta)} \end{cases}$$
 
-where $s$ is the time scale factor used at fit time. **V3.0 note:** mixing-covariate ($\Gamma$) and TVC ($\delta$) coefficients get $D_{jj}=1$ — they multiply arbitrary user-supplied covariates, not powers of rescaled time, so no unscaling applies. Continuous covariates on very different numeric scales should be standardized by the user before fitting to keep the Hessian well-conditioned (see identifiability guidance in the implementation notes).
+where $s$ is the time scale factor used at fit time. **Note:** mixing-covariate ($\Gamma$) and TVC ($\delta$) coefficients get $D_{jj}=1$ — they multiply arbitrary user-supplied covariates, not powers of rescaled time, so no unscaling applies. Continuous covariates on very different numeric scales should be standardized by the user before fitting to keep the Hessian well-conditioned (see identifiability guidance in the implementation notes).
 
 ---
 
@@ -451,7 +474,7 @@ $$\mathrm{SE}_{\text{model}} = \sqrt{\left|\operatorname{diag}(V_{\text{model}})
 
 The absolute value is taken element-wise to guard against small negative diagonal entries due to numerical imprecision.
 
-**V4.0 note:** under survey weighting, $H$ is the Hessian of the *weighted* NLL
+**Note:** under survey weighting, $H$ is the Hessian of the *weighted* NLL
 $-\ell_w(\theta)$, so $V_{\text{model}}$ is a weighted information-matrix inverse — but this
 naive "model-based" SE is **not** a valid/consistent variance estimator under weighting (Binder,
 1983; Skinner, Holt & Smith, 1989), since it ignores the weighting design entirely. It is
@@ -476,7 +499,7 @@ $$\mathrm{SE}_{\text{robust}} = \sqrt{\operatorname{diag}(V_{\text{robust}})}$$
 
 The sandwich estimator is consistent under misspecification of the within-subject correlation structure and heteroskedasticity (White, 1980).
 
-**V4.0 extension — weighted sandwich variance.** Under survey weighting (Section 1), the
+**Weighted sandwich variance.** Under survey weighting (Section 1), the
 implementation's per-subject score $\mathbf{g}_i$ is *already* the weighted score
 $w_i \cdot \nabla_\theta \ell_i(\hat\theta)$ (Section 4's weighting note), so the same formula
 above automatically yields:
@@ -497,11 +520,11 @@ AutoTraj reports **two parallel conventions**. They are equivalent for model sel
 
 Let:
 - $\ell = \ell(\hat\theta)$ — maximised log-likelihood (or $\ell_w(\hat\theta)$, the weighted
-  log-likelihood, when survey weights are used — see V4.0 note below)
-- $p$ — total number of free parameters (dimension of $\theta$; as of V3.0 this includes the $\Gamma$ and $\delta$ blocks when present)
+  log-likelihood, when survey weights are used — see the note below)
+- $p$ — total number of free parameters (dimension of $\theta$; includes the $\Gamma$ and $\delta$ blocks when present)
 - $N$ — number of **subjects** (not observations)
 
-**V4.0 note:** under survey weighting, AutoTraj plugs the *weighted* $\ell_w$ directly into the
+**Note:** under survey weighting, AutoTraj plugs the *weighted* $\ell_w$ directly into the
 formulas below with $N$ and $p$ left as the raw (unweighted) subject count and parameter count —
 a simplification consistent with common practice in weighted-GBTM software, not a fully resolved
 theoretical question (an "effective sample size" adjustment, e.g. Kish's design effect, is a
@@ -532,11 +555,12 @@ $$\text{AIC}_S = -2\ell + 2p$$
 
 A model with a smaller $\text{BIC}_S$ is preferred.
 
-The two conventions are related by:
+The two conventions are related by a simple scalar rescaling — each pair is exact algebraically,
+not merely equivalent for ranking purposes:
 
-$$\text{BIC}_S = -2 \cdot \text{BIC}_N - p \log N \quad \text{(not a simple sign flip)}$$
+$$\text{BIC}_S = -2 \cdot \text{BIC}_N, \qquad \text{AIC}_S = -2 \cdot \text{AIC}_N$$
 
-Both are displayed in AutoTraj output to facilitate comparison with other software.
+(Substituting $\text{BIC}_N = \ell - \tfrac12 p\log N$ gives $-2\text{BIC}_N = -2\ell + p\log N = \text{BIC}_S$ directly; likewise for AIC.) Both conventions are displayed in AutoTraj output to facilitate comparison with other software, and either can be derived from the other — AutoTraj computes both independently as a cross-check.
 
 ---
 
@@ -562,7 +586,7 @@ where $\hat{g}_i = \arg\max_g P(g \mid i)$ is the modal assignment and $N_g = |\
 
 $$\text{OCC}_g = \frac{\text{AvePP}_g / (1 - \text{AvePP}_g)}{\pi_g / (1 - \pi_g)}$$
 
-This is the ratio of the estimated odds of correct classification to the odds expected under random assignment. It equals 1.0 if the model provides no improvement over chance. **V3.0 note:** when mixing covariates are present, $\pi_g$ here is evaluated at the sample-average covariate profile (i.e., the marginal/average mixing proportion across subjects), since OCC is defined relative to a single reference "chance" rate per group.
+This is the ratio of the estimated odds of correct classification to the odds expected under random assignment. It equals 1.0 if the model provides no improvement over chance. **Note:** when mixing covariates are present, $\pi_g$ here is evaluated at the sample-average covariate profile (i.e., the marginal/average mixing proportion across subjects), since OCC is defined relative to a single reference "chance" rate per group.
 
 **Adequacy threshold:** $\text{OCC}_g \geq 5.0$ (Nagin, 2005).
 
@@ -594,14 +618,14 @@ The inner double sum equals the total entropy of the posterior distribution (whi
 
 ---
 
-## 9. Joint Dual-Trajectory Model (V5.0)
+## 9. Joint Dual-Trajectory Model
 
 This section is **additive** — it describes a separate model family and does not modify §1-§8.
 Two outcomes Y and Z, each with its own independent GBTM structure (own group count, polynomial
 orders, distribution, dropout toggle), linked by a **joint latent-class probability matrix**
 $\pi_{gh}$ ($K_Y \times K_Z$) instead of assuming the two outcomes' group memberships are
 independent — the standard "dual trajectory" approach (Nagin & Tremblay). Does not compose with
-V3.0's mixing-covariates/TVC or V4.0's survey weights in this pass (deferred future extensions).
+the mixing-covariates/TVC or survey-weight machinery in this pass (deferred future extensions).
 
 ### 9a. Conditional Independence Assumption
 
@@ -611,7 +635,7 @@ $$P(y_i, z_i \mid g, h) = P(y_i \mid g) \cdot P(z_i \mid h)$$
 
 where each factor is computed by the **same** single-outcome machinery in §3 — Y's factor uses
 outcome Y's own distribution/parameters exactly as a standalone single-outcome model would, and
-likewise for Z. No new per-observation likelihood formulas are introduced by V5.0.
+likewise for Z. No new per-observation likelihood formulas are introduced by this section.
 
 ### 9b. Parameter Vector Layout
 
@@ -624,7 +648,7 @@ $$\text{Z-BLOCK} = [\, \beta_Z \;|\; \gamma_{\text{drop},Z} \text{ (optional)} \
   implicitly $\theta_{0,0} \equiv 0$.
 - **Y-BLOCK / Z-BLOCK**: each is exactly a "solo" single-outcome parameter vector — group-major
   $\beta$, then optional 3-per-group dropout $\gamma$, then an optional CNORM raw-$\sigma$ or ZIP
-  $\zeta$ tail — identical in form to §2b-2e/2f with no Gamma/delta blocks (V5.0 doesn't use
+  $\zeta$ tail — identical in form to §2b-2e/2f with no Gamma/delta blocks (this model doesn't use
   mixing covariates or TVCs). **Y's tail sits immediately before Z's block starts** (not at the
   vector's absolute end) — this is what makes $\theta_{\text{joint}}$'s Y-slice and Z-slice each
   individually look like a standalone single-outcome vector with its own tail "at the end" of
@@ -710,7 +734,7 @@ outcome** and then **consistently re-permute $\pi_{gh}$ across both axes**:
    **approximation** — same caveat as the base model's Gamma SE carryover (§2a's note). Y-BLOCK/
    Z-BLOCK beta/dropout/tail SEs are exact (pure mechanical permutation).
 
-This is the highest-risk correctness surface in the V5.0 implementation. It is verified by a
+This is the highest-risk correctness surface in the joint dual-trajectory implementation. It is verified by a
 dedicated invariance test: resorting a hand-built parameter vector must reproduce the identical
 NLL on the same data before vs. after the resort (label permutation is a likelihood-invariant
 symmetry — the strongest available check), analogous to the equivalent 1-D invariance test added
@@ -718,8 +742,9 @@ for the base model's `sort_groups_by_intercept`.
 
 ### 9g. Backward-Compatibility Framing
 
-Unlike V3.0's "$P=0,Q=0$" and V4.0's "$w_i\equiv 1$" invariants (which reduce a wider model back
-to the *exact same* prior model), V5.0 is a wholly new capability with no default that reduces to
+Unlike the mixing-covariate machinery's "$P=0,Q=0$" and the survey-weight machinery's
+"$w_i\equiv 1$" invariants (each of which reduces a wider model back to the *exact same* prior
+model), the joint dual-trajectory model is a wholly new capability with no default that reduces to
 an existing single-outcome fit. The closest analogous guarantee: with $K_Z=1$, $P(z_i\mid h{=}0)$
 has no $g$-dependence, so the joint log-likelihood **additively separates**:
 
@@ -729,4 +754,4 @@ $$\log P(y_i,z_i) = \log P(z_i\mid h{=}0) + \log\sum_g \pi_g P(y_i\mid g)$$
 optimum equals the single-outcome Y MLE exactly. Because it is nonetheless a different (larger,
 jointly-optimized) numerical problem, this is checked via **tolerance-based** agreement against an
 independent single-outcome fit, not bit-identical equality — a deliberately weaker guarantee than
-V3.0/V4.0's invariants, stated as such rather than oversold.
+the other invariants above, stated as such rather than oversold.
