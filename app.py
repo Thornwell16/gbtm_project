@@ -1320,6 +1320,14 @@ with st.sidebar:
             "Multi-Start Restarts", min_value=1, max_value=20, value=default_starts,
             help="Number of random starting points per model. More starts reduce local-optima risk."
         )
+        manual_min_per_model = st.number_input(
+            "Est. Manual Time per Model (min)", min_value=0.5, max_value=60.0, value=5.0, step=0.5,
+            help="Rough assumption for how long it takes to specify, run, and check ONE model by "
+                 "hand in SAS/Stata/R (edit syntax, rerun, inspect BIC/significance/group size, "
+                 "decide accept/reject) — this is an editable estimate, not a benchmark. Adjust it "
+                 "to match your own workflow speed; it only drives the 'Manual Proc Time' comparison "
+                 "shown after fitting."
+        )
 
         if app_mode == "AutoTraj Search":
             st.markdown('<span class="sidebar-section-header">5. Search Grid</span>', unsafe_allow_html=True)
@@ -2088,6 +2096,11 @@ else:
                 winning_model = top_models[selected_rank]
 
                 with st.expander(f"📊 Compare Top {min(len(top_models), 10)} Models", expanded=False):
+                    st.caption(
+                        "Shortlist view: only models that passed the heuristic rejection rules, "
+                        "ranked by BIC. For every specification tried — including rejected and "
+                        "non-converged ones — see the 'BIC Search Diagnostics' tab below."
+                    )
                     comparison_rows = []
                     for i, m in enumerate(top_models[:10]):
                         comparison_rows.append({
@@ -2134,10 +2147,12 @@ else:
             if winning_model.get('cond_num', 0) > 1e10 or np.any(winning_model['se_model'] < 1e-3) or np.any(winning_model['se_model'] > 50):
                 st.warning("⚠️ **Warning: Unidentifiable Model Detected.** Standard errors are degenerate. Consider reducing groups.")
 
-            n_eval      = len(all_evaluated) if all_evaluated else 1
-            mps         = n_eval / run_time_val if run_time_val > 0 else 0
-            manual_mins = n_eval * 5
-            manual_str  = f"~{manual_mins} mins" if manual_mins < 60 else f"~{manual_mins/60:.1f} hrs"
+            n_eval        = len(all_evaluated) if all_evaluated else 1
+            mps           = n_eval / run_time_val if run_time_val > 0 else 0
+            manual_mins   = n_eval * manual_min_per_model
+            manual_str    = f"~{manual_mins:.0f} min" if manual_mins < 60 else f"~{manual_mins/60:.1f} hrs"
+            time_saved_min = manual_mins - (run_time_val / 60.0)
+            saved_str      = f"~{time_saved_min:.0f} min saved" if time_saved_min < 60 else f"~{time_saved_min/60:.1f} hrs saved"
 
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("BIC (Nagin)",    f"{winning_model['bic_nagin']:.2f}")
@@ -2148,7 +2163,13 @@ else:
             col5, col6, col7 = st.columns(3)
             col5.metric("Log-Likelihood", f"{winning_model['ll']:.2f}")
             col6.metric("Engine Time",    f"{run_time_val:.2f}s", f"{n_eval} models | {mps:.1f}/sec", delta_color="off")
-            col7.metric("Manual Proc Time", manual_str, "vs. SAS Syntax", delta_color="off")
+            col7.metric(
+                "Manual Proc Time (est.)", manual_str, saved_str,
+                delta_color="normal" if time_saved_min > 0 else "off",
+                help=f"Based on your 'Est. Manual Time per Model' assumption of {manual_min_per_model:.1f} "
+                     f"min × {n_eval} model(s) evaluated — an editable estimate (see the sidebar), not a "
+                     "benchmark. Compares against this run's actual Engine Time.",
+            )
 
             st.markdown("##### ✏️ Customize Plot Labels & Group Names")
             col_lbl1, col_lbl2 = st.columns(2)
@@ -2181,9 +2202,9 @@ else:
             st.divider()
             st.subheader("Publication Suite")
 
-            tab_viz, tab_est, tab_adq, tab_char, tab_comp = st.tabs([
+            tab_viz, tab_est, tab_adq, tab_char, tab_comp, tab_export = st.tabs([
                 "Trajectories", "Parameter Estimates", "Model Adequacy",
-                "Baseline Characteristics", "Model Comparison"
+                "Baseline Characteristics", "BIC Search Diagnostics", "Reports & Exports"
             ])
 
             # ── VISUALIZATION TAB ─────────────────────────────────────────────
@@ -2714,93 +2735,97 @@ else:
                 elif app_mode == "Single Model Mode":
                     st.info("Model Comparison is only available in AutoTraj Search mode.")
 
-            # ── EXPORT SECTION ────────────────────────────────────────────────
+            # ── REPORTS & EXPORTS TAB ─────────────────────────────────────────
 
-            st.divider()
-            st.subheader("Export")
-
-            export_col1, export_col2, export_col3, export_col4 = st.columns(4)
-
-            with export_col1:
-                st.download_button(
-                    label="📥 Download Posterior Probabilities (CSV)",
-                    data=assignments_df.to_csv(index=False).encode('utf-8'),
-                    file_name='gbtm_trajectory_assignments.csv', mime='text/csv'
+            with tab_export:
+                st.caption(
+                    "Every export below reflects the model currently selected above (Model "
+                    "Explorer / Publication Suite), including the Plain-Language Summary shown "
+                    "at the top of the page."
                 )
 
-            with export_col2:
-                # ── Full Results Package (ZIP) ──────────────────────────────
-                adq_df_exp, rel_entropy_exp = calc_model_adequacy(
-                    assignments_df, winning_pis_raw, group_names)
-                estimates_df_exp = get_parameter_estimates_for_ui(winning_model, group_names)
-                summary_txt = _make_model_summary_txt(winning_model, group_names, rel_entropy_exp)
+                export_col1, export_col2, export_col3, export_col4 = st.columns(4)
 
-                # Render plot to bytes
-                buf_svg_exp = io.BytesIO()
-                buf_png_exp = io.BytesIO()
-                try:
-                    fig_mpl.savefig(buf_svg_exp, format='svg', bbox_inches='tight')
-                    fig_mpl.savefig(buf_png_exp, format='png', dpi=300, bbox_inches='tight')
-                    buf_svg_exp.seek(0)
-                    buf_png_exp.seek(0)
-                    plot_bytes_available = True
-                except Exception:
-                    plot_bytes_available = False
+                with export_col1:
+                    st.download_button(
+                        label="📥 Download Posterior Probabilities (CSV)",
+                        data=assignments_df.to_csv(index=False).encode('utf-8'),
+                        file_name='gbtm_trajectory_assignments.csv', mime='text/csv'
+                    )
 
-                zip_buf = io.BytesIO()
-                with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr("parameter_estimates.csv",    estimates_df_exp.to_csv(index=False))
-                    zf.writestr("posterior_assignments.csv",  assignments_df.to_csv(index=False))
-                    zf.writestr("adequacy_metrics.csv",       adq_df_exp.to_csv(index=False))
-                    zf.writestr("model_summary.txt",          summary_txt)
-                    zf.writestr("plain_language_summary.md",  plain_summary_txt)
-                    if all_evaluated:
-                        comp_df_exp = pd.DataFrame(all_evaluated)
-                        zf.writestr("model_comparison.csv",  comp_df_exp.to_csv(index=False))
-                    if plot_bytes_available:
-                        zf.writestr("trajectory_plot.svg",   buf_svg_exp.read())
-                        zf.writestr("trajectory_plot.png",   buf_png_exp.read())
-                zip_buf.seek(0)
+                with export_col2:
+                    # ── Full Results Package (ZIP) ──────────────────────────
+                    adq_df_exp, rel_entropy_exp = calc_model_adequacy(
+                        assignments_df, winning_pis_raw, group_names)
+                    estimates_df_exp = get_parameter_estimates_for_ui(winning_model, group_names)
+                    summary_txt = _make_model_summary_txt(winning_model, group_names, rel_entropy_exp)
 
-                st.download_button(
-                    label="📦 Download Full Results Package (.zip)",
-                    data=zip_buf,
-                    file_name='gbtm_results_package.zip',
-                    mime='application/zip'
-                )
+                    # Render plot to bytes
+                    buf_svg_exp = io.BytesIO()
+                    buf_png_exp = io.BytesIO()
+                    try:
+                        fig_mpl.savefig(buf_svg_exp, format='svg', bbox_inches='tight')
+                        fig_mpl.savefig(buf_png_exp, format='png', dpi=300, bbox_inches='tight')
+                        buf_svg_exp.seek(0)
+                        buf_png_exp.seek(0)
+                        plot_bytes_available = True
+                    except Exception:
+                        plot_bytes_available = False
 
-            with export_col3:
-                report_html = _build_html_report(
-                    winning_model, group_names, estimates_df_exp, adq_df_exp, rel_entropy_exp,
-                    summary_txt, report_equations,
-                    png_bytes=buf_png_exp.getvalue() if plot_bytes_available else None,
-                    plain_summary=plain_summary_txt,
-                )
-                st.download_button(
-                    label="📄 Generate HTML Report",
-                    data=report_html.encode('utf-8'),
-                    file_name='gbtm_model_report.html', mime='text/html',
-                    help="A single shareable HTML file with the model summary, equations, "
-                         "parameter table, adequacy diagnostics, and trajectory plot.",
-                )
+                    zip_buf = io.BytesIO()
+                    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        zf.writestr("parameter_estimates.csv",    estimates_df_exp.to_csv(index=False))
+                        zf.writestr("posterior_assignments.csv",  assignments_df.to_csv(index=False))
+                        zf.writestr("adequacy_metrics.csv",       adq_df_exp.to_csv(index=False))
+                        zf.writestr("model_summary.txt",          summary_txt)
+                        zf.writestr("plain_language_summary.md",  plain_summary_txt)
+                        if all_evaluated:
+                            comp_df_exp = pd.DataFrame(all_evaluated)
+                            zf.writestr("model_comparison.csv",  comp_df_exp.to_csv(index=False))
+                        if plot_bytes_available:
+                            zf.writestr("trajectory_plot.svg",   buf_svg_exp.read())
+                            zf.writestr("trajectory_plot.png",   buf_png_exp.read())
+                    zip_buf.seek(0)
 
-            with export_col4:
-                try:
-                    report_pdf = _build_pdf_report(
+                    st.download_button(
+                        label="📦 Download Full Results Package (.zip)",
+                        data=zip_buf,
+                        file_name='gbtm_results_package.zip',
+                        mime='application/zip'
+                    )
+
+                with export_col3:
+                    report_html = _build_html_report(
                         winning_model, group_names, estimates_df_exp, adq_df_exp, rel_entropy_exp,
                         summary_txt, report_equations,
                         png_bytes=buf_png_exp.getvalue() if plot_bytes_available else None,
                         plain_summary=plain_summary_txt,
                     )
                     st.download_button(
-                        label="📑 Generate PDF Report",
-                        data=report_pdf,
-                        file_name='gbtm_model_report.pdf', mime='application/pdf',
-                        help="A print-ready PDF version of the same report — suitable for "
-                             "journal supplementary materials.",
+                        label="📄 Generate HTML Report",
+                        data=report_html.encode('utf-8'),
+                        file_name='gbtm_model_report.html', mime='text/html',
+                        help="A single shareable HTML file with the model summary, equations, "
+                             "parameter table, adequacy diagnostics, and trajectory plot.",
                     )
-                except Exception as e:
-                    st.caption(f"PDF report unavailable: {e}")
+
+                with export_col4:
+                    try:
+                        report_pdf = _build_pdf_report(
+                            winning_model, group_names, estimates_df_exp, adq_df_exp, rel_entropy_exp,
+                            summary_txt, report_equations,
+                            png_bytes=buf_png_exp.getvalue() if plot_bytes_available else None,
+                            plain_summary=plain_summary_txt,
+                        )
+                        st.download_button(
+                            label="📑 Generate PDF Report",
+                            data=report_pdf,
+                            file_name='gbtm_model_report.pdf', mime='application/pdf',
+                            help="A print-ready PDF version of the same report — suitable for "
+                                 "journal supplementary materials.",
+                        )
+                    except Exception as e:
+                        st.caption(f"PDF report unavailable: {e}")
 
         else:
             st.error("Model Failed to Converge or was rejected based on heuristic rules.")

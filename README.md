@@ -109,6 +109,7 @@ Test suites:
 | Parameter Recovery | `tests/test_parameter_recovery.py` | 24 tests: simulate known ground-truth (incl. weighted and joint dual-trajectory models), verify AutoTraj recovers parameters |
 | Cambridge Benchmark | `tests/test_cambridge_benchmark.py` | 7 tests: validate against Nagin (1999) published results |
 | Edge Cases | `tests/test_edge_cases.py` | 21 tests: pathological inputs, boundary conditions, reproducibility, label-switching invariance |
+| App Helpers | `tests/test_app_helpers.py` | 5 tests: plain-language summary, HTML/PDF report generation (UI-layer, no Streamlit runtime needed) |
 
 ## Architecture Capabilities
 AutoTraj is actively maintained. Beyond the core GBTM engine, it includes:

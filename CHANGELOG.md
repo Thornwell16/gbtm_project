@@ -20,7 +20,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
   tables), built with `reportlab` — a pure-Python PDF library with no external binary or system
   dependency (deliberately avoiding `wkhtmltopdf`/`weasyprint`, which need system libraries that
   aren't reliably available across Windows/Streamlit Cloud).
-
+- **Configurable "Manual Proc Time" comparison** — the "time saved vs. hand-fitting" metric
+  previously used a hardcoded, unexplained assumption (5 minutes per model). It's now a sidebar
+  input ("Est. Manual Time per Model") with explicit help text framing it as an editable estimate
+  of analyst workflow time, not a benchmark — and the results view now shows an explicit "time
+  saved" delta rather than just two side-by-side numbers.
+- **Publication Suite reorganized**: exports (CSV/ZIP/HTML/PDF) moved from a standalone section
+  after the tabs into a proper "Reports & Exports" tab, so the Publication Suite is the actual
+  one-stop-shop its name implies. The "Model Comparison" tab (all evaluated specifications,
+  including rejected/failed ones) was renamed "BIC Search Diagnostics" to disambiguate it from the
+  "Compare Top Models" shortlist view (valid, ranked candidates only) added earlier — each now
+  cross-references the other.
+- **New `tests/test_app_helpers.py`** — permanent regression coverage for the plain-language
+  summary and HTML/PDF report generation, previously only smoke-tested ad hoc during development.
 
 - **~2.3x faster fitting via parallel multi-start restarts.** The three fitting entry points
   (`run_single_model`, `run_autotraj`, `run_joint_dual_trajectory_model`) now run their multi-start
