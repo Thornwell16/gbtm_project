@@ -6,6 +6,7 @@ CI coverage so future edits to app.py can't silently break report
 generation without a test failing.
 """
 import numpy as np
+import pandas as pd
 import pytest
 
 from app import (
@@ -14,6 +15,7 @@ from app import (
     _build_pdf_report,
     _make_model_summary_txt,
     get_parameter_estimates_for_ui,
+    _suggest_distribution,
 )
 from main import (
     run_single_model,
@@ -129,3 +131,59 @@ def test_pdf_report_embeds_a_plot_image(fitted_model):
     )
     assert pdf_with[:5] == b'%PDF-'
     assert len(pdf_with) > len(pdf_without)
+
+
+# ---------------------------------------------------------------------------
+# _suggest_distribution
+# ---------------------------------------------------------------------------
+
+def test_suggest_distribution_binary():
+    s = pd.Series([0, 1, 0, 1, 1, 0, 0, 1] * 20)
+    result = _suggest_distribution(s)
+    assert result['suggestion'] == 'LOGIT'
+    assert result['confidence'] == 'high'
+
+
+def test_suggest_distribution_count_no_excess_zeros():
+    rng = np.random.default_rng(1)
+    s = pd.Series(rng.poisson(lam=4.0, size=2000))
+    result = _suggest_distribution(s)
+    assert result['suggestion'] == 'POISSON'
+
+
+def test_suggest_distribution_zero_inflated_count():
+    rng = np.random.default_rng(2)
+    base = rng.poisson(lam=3.0, size=2000)
+    extra_zeros = np.zeros(800, dtype=int)
+    s = pd.Series(np.concatenate([base, extra_zeros]))
+    result = _suggest_distribution(s)
+    assert result['suggestion'] == 'ZIP'
+    assert result['stats']['p0_observed'] > result['stats']['p0_poisson_implied']
+
+
+def test_suggest_distribution_continuous():
+    rng = np.random.default_rng(3)
+    s = pd.Series(rng.normal(loc=5.0, scale=2.0, size=1000))
+    result = _suggest_distribution(s)
+    assert result['suggestion'] == 'CNORM'
+
+
+def test_suggest_distribution_continuous_with_floor_ceiling_spikes():
+    # scale=5 vs. a clip range of width 10 forces a substantial fraction of
+    # mass to pile up at each boundary (~15-16% here), reliably clearing the
+    # 5% floor/ceiling-spike threshold regardless of the exact random draw.
+    rng = np.random.default_rng(4)
+    s = pd.Series(np.clip(rng.normal(loc=5.0, scale=5.0, size=1000), 0, 10))
+    result = _suggest_distribution(s)
+    assert result['suggestion'] == 'CNORM'
+    assert result['stats']['pct_at_min'] > 5.0 and result['stats']['pct_at_max'] > 5.0
+    assert result['confidence'] == 'high'
+
+
+def test_suggest_distribution_matches_cambridge_binary_outcome():
+    """Real-data sanity check: Cambridge's binary conviction outcome should
+    suggest LOGIT, matching how the dataset is actually modeled."""
+    df = load_cambridge_data()
+    long_df = prep_trajectory_data(df)
+    result = _suggest_distribution(long_df['Outcome'])
+    assert result['suggestion'] == 'LOGIT'

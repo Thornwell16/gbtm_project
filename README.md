@@ -106,10 +106,10 @@ make lint
 Test suites:
 | Suite | File | Description |
 |-------|------|-------------|
-| Parameter Recovery | `tests/test_parameter_recovery.py` | 24 tests: simulate known ground-truth (incl. weighted and joint dual-trajectory models), verify AutoTraj recovers parameters |
+| Parameter Recovery | `tests/test_parameter_recovery.py` | 25 tests: simulate known ground-truth (incl. weighted, joint dual-trajectory, and joint AutoTraj Search models), verify AutoTraj recovers parameters |
 | Cambridge Benchmark | `tests/test_cambridge_benchmark.py` | 7 tests: validate against Nagin (1999) published results |
-| Edge Cases | `tests/test_edge_cases.py` | 21 tests: pathological inputs, boundary conditions, reproducibility, label-switching invariance |
-| App Helpers | `tests/test_app_helpers.py` | 5 tests: plain-language summary, HTML/PDF report generation (UI-layer, no Streamlit runtime needed) |
+| Edge Cases | `tests/test_edge_cases.py` | 24 tests: pathological inputs, boundary conditions, reproducibility, label-switching invariance, joint search rejection cascade |
+| App Helpers | `tests/test_app_helpers.py` | 11 tests: plain-language summary, HTML/PDF report generation, distribution-suggestion heuristic (UI-layer, no Streamlit runtime needed) |
 
 ## Architecture Capabilities
 AutoTraj is actively maintained. Beyond the core GBTM engine, it includes:
@@ -120,7 +120,9 @@ AutoTraj is actively maintained. Beyond the core GBTM engine, it includes:
 
 * **Survey Weights:** Inverse probability sampling weights for complex stratified national surveys, with Huber-White sandwich standard errors as the valid inference basis.
 
-* **Joint Trajectories:** Nagin-style dual-trajectory FMM architecture — two outcomes with independent group structures linked by a joint latent-class probability matrix, for modeling interacting longitudinal outcomes.
+* **Joint Trajectories:** Nagin-style dual-trajectory FMM architecture — two outcomes with independent group structures linked by a joint latent-class probability matrix, for modeling interacting longitudinal outcomes. Fully automated: AutoTraj Search evaluates every group/order combination for **both** outcomes simultaneously and ranks the results by BIC, exactly like the single-outcome search — not a lesser, manually-specified alternative.
+
+* **Distribution Suggestions:** The Data Quality Preview inspects each outcome column and suggests an appropriate distribution (LOGIT/CNORM/POISSON/ZIP) with a plain-English explanation of the reasoning — informational only, never a hard gate.
 
 See CHANGELOG.md for the detailed history of when each capability was added.
 

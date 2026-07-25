@@ -9,6 +9,46 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### New Features
 
+- **AutoTraj Search for the joint dual-trajectory model** (`run_joint_autotraj`) — the joint model
+  is now fully automated, exactly like the single-outcome path: every group/order combination for
+  **both** outcomes is evaluated (Cartesian product of each outcome's own combinatorial grid),
+  poorly-specified fits are rejected via the same heuristic cascade as `run_autotraj` (singularity,
+  degenerate SEs, per-outcome minimum group size, per-outcome highest-order-term significance — the
+  latter two newly doubled across Y and Z), and survivors are ranked by BIC. Dual-Trajectory Mode's
+  sidebar now has an "AutoTraj Search (grid)" vs. "Single Model (fixed spec)" toggle (defaulting to
+  Search), range sliders per outcome, a two-tier size guardrail (raw combo count, since joint fits
+  are pricier per-combination than single-outcome ones — and total optimizer runs), a Joint Model
+  Explorer + "Compare Top Models" shortlist view, and a "BIC Search Diagnostics" table covering
+  every specification tried, including rejected ones. The existing fixed-spec capability is
+  unchanged, just no longer the default. New tests: a recovery test confirming the search finds the
+  true combined `(K_Y, orders_Y) x (K_Z, orders_Z)` specification from simulated data, a rejection-
+  cascade test, an overparameterization-rejection test, and a guardrail-sizing regression test
+  (the two-grid combo count must be the *product* of each grid's size, not their sum).
+- **Distribution-suggestion heuristic** (`_suggest_distribution`) — the Data Quality Preview (both
+  single-outcome and joint modes) now inspects each outcome column and suggests an appropriate
+  distribution with a plain-English explanation: binary values suggest LOGIT; non-negative integer
+  counts are checked for excess zeros (observed zero rate vs. what a plain Poisson process with the
+  same mean would predict) to distinguish POISSON from ZIP; continuous values default to CNORM,
+  noting floor/ceiling spikes as evidence for genuine censoring. Purely informational — never
+  blocks a fit — and flags a mismatch when the sidebar's actual distribution selection differs from
+  the suggestion. 6 new tests covering all four branches plus a real-data sanity check against
+  Cambridge's binary conviction outcome.
+- **About & Docs refreshed** to describe the full current feature set (joint modeling and its
+  automated search, covariates, survey weights, the Publication Suite, distribution suggestions,
+  and programmatic/pip usage) — previously described only the original single-outcome engine.
+
+### Fixes
+
+- **Critical: Joint Mode results never displayed after fitting.** A stray line
+  (`st.session_state.joint_model = None`) inside the Fit Log expander wiped the just-fitted model
+  immediately after every successful fit whenever the fit log had any content (i.e. whenever any
+  multi-start restart beat the first one — common) — the results section below was gated on that
+  same session-state key, so it silently never rendered. Found while building the joint search
+  feature above (same code region); fixed by removing the stray line. Verified via a Streamlit
+  `AppTest` simulation of the full fit-and-display flow, for both Search and Single Model modes.
+
+### New Features (continued)
+
 - **Plain-Language Summary** — a rule-based (not AI-generated) auto-interpretation of each fitted
   model: classifies each group's trajectory by relative level and direction (stable/increasing/
   decreasing, comparing fitted values at the first vs. last observed time point), and summarizes

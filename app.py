@@ -79,12 +79,99 @@ from main import (
     get_subject_assignments,
     calc_model_adequacy,
     run_joint_dual_trajectory_model,
+    run_joint_autotraj,
     get_joint_subject_assignments,
     calc_joint_model_adequacy,
     _joint_layout,
 )
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+def _suggest_distribution(outcome_series):
+    """Heuristically suggest a distribution family for an outcome variable,
+    with a plain-English explanation of the statistical reasoning behind it.
+
+    Purely informational — never raises, never gates a fit. The specific
+    thresholds below (1.5x + 5pp margin for the ZIP-vs-POISSON call; 5% for
+    the floor/ceiling-spike note) are stated explicitly in the returned
+    explanation text rather than hidden, so they're easy to see and recalibrate
+    if they prove off in practice.
+
+    Args:
+        outcome_series: pandas Series of observed outcome values (may contain
+            NaNs, which are dropped before inspection).
+
+    Returns:
+        dict with keys:
+            'suggestion':  'LOGIT' | 'POISSON' | 'ZIP' | 'CNORM'.
+            'explanation': plain-English reasoning, including the actual
+                           numbers behind the call.
+            'confidence':  'high' | 'medium'.
+            'stats':       dict of the raw numbers referenced above.
+    """
+    s = outcome_series.dropna()
+    stats = {'n': int(len(s)), 'min': float(s.min()), 'max': float(s.max()), 'mean': float(s.mean())}
+
+    unique_vals = set(s.unique().tolist())
+    if unique_vals.issubset({0, 1, 0.0, 1.0}):
+        return {
+            'suggestion': 'LOGIT', 'confidence': 'high', 'stats': stats,
+            'explanation': (
+                f"All {stats['n']:,} observed values are 0 or 1 (binary) — LOGIT is the "
+                "standard choice for a binary outcome."
+            ),
+        }
+
+    is_nonneg_int = (
+        pd.api.types.is_numeric_dtype(s) and (s >= 0).all()
+        and s.apply(lambda x: float(x) == int(x)).all()
+    )
+    if is_nonneg_int:
+        mean = stats['mean']
+        p0_poisson = float(np.exp(-mean)) if mean > 0 else 1.0
+        p0_observed = float((s == 0).mean())
+        stats.update({'p0_observed': p0_observed, 'p0_poisson_implied': p0_poisson})
+        if p0_observed > p0_poisson * 1.5 and (p0_observed - p0_poisson) > 0.05:
+            return {
+                'suggestion': 'ZIP', 'confidence': 'medium', 'stats': stats,
+                'explanation': (
+                    f"{p0_observed*100:.1f}% of observations are zero, but a Poisson process "
+                    f"with mean {mean:.2f} would predict only {p0_poisson*100:.1f}% zeros — "
+                    "ZIP is likely more appropriate than plain POISSON."
+                ),
+            }
+        return {
+            'suggestion': 'POISSON', 'confidence': 'medium', 'stats': stats,
+            'explanation': (
+                f"Values are non-negative integers (count data). Observed zero rate "
+                f"({p0_observed*100:.1f}%) is close to the Poisson-implied rate "
+                f"({p0_poisson*100:.1f}% given mean {mean:.2f}) — no strong excess-zero "
+                "signal, so plain POISSON is likely sufficient."
+            ),
+        }
+
+    # Continuous fallback.
+    at_min_pct = float((s == stats['min']).mean()) * 100
+    at_max_pct = float((s == stats['max']).mean()) * 100
+    stats.update({'pct_at_min': at_min_pct, 'pct_at_max': at_max_pct})
+    censoring_note = ""
+    if at_min_pct > 5.0 or at_max_pct > 5.0:
+        censoring_note = (
+            f" Note: {at_min_pct:.1f}% of values are exactly at the observed minimum "
+            f"({stats['min']:.2f}) and {at_max_pct:.1f}% at the maximum ({stats['max']:.2f}) — "
+            "spikes at the boundary can indicate floor/ceiling censoring, which CNORM's "
+            "Tobit-style bounds are designed to handle."
+        )
+    return {
+        'suggestion': 'CNORM', 'confidence': 'high' if censoring_note else 'medium',
+        'stats': stats,
+        'explanation': (
+            f"Values are continuous, ranging [{stats['min']:.2f}, {stats['max']:.2f}]. "
+            f"CNORM is the standard choice; consider setting its Min/Max bounds to at "
+            f"least this observed range.{censoring_note}"
+        ),
+    }
+
 
 def _beta_start_indices(orders_list, n_mix=1):
     """Return list of (start_idx, n_betas) tuples for each group's beta block.
@@ -1266,6 +1353,8 @@ if 'run_complete' not in st.session_state:
     st.session_state.raw_df      = None
     st.session_state.use_sample_data = False
     st.session_state.use_joint_sample_data = False
+    st.session_state.joint_top_models = None
+    st.session_state.joint_all_evaluated = None
 
 with st.sidebar:
     st.markdown("""
@@ -1354,10 +1443,17 @@ with st.sidebar:
     elif app_mode == "Dual-Trajectory (Joint) Mode":
         st.caption(
             "Two outcomes (Y, Z) linked by a joint latent-class probability "
-            "matrix, instead of assuming independent group membership. Long format "
-            "only — single model specification (no AutoTraj-style search over both "
-            "outcomes' group/order grids)."
+            "matrix, instead of assuming independent group membership. Long format only."
         )
+        joint_run_mode = st.radio(
+            "Fitting mode:", ["AutoTraj Search (grid)", "Single Model (fixed spec)"],
+            horizontal=True, key="joint_run_mode",
+            help="AutoTraj Search automatically evaluates every group/order combination for "
+                 "BOTH outcomes and ranks the results — the same automation the single-outcome "
+                 "AutoTraj Search provides. Single Model fits one fixed specification you choose.",
+        )
+        joint_is_search = joint_run_mode.startswith("AutoTraj Search")
+
         st.markdown('<span class="sidebar-section-header">1. Data Mapping (Long Format)</span>', unsafe_allow_html=True)
         joint_id_col = st.text_input("ID Col", value="ID", key="joint_id_col")
         col_jy1, col_jy2 = st.columns(2)
@@ -1378,11 +1474,15 @@ with st.sidebar:
             if miny.strip() != "": joint_cnorm_min_y = float(miny)
             if maxy.strip() != "": joint_cnorm_max_y = float(maxy)
         joint_dropout_y = st.checkbox("Include MNAR Dropout (Y)", value=False, key="joint_drop_y")
-        joint_k_y = st.number_input("Number of Groups (Y)", min_value=1, max_value=6, value=2, key="joint_k_y")
-        joint_orders_y = [
-            st.number_input(f"Y Group {i+1} Order", min_value=0, max_value=5, value=1, key=f"joint_oy_{i}")
-            for i in range(joint_k_y)
-        ]
+        if joint_is_search:
+            group_range_y = st.slider("Min & Max Groups (Y)", 1, 6, (1, 2), key="joint_group_range_y")
+            order_range_y = st.slider("Min & Max Polynomial Order (Y)", 0, 5, (0, 2), key="joint_order_range_y")
+        else:
+            joint_k_y = st.number_input("Number of Groups (Y)", min_value=1, max_value=6, value=2, key="joint_k_y")
+            joint_orders_y = [
+                st.number_input(f"Y Group {i+1} Order", min_value=0, max_value=5, value=1, key=f"joint_oy_{i}")
+                for i in range(joint_k_y)
+            ]
 
         st.markdown('<span class="sidebar-section-header">3. Outcome Z</span>', unsafe_allow_html=True)
         joint_dist_z = st.selectbox("Distribution:", ["LOGIT", "CNORM", "POISSON", "ZIP"], key="joint_dist_z")
@@ -1395,17 +1495,45 @@ with st.sidebar:
             if minz.strip() != "": joint_cnorm_min_z = float(minz)
             if maxz.strip() != "": joint_cnorm_max_z = float(maxz)
         joint_dropout_z = st.checkbox("Include MNAR Dropout (Z)", value=False, key="joint_drop_z")
-        joint_k_z = st.number_input("Number of Groups (Z)", min_value=1, max_value=6, value=2, key="joint_k_z")
-        joint_orders_z = [
-            st.number_input(f"Z Group {i+1} Order", min_value=0, max_value=5, value=1, key=f"joint_oz_{i}")
-            for i in range(joint_k_z)
-        ]
+        if joint_is_search:
+            group_range_z = st.slider("Min & Max Groups (Z)", 1, 6, (1, 2), key="joint_group_range_z")
+            order_range_z = st.slider("Min & Max Polynomial Order (Z)", 0, 5, (0, 2), key="joint_order_range_z")
+        else:
+            joint_k_z = st.number_input("Number of Groups (Z)", min_value=1, max_value=6, value=2, key="joint_k_z")
+            joint_orders_z = [
+                st.number_input(f"Z Group {i+1} Order", min_value=0, max_value=5, value=1, key=f"joint_oz_{i}")
+                for i in range(joint_k_z)
+            ]
 
         st.markdown('<span class="sidebar-section-header">4. Engine Options</span>', unsafe_allow_html=True)
         joint_n_starts = st.number_input(
             "Multi-Start Restarts", min_value=1, max_value=20, value=5, key="joint_n_starts",
             help="Number of random starting points. More starts reduce local-optima risk."
         )
+
+        if joint_is_search:
+            st.markdown('<span class="sidebar-section-header">5. Heuristic Rules</span>', unsafe_allow_html=True)
+            joint_min_pct = st.slider("Min Group Size (%, both outcomes)", 1.0, 15.0, 5.0, 0.5, key="joint_min_pct")
+            joint_p_val = st.number_input("P-Value Threshold", value=0.05, format="%.3f", key="joint_p_val")
+
+            joint_n_y = sum(
+                (order_range_y[1] - order_range_y[0] + 1) ** kk
+                for kk in range(group_range_y[0], group_range_y[1] + 1)
+            )
+            joint_n_z = sum(
+                (order_range_z[1] - order_range_z[0] + 1) ** kk
+                for kk in range(group_range_z[0], group_range_z[1] + 1)
+            )
+            joint_n_combos_est = joint_n_y * joint_n_z
+            joint_est_fits = joint_n_combos_est * joint_n_starts
+            if joint_n_combos_est > 120:
+                st.warning(
+                    f"⚠️ {joint_n_combos_est:,} joint model specifications to evaluate — each is "
+                    "pricier to fit than a single-outcome model (wider parameter vector, costlier "
+                    "Hessian). Consider narrowing either outcome's group/order range."
+                )
+            if joint_est_fits > 1500:
+                st.warning(f"⚠️ ≈{joint_est_fits:,} total optimizer runs estimated. This may take a long time.")
 
 # ── About page ───────────────────────────────────────────────────────────────
 
@@ -1418,7 +1546,13 @@ if app_mode == "About & Docs":
     """, unsafe_allow_html=True)
     st.markdown(r"""
     **Overview**
-    AutoTraj is a high-performance engine for Group-Based Trajectory Modeling (GBTM), a specialized application of finite mixture modeling utilized to identify latent subpopulations following distinct developmental trajectories over time. It automates the exhaustive search, selection, and visualization of these models by leveraging a fully vectorized, C-compiled analytical Jacobian engine to rapidly evaluate combinatorial polynomial grids.
+    AutoTraj is a high-performance engine for Group-Based Trajectory Modeling (GBTM), a specialized application of finite mixture modeling utilized to identify latent subpopulations following distinct developmental trajectories over time. It automates the exhaustive search, selection, and visualization of these models by leveraging a fully vectorized, C-compiled analytical Jacobian engine to rapidly evaluate combinatorial polynomial grids — across four outcome distributions (binary LOGIT, censored-normal/Tobit CNORM, Poisson, and zero-inflated Poisson), and across single-outcome, covariate-adjusted, survey-weighted, and joint dual-trajectory model families alike.
+
+    **Dual-Trajectory (Joint) Modeling**
+    Beyond a single outcome, AutoTraj also automates the search for **dual-trajectory (joint) models** — two outcomes, each with its own independent group structure, linked by a joint latent-class probability matrix instead of assuming the outcomes' group memberships are independent (the standard Nagin & Tremblay "dual trajectory" approach). This answers questions like *"does high aggression co-occur with high emotional symptoms more than chance would predict?"* — not just each outcome's own developmental pattern. The joint model's automated search mirrors the single-outcome AutoTraj Search exactly: every group/order combination for **both** outcomes is evaluated, poorly-specified fits are rejected, and the survivors are ranked by BIC.
+
+    **Covariates & Survey Weights**
+    Group membership can be predicted by time-invariant baseline covariates (a multinomial logit on the mixing proportions), and the trajectory equation itself can be deflected by time-varying covariates. For complex survey data, a per-subject sampling weight turns the objective into a weighted pseudo-log-likelihood, with Huber-White sandwich standard errors as the valid basis for inference under weighting (model-based SEs are retained for reference only).
 
     **Methodology & Missing Data**
     By default, the engine utilizes Full Information Maximum Likelihood (FIML), which provides unbiased parameter estimates under the assumption that missing data is Missing At Random (MAR).
@@ -1430,7 +1564,7 @@ if app_mode == "About & Docs":
 
     st.markdown(r"""
     **Mathematical Safeguards & Model Identifiability**
-    Unlike standard statistical packages that may output estimates for overparameterized or unidentifiable models, AutoTraj utilizes strict mathematical exclusion criteria during the automated search phase. By actively calculating the condition number of the scaled Hessian matrix, the engine automatically rejects models that produce singular information matrices (flat likelihood surfaces) or degenerate standard errors, protecting against artificial significance caused by algorithmic bounds.
+    Unlike standard statistical packages that may output estimates for overparameterized or unidentifiable models, AutoTraj utilizes strict mathematical exclusion criteria during the automated search phase. By actively calculating the condition number of the scaled Hessian matrix, the engine automatically rejects models that produce singular information matrices (flat likelihood surfaces) or degenerate standard errors, protecting against artificial significance caused by algorithmic bounds. The same exclusion criteria apply to the joint model's search, evaluated independently for each outcome.
 
     **Robust Standard Errors**
     In addition to model-based standard errors derived from the exact numerical Hessian (Observed Information Matrix), AutoTraj natively computes Huber-White sandwich estimators. This is achieved by cross-multiplying the analytical subject-level gradient vectors against the inverse Hessian, providing standard errors robust to minor model misspecifications and heteroskedasticity.
@@ -1446,6 +1580,15 @@ if app_mode == "About & Docs":
     * **AIC (Standard):** $-2 \cdot LL + 2p$
     * **BIC (Standard):** $-2 \cdot LL + p \cdot \ln(N)$
 
+    **Data Quality & Distribution Suggestions**
+    Before fitting, the Data Quality Preview inspects each outcome column and suggests an appropriate distribution — binary values suggest LOGIT; non-negative integer counts are checked for excess zeros (comparing the observed zero rate to what a plain Poisson process with the same mean would predict) to distinguish POISSON from ZIP; continuous values default to CNORM, with a note when a floor/ceiling spike suggests genuine censoring. This is informational only — it never blocks a fit, and flags a mismatch if your sidebar selection differs from the suggestion.
+
+    **Publication Suite**
+    Every fitted model comes with a rule-based Plain-Language Summary (group levels, directions, and adequacy diagnostics stated in prose, not just tables), one-click HTML and PDF report generation, side-by-side model comparison views, and CSV/ZIP exports of parameters, assignments, and diagnostics — everything needed to move from a fitted model to a written result.
+
+    **Programmatic Usage**
+    The engine has zero Streamlit dependency and is independently pip-installable (`pip install autotraj-gbtm`) as the `autotraj` package, for use in scripts or notebooks without the web UI. See the README for details.
+
     ---
     **Suggested Citation**
     Warden, D. E. (2026). AutoTraj: Automated Group-Based Trajectory Modeling Engine [Software]. GitHub. https://github.com/Thornwell16/gbtm_project
@@ -1454,6 +1597,7 @@ if app_mode == "About & Docs":
     * Haviland, A. M., Jones, B. L., & Nagin, D. S. (2011). Group-based trajectory modeling: extended statistical and survival analysis capabilities. *Sociological Methods & Research*, 40(3), 485-492.
     * Jones, B. L., Nagin, D. S., & Roeder, K. (2001). A SAS procedure based on mixture models for estimating developmental trajectories. *Sociological Methods & Research*, 29(3), 374-393.
     * Nagin, D. S. (1999). Analyzing developmental trajectories: a semiparametric, group-based approach. *Psychological Methods*, 4(2), 139-157.
+    * Nagin, D. S., & Tremblay, R. E. (2001). Analyzing developmental trajectories of distinct but related behaviors: a group-based method. *Psychological Methods*, 6(1), 18-34.
     """)
     st.divider()
     st.markdown('<div class="app-footer">AutoTraj &nbsp;&middot;&nbsp; Built by Donald E. Warden, PhD, MPH &nbsp;&middot;&nbsp; <em>Sapientia Veritatem Parit</em> &nbsp;&middot;&nbsp; MIT License</div>', unsafe_allow_html=True)
@@ -1474,13 +1618,19 @@ elif app_mode == "Dual-Trajectory (Joint) Mode":
    simulated dataset, or upload your own long-format file (one row per subject-timepoint, with
    separate outcome/time columns for each of the two outcomes).
 2. **Check the Data Quality Preview** — after loading, expand it to confirm subject counts, wave
-   counts, and outcome ranges look right (especially CNORM min/max, if used).
+   counts, outcome ranges, and the suggested distribution for each outcome (with an explanation).
 3. **Map columns & configure both outcomes** in the sidebar — ID, Outcome/Time columns for Y and Z,
-   each outcome's distribution, number of groups, and polynomial order.
-4. **Click "Fit Joint Dual-Trajectory Model."** The key output is the **π matrix** — it shows
-   whether the two outcomes' latent classes are associated (e.g. "does high aggression co-occur
-   with high emotional symptoms more than chance?"), not just each outcome's own trajectories.
-5. **Export** parameter estimates, assignments, and the π/contingency tables from the Export row.
+   and each outcome's distribution.
+4. **Leave "AutoTraj Search" selected** (the default) to automatically search every group/order
+   combination for BOTH outcomes and rank the results by BIC — the same automation as the main
+   AutoTraj Search, just doubled across two outcomes. Switch to "Single Model" only if you already
+   know the exact specification you want.
+5. **Click "Run Joint AutoTraj Search."** The key output is the **π matrix** — it shows whether the
+   two outcomes' latent classes are associated (e.g. "does high aggression co-occur with high
+   emotional symptoms more than chance?"), not just each outcome's own trajectories. Use the Joint
+   Model Explorer to browse other candidates, or "BIC Search Diagnostics" to see every combination
+   tried.
+6. **Export** parameter estimates, assignments, and the π/contingency tables from the Export row.
         """)
 
     uploaded_file_j = st.file_uploader(
@@ -1561,33 +1711,137 @@ elif app_mode == "Dual-Trajectory (Joint) Mode":
                         "or leave blank to auto-detect from the data."
                     )
 
-                if st.button("Fit Joint Dual-Trajectory Model", type="primary"):
+                    sugg_y = _suggest_distribution(df_y_j['Outcome'])
+                    st.info(f"**Outcome Y — suggested distribution: {sugg_y['suggestion']}** — {sugg_y['explanation']}")
+                    if sugg_y['suggestion'] != joint_dist_y:
+                        st.warning(
+                            f"You selected **{joint_dist_y}** for Outcome Y, but this preview suggests "
+                            f"**{sugg_y['suggestion']}** may fit better. Informational only — your "
+                            "selection is still what gets used when you run the model."
+                        )
+
+                    sugg_z = _suggest_distribution(df_z_j['Outcome'])
+                    st.info(f"**Outcome Z — suggested distribution: {sugg_z['suggestion']}** — {sugg_z['explanation']}")
+                    if sugg_z['suggestion'] != joint_dist_z:
+                        st.warning(
+                            f"You selected **{joint_dist_z}** for Outcome Z, but this preview suggests "
+                            f"**{sugg_z['suggestion']}** may fit better. Informational only — your "
+                            "selection is still what gets used when you run the model."
+                        )
+
+                joint_button_label = "Run Joint AutoTraj Search" if joint_is_search else "Fit Joint Dual-Trajectory Model"
+                if st.button(joint_button_label, type="primary"):
                     joint_fit_log = []
-                    with st.spinner("Fitting joint model (multi-start BFGS)... this may take a while."):
-                        try:
-                            model_j = run_joint_dual_trajectory_model(
-                                df_y_j, df_z_j, orders_y=joint_orders_y, orders_z=joint_orders_z,
-                                dist_y=joint_dist_y, dist_z=joint_dist_z,
-                                use_dropout_y=joint_dropout_y, use_dropout_z=joint_dropout_z,
-                                cnorm_min_y=joint_cnorm_min_y, cnorm_max_y=joint_cnorm_max_y,
-                                cnorm_min_z=joint_cnorm_min_z, cnorm_max_z=joint_cnorm_max_z,
-                                n_starts=joint_n_starts, log_callback=joint_fit_log.append,
+                    if joint_is_search:
+                        joint_progress_bar = st.progress(0.0, text="Starting Joint AutoTraj Search...")
+
+                        def _joint_progress_cb(current, total, combo):
+                            joint_progress_bar.progress(
+                                current / total,
+                                text=f"Evaluated {current}/{total} — last: Y{combo[0]} / Z{combo[1]}",
                             )
-                            st.session_state.joint_model = model_j
-                            st.session_state.joint_df_y = df_y_j
-                            st.session_state.joint_df_z = df_z_j
-                            st.session_state.joint_fit_log = joint_fit_log
-                        except Exception as e:
-                            st.error(f"Model fitting failed: {e}")
+
+                        with st.spinner("Running joint AutoTraj Search (multi-start BFGS per combination)... this may take a while."):
+                            try:
+                                top_models_j, all_evaluated_j = run_joint_autotraj(
+                                    df_y_j, df_z_j,
+                                    min_groups_y=group_range_y[0], max_groups_y=group_range_y[1],
+                                    min_order_y=order_range_y[0], max_order_y=order_range_y[1],
+                                    min_groups_z=group_range_z[0], max_groups_z=group_range_z[1],
+                                    min_order_z=order_range_z[0], max_order_z=order_range_z[1],
+                                    min_group_pct=joint_min_pct, p_val_thresh=joint_p_val,
+                                    dist_y=joint_dist_y, dist_z=joint_dist_z,
+                                    use_dropout_y=joint_dropout_y, use_dropout_z=joint_dropout_z,
+                                    cnorm_min_y=joint_cnorm_min_y, cnorm_max_y=joint_cnorm_max_y,
+                                    cnorm_min_z=joint_cnorm_min_z, cnorm_max_z=joint_cnorm_max_z,
+                                    n_starts=joint_n_starts, progress_callback=_joint_progress_cb,
+                                    log_callback=joint_fit_log.append,
+                                )
+                                st.session_state.joint_top_models = top_models_j
+                                st.session_state.joint_all_evaluated = all_evaluated_j
+                                st.session_state.joint_df_y = df_y_j
+                                st.session_state.joint_df_z = df_z_j
+                                st.session_state.joint_fit_log = joint_fit_log
+                            except Exception as e:
+                                st.error(f"Search failed: {e}")
+                        joint_progress_bar.empty()
+                    else:
+                        with st.spinner("Fitting joint model (multi-start BFGS)... this may take a while."):
+                            try:
+                                model_j = run_joint_dual_trajectory_model(
+                                    df_y_j, df_z_j, orders_y=joint_orders_y, orders_z=joint_orders_z,
+                                    dist_y=joint_dist_y, dist_z=joint_dist_z,
+                                    use_dropout_y=joint_dropout_y, use_dropout_z=joint_dropout_z,
+                                    cnorm_min_y=joint_cnorm_min_y, cnorm_max_y=joint_cnorm_max_y,
+                                    cnorm_min_z=joint_cnorm_min_z, cnorm_max_z=joint_cnorm_max_z,
+                                    n_starts=joint_n_starts, log_callback=joint_fit_log.append,
+                                )
+                                st.session_state.joint_top_models = [model_j] if model_j['pis_joint'] is not None else []
+                                st.session_state.joint_all_evaluated = None
+                                st.session_state.joint_df_y = df_y_j
+                                st.session_state.joint_df_z = df_z_j
+                                st.session_state.joint_fit_log = joint_fit_log
+                            except Exception as e:
+                                st.error(f"Model fitting failed: {e}")
                     if joint_fit_log:
                         with st.expander(f"Fit Log ({len(joint_fit_log)} multi-start resolutions)"):
                             st.code("\n".join(joint_fit_log), language=None)
-                            st.session_state.joint_model = None
 
-                if st.session_state.get("joint_model") is not None:
-                    model_j = st.session_state.joint_model
+                if st.session_state.get("joint_top_models"):
+                    top_models_j = st.session_state.joint_top_models
+                    all_evaluated_j = st.session_state.get("joint_all_evaluated")
                     df_y_j = st.session_state.joint_df_y
                     df_z_j = st.session_state.joint_df_z
+
+                    if len(top_models_j) > 1:
+                        st.markdown("""
+                        <div class="model-explorer-card">
+                            <h4>Joint Model Explorer</h4>
+                            <p>Select a valid joint model below to explore its trajectories, parameters, and diagnostics.</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        joint_model_choices = [
+                            f"Rank {i+1} | Y:{len(m['orders_y'])}g{m['orders_y']} / Z:{len(m['orders_z'])}g{m['orders_z']} | BIC: {m['bic']:.2f}"
+                            for i, m in enumerate(top_models_j[:10])
+                        ]
+                        joint_selected_str = st.selectbox("Select a candidate joint model:", joint_model_choices, label_visibility="collapsed")
+                        joint_selected_rank = int(joint_selected_str.split("|")[0].replace("Rank ", "").strip()) - 1
+                        model_j = top_models_j[joint_selected_rank]
+
+                        with st.expander(f"📊 Compare Top {min(len(top_models_j), 10)} Joint Models", expanded=False):
+                            st.caption(
+                                "Shortlist view: only joint models that passed the heuristic rejection "
+                                "rules, ranked by BIC. For every specification tried — including "
+                                "rejected and non-converged ones — see 'BIC Search Diagnostics' below."
+                            )
+                            joint_comparison_rows = [{
+                                "Rank": i + 1, "Groups Y": len(m['orders_y']), "Orders Y": str(m['orders_y']),
+                                "Groups Z": len(m['orders_z']), "Orders Z": str(m['orders_z']),
+                                "LL": round(m['ll'], 2), "BIC (Nagin)": round(m['bic'], 2),
+                                "AIC (Nagin)": round(m['aic'], 2), "Condition #": f"{m['cond_num']:.1e}",
+                            } for i, m in enumerate(top_models_j[:10])]
+                            joint_comparison_df = pd.DataFrame(joint_comparison_rows)
+                            st.dataframe(joint_comparison_df, use_container_width=True, hide_index=True)
+                            st.download_button(
+                                "Comparison Table (CSV)", joint_comparison_df.to_csv(index=False).encode('utf-8'),
+                                file_name="joint_model_comparison.csv", mime="text/csv", key="dl_joint_comparison_table",
+                            )
+
+                        if all_evaluated_j:
+                            with st.expander("BIC Search Diagnostics (every combination tried)", expanded=False):
+                                st.caption(
+                                    "Every (K_Y, orders_Y) × (K_Z, orders_Z) combination evaluated, "
+                                    "including rejected and non-converged ones — sortable by clicking "
+                                    "any column header."
+                                )
+                                diag_df_j = pd.DataFrame(all_evaluated_j)
+                                st.dataframe(diag_df_j, use_container_width=True, hide_index=True)
+                                st.download_button(
+                                    "Full Diagnostics Table (CSV)", diag_df_j.to_csv(index=False).encode('utf-8'),
+                                    file_name="joint_bic_diagnostics.csv", mime="text/csv", key="dl_joint_diagnostics",
+                                )
+                    else:
+                        model_j = top_models_j[0]
 
                     if model_j['pis_joint'] is None:
                         st.error("Model did not converge to a valid solution. Try increasing restarts or simplifying the group/order specification.")
@@ -1718,6 +1972,17 @@ elif app_mode == "Dual-Trajectory (Joint) Mode":
                                 _obs_vs_est_figure(df_z_j, assignments_z_view, model_z_view, group_names_z, model_j['dist_z']),
                                 use_container_width=True,
                             )
+                elif st.session_state.get("joint_all_evaluated") is not None:
+                    st.error(
+                        "No joint model specification passed the heuristic rejection rules. Try "
+                        "widening the group/order search range, loosening the Min Group Size / "
+                        "P-Value thresholds, or increasing multi-start restarts."
+                    )
+                    with st.expander("BIC Search Diagnostics (every combination tried)", expanded=True):
+                        st.dataframe(
+                            pd.DataFrame(st.session_state.joint_all_evaluated),
+                            use_container_width=True, hide_index=True,
+                        )
 
 # ── Main app ──────────────────────────────────────────────────────────────────
 
@@ -1851,6 +2116,15 @@ else:
                         template="plotly_white",
                     )
                     st.plotly_chart(fig_obs, use_container_width=True)
+
+                    suggestion = _suggest_distribution(_preview_df['Outcome'])
+                    st.info(f"**Suggested distribution: {suggestion['suggestion']}** — {suggestion['explanation']}")
+                    if suggestion['suggestion'] != dist_flag:
+                        st.warning(
+                            f"You selected **{dist_flag}** in the sidebar, but this preview suggests "
+                            f"**{suggestion['suggestion']}** may fit better. Informational only — "
+                            "your selection is still what gets used when you run the model."
+                        )
                 else:
                     st.info("Map the ID / Outcome / Time columns above to preview data quality.")
             except Exception:

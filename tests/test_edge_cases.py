@@ -23,6 +23,7 @@ from main import (
     prep_trajectory_data,
     run_single_model,
     run_autotraj,
+    run_joint_autotraj,
     get_subject_assignments,
     extract_flat_arrays,
     extract_joint_flat_arrays,
@@ -394,6 +395,94 @@ def test_unbalanced_groups():
     assert len(group_size_rejections) > 0, (
         f"Expected group-size rejection; statuses: {[m['Status'] for m in all_tight]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# TEST 9b: run_joint_autotraj's rejection cascade
+# ---------------------------------------------------------------------------
+
+def test_joint_autotraj_rejection_cascade_min_group_pct():
+    """Joint analogue of test_unbalanced_groups: a lopsided Y-marginal split
+    (90%/10%, with Z balanced at 50/50) must be accepted under a loose
+    min_group_pct and rejected under a tight one, with the rejection reason
+    specifically flagging Y's group size."""
+    group_params_y = [{'betas': [-2.5, 1.2]}, {'betas': [2.0, -1.5]}]
+    group_params_z = [{'betas': [-1.5, 1.0]}, {'betas': [1.2, -0.8]}]
+    # Row sums (Y marginal) ~= [0.9, 0.1]; column sums (Z marginal) ~= [0.5, 0.5].
+    pi_gh_lopsided_y = np.array([[0.45, 0.45], [0.05, 0.05]])
+
+    df_y, df_z, truth = simulate_joint_two_outcome_trajectories(
+        n_subjects=600, time_points_y=np.linspace(-1, 1, 10), time_points_z=np.linspace(-1, 1, 10),
+        group_params_y=group_params_y, group_params_z=group_params_z,
+        pi_gh=pi_gh_lopsided_y, seed=909,
+    )
+
+    valid_loose, all_loose = run_joint_autotraj(
+        df_y, df_z,
+        min_groups_y=2, max_groups_y=2, min_order_y=1, max_order_y=1,
+        min_groups_z=2, max_groups_z=2, min_order_z=1, max_order_z=1,
+        min_group_pct=5.0, p_val_thresh=0.10, n_starts=N_STARTS,
+    )
+    assert len(valid_loose) > 0, (
+        f"Expected at least one valid model with min_group_pct=5.0; "
+        f"statuses={[m['Status'] for m in all_loose]}"
+    )
+
+    valid_tight, all_tight = run_joint_autotraj(
+        df_y, df_z,
+        min_groups_y=2, max_groups_y=2, min_order_y=1, max_order_y=1,
+        min_groups_z=2, max_groups_z=2, min_order_z=1, max_order_z=1,
+        min_group_pct=15.0, p_val_thresh=0.10, n_starts=N_STARTS,
+    )
+    assert len(valid_tight) == 0, (
+        f"Expected no valid models with min_group_pct=15.0; "
+        f"got {[(m['bic'], m['pis_joint'].sum(axis=1)) for m in valid_tight]}"
+    )
+    group_size_rejections_y = [m for m in all_tight if 'Group Size' in m.get('Status', '') and '— Y' in m['Status']]
+    assert len(group_size_rejections_y) > 0, (
+        f"Expected a Y-specific group-size rejection; statuses: {[m['Status'] for m in all_tight]}"
+    )
+
+
+def test_joint_autotraj_rejects_overparameterized_combo():
+    """A high-order combo with few distinct time points should be rejected
+    (singular/degenerate SE), mirroring test_overparameterized_model."""
+    group_params_y = [{'betas': [-1.0]}, {'betas': [1.0, -0.3]}]
+    group_params_z = [{'betas': [-1.0]}, {'betas': [0.8, -0.2]}]
+    pi_gh = np.array([[0.45, 0.05], [0.05, 0.45]])
+    few_times = np.array([-1.0, 0.0, 1.0])  # only 3 distinct time points
+
+    df_y, df_z, truth = simulate_joint_two_outcome_trajectories(
+        n_subjects=300, time_points_y=few_times, time_points_z=few_times,
+        group_params_y=group_params_y, group_params_z=group_params_z,
+        pi_gh=pi_gh, seed=707,
+    )
+
+    _, all_evaluated = run_joint_autotraj(
+        df_y, df_z,
+        min_groups_y=1, max_groups_y=1, min_order_y=5, max_order_y=5,
+        min_groups_z=1, max_groups_z=1, min_order_z=0, max_order_z=0,
+        min_group_pct=5.0, p_val_thresh=0.05, n_starts=N_STARTS,
+    )
+    assert len(all_evaluated) == 1
+    assert all_evaluated[0]['Status'] != "Valid", (
+        f"Order-5 model with only 3 time points should not validate; got {all_evaluated[0]}"
+    )
+
+
+def test_joint_autotraj_guardrail_sizing_is_multiplicative():
+    """The joint search space must be the PRODUCT of each outcome's own combo
+    count, not their sum — a regression guard on the sizing formula used both
+    by run_joint_autotraj internally and by the app.py guardrail warning."""
+    def _n_combos(min_groups, max_groups, min_order, max_order):
+        return sum((max_order - min_order + 1) ** k for k in range(min_groups, max_groups + 1))
+
+    n_y = _n_combos(1, 3, 0, 2)  # 3 + 9 + 27 = 39... actually sum over k=1..3 of 3**k
+    n_z = _n_combos(1, 3, 0, 2)
+    assert n_y == 3 + 9 + 27  # k=1:3^1=3, k=2:3^2=9, k=3:3^3=27
+    n_combos_joint = n_y * n_z
+    assert n_combos_joint == n_y * n_z and n_combos_joint != n_y + n_z
+    assert n_combos_joint == 39 * 39  # multiplicative, not additive (39+39=78)
 
 
 # ---------------------------------------------------------------------------

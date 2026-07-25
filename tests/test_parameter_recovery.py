@@ -34,6 +34,7 @@ from main import (
     run_autotraj,
     get_subject_assignments,
     run_joint_dual_trajectory_model,
+    run_joint_autotraj,
     get_joint_subject_assignments,
 )
 from tests.simulate import (
@@ -899,3 +900,32 @@ def test_joint_collapses_to_single_outcome_when_kz_1():
         f"Joint K_Z=1 Y-betas don't match an independent single-outcome fit within tolerance:\n"
         f"joint={joint_y_betas}, single={single_y_betas}"
     )
+
+
+def test_joint_autotraj_recovers_true_combined_specification():
+    """run_joint_autotraj (the automated combinatorial search for the joint
+    model) should prefer (K_Y=2,orders_y=[0,1]) x (K_Z=2,orders_z=[0,1]) --
+    already in ascending-intercept order, matching _joint_true_params'
+    convention -- when data is simulated from exactly that joint spec."""
+    group_params_y, group_params_z = _joint_true_params()
+    df_y, df_z, truth = simulate_joint_two_outcome_trajectories(
+        n_subjects=600, time_points_y=T15, time_points_z=T15,
+        group_params_y=group_params_y, group_params_z=group_params_z,
+        pi_gh=_JOINT_PI_GH_CONCORDANT, seed=101,
+    )
+    top_models, all_evaluated = run_joint_autotraj(
+        df_y, df_z,
+        min_groups_y=1, max_groups_y=2, min_order_y=0, max_order_y=1,
+        min_groups_z=1, max_groups_z=2, min_order_z=0, max_order_z=1,
+        min_group_pct=5.0, p_val_thresh=0.10, n_starts=N_STARTS,
+    )
+    assert len(top_models) > 0, "Search found no valid joint model specifications at all"
+    best = top_models[0]  # already sorted by 'bic' descending
+    assert best['k_y'] == 2 and best['k_z'] == 2, f"Expected K_Y=K_Z=2, got k_y={best['k_y']}, k_z={best['k_z']}"
+    assert sorted(best['orders_y']) == [0, 1], f"Expected orders_y=[0,1], got {best['orders_y']}"
+    assert sorted(best['orders_z']) == [0, 1], f"Expected orders_z=[0,1], got {best['orders_z']}"
+
+    # all_evaluated must record every combination tried, not just the valid ones
+    n_y_combos = sum(2 ** k for k in range(1, 3))   # order range width 2, k=1,2
+    n_z_combos = sum(2 ** k for k in range(1, 3))
+    assert len(all_evaluated) == n_y_combos * n_z_combos

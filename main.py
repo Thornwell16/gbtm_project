@@ -2715,6 +2715,154 @@ def run_joint_dual_trajectory_model(df_y, df_z, orders_y, orders_z, dist_y='LOGI
     }
 
 
+def run_joint_autotraj(df_y, df_z,
+                        min_groups_y=1, max_groups_y=3, min_order_y=0, max_order_y=3,
+                        min_groups_z=1, max_groups_z=3, min_order_z=0, max_order_z=3,
+                        min_group_pct=5.0, p_val_thresh=0.05,
+                        dist_y='LOGIT', dist_z='LOGIT',
+                        use_dropout_y=False, use_dropout_z=False,
+                        cnorm_min_y=0.0, cnorm_max_y=0.0, cnorm_min_z=0.0, cnorm_max_z=0.0,
+                        n_starts=5, progress_callback=None, log_callback=None):
+    """Exhaustive automated search over BOTH outcomes' (K, orders) grids for
+    the joint dual-trajectory model — the joint analogue of run_autotraj.
+
+    Builds every (orders_y, orders_z) combination (Cartesian product of each
+    outcome's own combinatorial grid, generated the same way run_autotraj
+    builds its single-outcome grid), fits each via the existing
+    run_joint_dual_trajectory_model (reused as the per-combo worker rather
+    than re-inlining the fit/extract/scale/multistart/post-process logic a
+    second time), and applies a rejection cascade mirroring run_autotraj's
+    (main.py ~2440-2471) but doubled per-outcome where relevant:
+        1. Convergence      : pis_joint is not None.
+        2. Singularity      : cond_num > 1e10 -> reject (not previously
+           checked anywhere in the joint path -- new here, matching the
+           single-outcome threshold).
+        3. SE sanity        : any(se_model < 1e-3) or any(se_model > 50).
+        4. Group size       : BOTH outcomes' marginal min group % must clear
+           min_group_pct (pis_joint.sum(axis=1)/.sum(axis=0) give the Y/Z
+           marginals directly -- no extra fitting needed).
+        5. Significance     : BOTH outcomes' highest-order beta per group
+           must be significant at p_val_thresh (t-test, dof from the
+           model's own 'dof' key) -- walks each outcome's beta blocks via
+           _joint_layout's y_beta_start/z_beta_start offsets.
+
+    The outer loop over combos is sequential (not thread-pooled) -- each
+    inner run_joint_dual_trajectory_model call already parallelises its own
+    n_starts restarts via _run_multistart's thread pool; parallelising
+    across combos too would oversubscribe CPU cores.
+
+    Args:
+        df_y, df_z: Long-format DataFrames for outcomes Y and Z (same
+            requirements as run_joint_dual_trajectory_model).
+        min_groups_y/max_groups_y/min_order_y/max_order_y: Y's search grid.
+        min_groups_z/max_groups_z/min_order_z/max_order_z: Z's search grid.
+        min_group_pct: minimum acceptable marginal group % for EITHER outcome.
+        p_val_thresh: significance threshold for the highest-order term.
+        dist_y, dist_z, use_dropout_y, use_dropout_z, cnorm_min/max_y/z,
+            n_starts: passed straight through to every combo's fit.
+        progress_callback: optional callable(current, total, (orders_y, orders_z)).
+        log_callback: optional callable(str), forwarded to every inner fit.
+
+    Returns:
+        Tuple[List[dict], List[dict]]:
+            valid_models: full model dicts (same shape as
+                run_joint_dual_trajectory_model's return), one per combo
+                that passed every filter, sorted by 'bic' descending.
+            all_evaluated_models: lightweight dicts for every combo tried --
+                keys 'Groups_Y', 'Orders_Y', 'Groups_Z', 'Orders_Z', 'Status',
+                'BIC (Nagin)', 'BIC (Standard)', 'AIC (Nagin)', 'LL',
+                'Min_Group_%_Y', 'Min_Group_%_Z' -- sorted the same way,
+                NaN-safe.
+    """
+    def _build_combos(min_groups, max_groups, min_order, max_order):
+        combos = []
+        for k in range(min_groups, max_groups + 1):
+            for orders in itertools.product(range(min_order, max_order + 1), repeat=k):
+                combos.append(list(orders))
+        return combos
+
+    y_combos = _build_combos(min_groups_y, max_groups_y, min_order_y, max_order_y)
+    z_combos = _build_combos(min_groups_z, max_groups_z, min_order_z, max_order_z)
+    all_combinations = list(itertools.product(y_combos, z_combos))
+
+    def _outcome_significant(result_x, se_model, beta_start, orders_list, k, dof):
+        idx = beta_start
+        for g in range(k):
+            n_betas = orders_list[g] + 1
+            est, se = result_x[idx + n_betas - 1], se_model[idx + n_betas - 1]
+            t_stat = est / se if se > 0 else 0
+            p_val = 2 * (1 - t_dist.cdf(abs(t_stat), df=dof))
+            if p_val >= p_val_thresh:
+                return False
+            idx += n_betas
+        return True
+
+    valid_models = []
+    all_evaluated_models = []
+
+    for i, (orders_y, orders_z) in enumerate(all_combinations):
+        model = run_joint_dual_trajectory_model(
+            df_y, df_z, orders_y=orders_y, orders_z=orders_z,
+            dist_y=dist_y, dist_z=dist_z,
+            use_dropout_y=use_dropout_y, use_dropout_z=use_dropout_z,
+            cnorm_min_y=cnorm_min_y, cnorm_max_y=cnorm_max_y,
+            cnorm_min_z=cnorm_min_z, cnorm_max_z=cnorm_max_z,
+            n_starts=n_starts, log_callback=log_callback,
+        )
+
+        k_y, k_z = model['k_y'], model['k_z']
+        status = None
+        min_pct_y = min_pct_z = np.nan
+
+        if model['pis_joint'] is None:
+            status = "Failed Convergence"
+        else:
+            pis_joint = model['pis_joint']
+            min_pct_y = float(pis_joint.sum(axis=1).min() * 100)
+            min_pct_z = float(pis_joint.sum(axis=0).min() * 100)
+
+            if model['cond_num'] > 1e10:
+                status = "Rejected (Singular Matrix / Unidentifiable)"
+            elif np.any(model['se_model'] < 1e-3) or np.any(model['se_model'] > 50):
+                status = "Rejected (Degenerate SE / Flat Likelihood)"
+            elif min_pct_y < min_group_pct:
+                status = f"Rejected (Group Size < {min_group_pct}% — Y)"
+            elif min_pct_z < min_group_pct:
+                status = f"Rejected (Group Size < {min_group_pct}% — Z)"
+            else:
+                n_theta, y_beta_start, z_beta_start, _, _, _ = _joint_layout(
+                    k_y, k_z, model['orders_y'], model['orders_z'],
+                    use_dropout_y, dist_y, use_dropout_z, dist_z,
+                )
+                y_ok = _outcome_significant(model['result'].x, model['se_model'], y_beta_start, model['orders_y'], k_y, model['dof'])
+                z_ok = _outcome_significant(model['result'].x, model['se_model'], z_beta_start, model['orders_z'], k_z, model['dof'])
+                if not (y_ok and z_ok):
+                    status = f"Rejected (P-Value > {p_val_thresh})"
+                else:
+                    status = "Valid"
+
+        all_evaluated_models.append({
+            'Groups_Y': k_y, 'Orders_Y': str(orders_y), 'Groups_Z': k_z, 'Orders_Z': str(orders_z),
+            'Status': status,
+            'BIC (Nagin)': model.get('bic', np.nan), 'BIC (Standard)': model.get('bic_standard', np.nan),
+            'AIC (Nagin)': model.get('aic', np.nan), 'LL': model.get('ll', np.nan),
+            'Min_Group_%_Y': min_pct_y, 'Min_Group_%_Z': min_pct_z,
+        })
+
+        if status == "Valid":
+            valid_models.append(model)
+
+        if progress_callback:
+            progress_callback(i + 1, len(all_combinations), (orders_y, orders_z))
+
+    valid_models.sort(key=lambda m: m['bic'], reverse=True)
+    all_evaluated_models.sort(
+        key=lambda m: m['BIC (Nagin)'] if pd.notnull(m['BIC (Nagin)']) else -np.inf, reverse=True
+    )
+
+    return valid_models, all_evaluated_models
+
+
 def get_subject_assignments(model_dict, df):
     """Compute posterior group probabilities and hard assignments for every subject.
 
