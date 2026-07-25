@@ -30,6 +30,7 @@ from main import (
     calc_model_adequacy,
     # Joint dual-trajectory fitting
     run_joint_dual_trajectory_model,
+    run_joint_autotraj,
     get_joint_subject_assignments,
     calc_joint_model_adequacy,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "get_subject_assignments",
     "calc_model_adequacy",
     "run_joint_dual_trajectory_model",
+    "run_joint_autotraj",
     "get_joint_subject_assignments",
     "calc_joint_model_adequacy",
 ]

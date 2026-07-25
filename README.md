@@ -16,7 +16,7 @@ By bypassing standard interpreted Python using `numba` Just-In-Time (JIT) C-comp
 * **Missing Not At Random (MNAR) Capability:** Integrates an optional dropout model, utilizing logistic survival equations conditioned on previous health states to account for informative attrition.
 * **Robust Statistics:** Automatically computes Huber-White robust sandwich estimators for standard errors alongside model-based Hessian SEs.
 * **Universal Data Formats:** Supports both Wide format (auto-pivot) and Long format data directly through the UI.
-* **Publication Suite:** Instantly generates interactive Plotly graphics, exportable Matplotlib vectors, parameter estimates, AvePP/OCC adequacy metrics, and stratified baseline demographic tables.
+* **Publication Suite:** Instantly generates interactive Plotly graphics, exportable Matplotlib vectors, parameter estimates, AvePP/OCC adequacy metrics, and stratified baseline demographic tables — plus a rule-based plain-language summary, one-click HTML/PDF reports, LaTeX parameter tables, and a reproducible Python script export, for both single-outcome and joint dual-trajectory models alike.
 
 ## Mathematical Documentation
 Full derivations, gradient proofs, and formula references are in [MATH.md](MATH.md).
@@ -109,7 +109,7 @@ Test suites:
 | Parameter Recovery | `tests/test_parameter_recovery.py` | 25 tests: simulate known ground-truth (incl. weighted, joint dual-trajectory, and joint AutoTraj Search models), verify AutoTraj recovers parameters |
 | Cambridge Benchmark | `tests/test_cambridge_benchmark.py` | 7 tests: validate against Nagin (1999) published results |
 | Edge Cases | `tests/test_edge_cases.py` | 24 tests: pathological inputs, boundary conditions, reproducibility, label-switching invariance, joint search rejection cascade |
-| App Helpers | `tests/test_app_helpers.py` | 11 tests: plain-language summary, HTML/PDF report generation, distribution-suggestion heuristic (UI-layer, no Streamlit runtime needed) |
+| App Helpers | `tests/test_app_helpers.py` | 17 tests: plain-language summaries (single + joint), HTML/PDF report generation (single + joint), reproducible-script export, distribution-suggestion heuristic (UI-layer, no Streamlit runtime needed) |
 
 ## Architecture Capabilities
 AutoTraj is actively maintained. Beyond the core GBTM engine, it includes:

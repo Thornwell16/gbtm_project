@@ -7,6 +7,33 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### New Features
+
+- **Joint Mode reaches Publication Suite parity with Single Model Mode.** Previously Joint Mode
+  only had individual CSV exports — no plain-language summary, no HTML/PDF report, no bundled ZIP.
+  Added:
+  - **Joint Plain-Language Summary** — each outcome's own group narrative (reusing the existing
+    single-outcome summary logic unchanged, since each outcome's parameter block is a standalone
+    single-outcome vector per MATH.md §9b) plus a **joint comorbidity paragraph** identifying the
+    most over- and under-represented (Y-group, Z-group) pairing, computed directly from the fitted
+    π matrix against the independence-implied outer product of its marginals (an observed/expected
+    "lift" ratio) — not a qualitative read of the heatmap. Verified against a fixture with a known
+    concordant π_gh: the summary correctly identifies the true over-represented cell.
+  - **Joint HTML report** — π matrix, adequacy tables, parameter table, and the two trajectory
+    plots embedded as genuinely **interactive** Plotly figures (not static images).
+  - **Joint PDF report** — everything except the plots (PDF can't be interactive; avoided adding
+    a static-image-rendering dependency like `kaleido` for this) — see the HTML report for those.
+  - **Joint full-results ZIP bundle** — all CSVs, the plain-language summary, and the reproducible
+    script in one download.
+- **Reproducible Python script export** (single-outcome and joint) — a one-click download of a
+  standalone script (using the pip-installable `autotraj` package) that reproduces the exact fitted
+  specification, with every argument filled in from the actual model (not template placeholders).
+  For journal supplementary materials or independent replication.
+- **LaTeX parameter table export** (single-outcome and joint) — `\input{}`-ready LaTeX tabular
+  environments via pandas' built-in `to_latex()`.
+- Fixed a gap found while building the script export: `run_joint_autotraj` (added in the previous
+  entry) was missing from the `autotraj` package's public API — added.
+
 ### Performance
 
 - **~2x faster fitting by eliminating a redundant kernel pass per BFGS evaluation.** scipy's BFGS

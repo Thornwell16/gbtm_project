@@ -641,6 +641,77 @@ def _generate_plain_language_summary(winning_model, group_names, long_df, adq_df
     return "\n".join(lines)
 
 
+def _generate_joint_plain_language_summary(model_j, group_names_y, group_names_z, df_y_j, df_z_j,
+                                            y_adq_df, y_rel_entropy, z_adq_df, z_rel_entropy):
+    """Return a plain-English interpretation of a fitted joint dual-trajectory
+    model: each outcome's own group narrative (reusing
+    _generate_plain_language_summary unchanged -- Y-BLOCK/Z-BLOCK are each a
+    standalone single-outcome parameter vector, see MATH.md §9b -- via
+    solo-outcome "view" dicts built the same way the trajectory-plot code
+    already does), plus a joint comorbidity paragraph identifying the most
+    over- and under-represented (Y-group, Z-group) pairing relative to what
+    independence would predict. The comorbidity numbers are computed directly
+    from the fitted pi_gh matrix (observed vs. the independence-implied outer
+    product of the marginals) -- not a qualitative read of the heatmap.
+    """
+    pis_joint = model_j['pis_joint']
+    k_y, k_z = model_j['k_y'], model_j['k_z']
+    marginal_y = pis_joint.sum(axis=1)
+    marginal_z = pis_joint.sum(axis=0)
+    independent = np.outer(marginal_y, marginal_z)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ratio = np.where(independent > 1e-12, pis_joint / independent, np.nan)
+
+    _, y_beta_start, z_beta_start, _, _, _ = _joint_layout(
+        k_y, k_z, model_j['orders_y'], model_j['orders_z'],
+        model_j['use_dropout_y'], model_j['dist_y'], model_j['use_dropout_z'], model_j['dist_z'],
+    )
+    result_x = model_j['result'].x
+    model_y_view = {
+        'orders': model_j['orders_y'], 'n_mix': 1, 'pis': marginal_y,
+        'result': SimpleNamespace(x=np.concatenate([np.zeros(k_y - 1), result_x[y_beta_start:z_beta_start]])),
+    }
+    model_z_view = {
+        'orders': model_j['orders_z'], 'n_mix': 1, 'pis': marginal_z,
+        'result': SimpleNamespace(x=np.concatenate([np.zeros(k_z - 1), result_x[z_beta_start:]])),
+    }
+
+    lines = ["#### Outcome Y"]
+    lines.append(_generate_plain_language_summary(
+        model_y_view, group_names_y, df_y_j, y_adq_df, y_rel_entropy, model_j['dist_y']
+    ))
+    lines.append("#### Outcome Z")
+    lines.append(_generate_plain_language_summary(
+        model_z_view, group_names_z, df_z_j, z_adq_df, z_rel_entropy, model_j['dist_z']
+    ))
+    lines.append("#### Joint Association (Comorbidity)")
+
+    if not np.any(np.isfinite(ratio)):
+        lines.append("Joint association could not be characterized (degenerate marginal probabilities).")
+    else:
+        g_max, h_max = np.unravel_index(np.nanargmax(ratio), ratio.shape)
+        g_min, h_min = np.unravel_index(np.nanargmin(ratio), ratio.shape)
+        max_ratio, min_ratio = float(ratio[g_max, h_max]), float(ratio[g_min, h_min])
+
+        lines.append(
+            f"Subjects in **{group_names_y[g_max]}** are **{max_ratio:.2f}x** as likely as chance would "
+            f"predict to also be in **{group_names_z[h_max]}** (observed: {pis_joint[g_max, h_max]*100:.1f}% "
+            f"of all subjects; {independent[g_max, h_max]*100:.1f}% expected if the two outcomes were "
+            "independent) — the strongest positive association in this fit."
+        )
+        if (g_min, h_min) != (g_max, h_max):
+            lines.append(
+                f"Conversely, subjects in **{group_names_y[g_min]}** are only **{min_ratio:.2f}x** as "
+                f"likely as chance would predict to also be in **{group_names_z[h_min]}** (observed: "
+                f"{pis_joint[g_min, h_min]*100:.1f}%; {independent[g_min, h_min]*100:.1f}% expected under "
+                "independence) — the strongest negative/protective association in this fit."
+            )
+        overall = "notably associated" if (max_ratio >= 1.3 or min_ratio <= 0.7) else "close to what independence would predict"
+        lines.append(f"Overall, the two outcomes' group memberships are **{overall}** (a ratio of 1.0 means exactly independent).")
+
+    return "\n\n".join(lines)
+
+
 def _build_html_report(winning_model, group_names, estimates_df, adq_df, rel_entropy,
                         summary_txt, equations, png_bytes=None, plain_summary=None):
     """Return a single self-contained HTML report string bundling the model
@@ -811,6 +882,287 @@ def _build_pdf_report(winning_model, group_names, estimates_df, adq_df, rel_entr
     story.append(Paragraph(f"Relative Entropy: {rel_entropy:.3f}", meta))
     story.append(Spacer(1, 4))
     story.append(_df_to_table(adq_df))
+
+    story.append(Spacer(1, 14))
+    story.append(Paragraph(
+        "Suggested Citation: Warden, D. E. (2026). AutoTraj: Automated Group-Based Trajectory "
+        "Modeling Engine [Software]. GitHub. https://github.com/Thornwell16/gbtm_project", meta,
+    ))
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch)
+    doc.build(story)
+    return buf.getvalue()
+
+
+def _build_reproducible_script(winning_model):
+    """Return a standalone Python script (str) that reproduces this exact
+    single-outcome fit using the pip-installable `autotraj` package, for
+    journal supplementary materials or independent replication. The user
+    only needs to point `pd.read_csv(...)` at their own long-format data —
+    every model-specification argument below is filled in from the actual
+    fitted model, not a template placeholder.
+    """
+    orders = winning_model['orders']
+    dist = winning_model.get('dist', 'LOGIT')
+    use_dropout = winning_model.get('use_dropout', False)
+    cnorm_min = winning_model.get('cnorm_min')
+    cnorm_max = winning_model.get('cnorm_max')
+    baseline_cov_cols = winning_model.get('baseline_cov_cols') or []
+    tvc_cols = winning_model.get('tvc_cols') or []
+    weight_col = winning_model.get('weight_col')
+    n_starts = 10
+
+    kwargs_lines = [f"    orders_list={orders!r},", f"    dist={dist!r},"]
+    if use_dropout:
+        kwargs_lines.append("    use_dropout=True,")
+    if dist == 'CNORM' and cnorm_min is not None:
+        kwargs_lines.append(f"    cnorm_min={cnorm_min!r}, cnorm_max={cnorm_max!r},")
+    if baseline_cov_cols:
+        kwargs_lines.append(f"    baseline_cov_cols={list(baseline_cov_cols)!r},")
+    if tvc_cols:
+        kwargs_lines.append(f"    tvc_cols={list(tvc_cols)!r},")
+    if weight_col:
+        kwargs_lines.append(f"    weight_col={weight_col!r},")
+    kwargs_lines.append(f"    n_starts={n_starts},  # increase for a more thorough multi-start search")
+    kwargs_block = "\n".join(kwargs_lines)
+
+    return f'''"""
+Reproducible fit script, auto-generated by AutoTraj.
+
+Recreates the exact model specification fitted in the app: a {len(orders)}-group
+{dist} model{" with an MNAR dropout sub-model" if use_dropout else ""}.
+
+Requires: pip install autotraj-gbtm
+Your data must be a long-format DataFrame with columns ID, Time, Outcome
+(plus any covariate/weight columns referenced below, if present).
+"""
+import pandas as pd
+import autotraj
+
+long_df = pd.read_csv("your_data.csv")  # <-- replace with your actual long-format data
+
+model = autotraj.run_single_model(
+    long_df,
+{kwargs_block}
+)
+
+print("Log-Likelihood:", model["ll"])
+print("BIC (Nagin):", model["bic"], "| BIC (Standard):", model["bic_standard"])
+print("Parameter estimates:", model["result"].x)
+print("Standard errors (model-based):", model["se_model"])
+print("Standard errors (robust, Huber-White sandwich):", model["se_robust"])
+
+assignments = autotraj.get_subject_assignments(model, long_df)
+print(assignments.head())
+'''
+
+
+def _build_joint_reproducible_script(model_j):
+    """Joint-model analogue of _build_reproducible_script."""
+    orders_y, orders_z = model_j['orders_y'], model_j['orders_z']
+    dist_y, dist_z = model_j.get('dist_y', 'LOGIT'), model_j.get('dist_z', 'LOGIT')
+    use_dropout_y, use_dropout_z = model_j.get('use_dropout_y', False), model_j.get('use_dropout_z', False)
+    n_starts = 10
+
+    kwargs_lines = [
+        f"    orders_y={orders_y!r}, orders_z={orders_z!r},",
+        f"    dist_y={dist_y!r}, dist_z={dist_z!r},",
+    ]
+    if use_dropout_y or use_dropout_z:
+        kwargs_lines.append(f"    use_dropout_y={use_dropout_y!r}, use_dropout_z={use_dropout_z!r},")
+    if dist_y == 'CNORM':
+        kwargs_lines.append(f"    cnorm_min_y={model_j.get('cnorm_min_y')!r}, cnorm_max_y={model_j.get('cnorm_max_y')!r},")
+    if dist_z == 'CNORM':
+        kwargs_lines.append(f"    cnorm_min_z={model_j.get('cnorm_min_z')!r}, cnorm_max_z={model_j.get('cnorm_max_z')!r},")
+    kwargs_lines.append(f"    n_starts={n_starts},  # increase for a more thorough multi-start search")
+    kwargs_block = "\n".join(kwargs_lines)
+
+    return f'''"""
+Reproducible fit script, auto-generated by AutoTraj.
+
+Recreates the exact joint dual-trajectory specification fitted in the app:
+Outcome Y = {len(orders_y)}-group {dist_y}, Outcome Z = {len(orders_z)}-group {dist_z}.
+
+Requires: pip install autotraj-gbtm
+df_y and df_z must be long-format DataFrames (columns ID, Time, Outcome) that
+share the identical subject-ID set.
+"""
+import pandas as pd
+import autotraj
+
+df_y = pd.read_csv("your_outcome_y.csv")  # <-- replace with your actual Outcome-Y data
+df_z = pd.read_csv("your_outcome_z.csv")  # <-- replace with your actual Outcome-Z data
+
+model = autotraj.run_joint_dual_trajectory_model(
+    df_y, df_z,
+{kwargs_block}
+)
+
+print("Log-Likelihood:", model["ll"])
+print("BIC (Nagin):", model["bic"])
+print("Joint pi_gh matrix:\\n", model["pis_joint"])
+
+assignments = autotraj.get_joint_subject_assignments(model, df_y, df_z)
+print(assignments.head())
+'''
+
+
+def _build_joint_html_report(model_j, group_names_y, group_names_z, pis_joint, param_df_j,
+                              joint_adq_df, joint_rel_entropy, y_adq_df, y_rel_entropy,
+                              z_adq_df, z_rel_entropy, plain_summary, fig_traj_y, fig_traj_z):
+    """Return a self-contained HTML report for a fitted joint dual-trajectory
+    model — mirrors _build_html_report's structure, but for the joint layout
+    (pi matrix, per-outcome + joint adequacy, joint comorbidity summary), and
+    embeds the two INTERACTIVE Plotly trajectory figures (via CDN plotly.js,
+    the same external-CDN convention already used for MathJax equation
+    rendering in _build_html_report) rather than static images.
+    """
+    import html as _html
+    import re as _re
+
+    dist_y, dist_z = model_j.get('dist_y', 'LOGIT'), model_j.get('dist_z', 'LOGIT')
+    k_y, k_z = model_j['k_y'], model_j['k_z']
+
+    plain_summary_html = ""
+    if plain_summary:
+        body_lines = []
+        for line in plain_summary.split("\n"):
+            escaped = _html.escape(line)
+            escaped = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+            if escaped.startswith("#### "):
+                body_lines.append(f"<h3>{escaped[5:]}</h3>")
+            elif escaped.startswith("- "):
+                body_lines.append(f"<li>{escaped[2:]}</li>")
+            elif escaped.strip() == "":
+                body_lines.append("")
+            else:
+                body_lines.append(f"<p>{escaped}</p>")
+        plain_summary_html = "\n".join(body_lines)
+
+    pi_df = pd.DataFrame(np.round(pis_joint, 4), index=group_names_y, columns=group_names_z)
+    traj_y_html = fig_traj_y.to_html(full_html=False, include_plotlyjs='cdn')
+    traj_z_html = fig_traj_z.to_html(full_html=False, include_plotlyjs=False)
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"/>
+<title>AutoTraj Joint Model Report</title>
+<style>
+body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; color: #222; }}
+h1 {{ border-bottom: 3px solid #2B6083; padding-bottom: 0.3rem; }}
+h2 {{ color: #2B6083; margin-top: 2rem; }}
+h3 {{ color: #2B6083; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 0.9rem; }}
+th, td {{ border: 1px solid #ddd; padding: 6px 10px; text-align: left; }}
+th {{ background: #2B6083; color: white; }}
+tr:nth-child(even) {{ background: #f7f7f7; }}
+.meta {{ color: #666; font-size: 0.85rem; }}
+.traj-row {{ display: flex; gap: 1rem; flex-wrap: wrap; }}
+.traj-row > div {{ flex: 1; min-width: 400px; }}
+</style></head>
+<body>
+<h1>AutoTraj Joint Dual-Trajectory Model Report</h1>
+<p class="meta">Outcome Y: {k_y}-group {dist_y} &nbsp;|&nbsp; Outcome Z: {k_z}-group {dist_z}
+&nbsp;|&nbsp; LL: {model_j['ll']:.2f} &nbsp;|&nbsp; BIC (Nagin): {model_j['bic']:.2f}</p>
+
+<h2>Plain-Language Summary</h2>
+{plain_summary_html if plain_summary_html else "<p><em>Not available.</em></p>"}
+
+<h2>Joint Latent-Class Probability Matrix (π)</h2>
+{pi_df.to_html(border=0)}
+
+<h2>Fitted Trajectories</h2>
+<div class="traj-row"><div>{traj_y_html}</div><div>{traj_z_html}</div></div>
+
+<h2>Parameter Estimates</h2>
+{param_df_j.to_html(index=False, border=0)}
+
+<h2>Model Adequacy Diagnostics (Nagin, 2005)</h2>
+<h3>Joint</h3><p class="meta">Relative Entropy: {joint_rel_entropy:.3f}</p>{joint_adq_df.to_html(index=False, border=0)}
+<h3>Y-Marginal</h3><p class="meta">Relative Entropy: {y_rel_entropy:.3f}</p>{y_adq_df.to_html(index=False, border=0)}
+<h3>Z-Marginal</h3><p class="meta">Relative Entropy: {z_rel_entropy:.3f}</p>{z_adq_df.to_html(index=False, border=0)}
+
+<p class="meta">Suggested Citation: Warden, D. E. (2026). AutoTraj: Automated Group-Based Trajectory Modeling Engine [Software]. GitHub. https://github.com/Thornwell16/gbtm_project</p>
+</body></html>"""
+
+
+def _build_joint_pdf_report(model_j, group_names_y, group_names_z, pis_joint, param_df_j,
+                             joint_adq_df, joint_rel_entropy, y_adq_df, y_rel_entropy,
+                             z_adq_df, z_rel_entropy, plain_summary):
+    """PDF analogue of _build_joint_html_report, via reportlab (see
+    _build_pdf_report's docstring for why reportlab was chosen). Trajectory
+    plots are intentionally omitted (PDF can't be interactive, and this
+    avoids a static-image-rendering dependency like kaleido) — the HTML
+    report is the place for those.
+    """
+    import re as _re
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    dist_y, dist_z = model_j.get('dist_y', 'LOGIT'), model_j.get('dist_z', 'LOGIT')
+    k_y, k_z = model_j['k_y'], model_j['k_z']
+
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle('AT_H1', parent=styles['Heading1'], textColor=colors.HexColor('#2B6083'))
+    h2 = ParagraphStyle('AT_H2', parent=styles['Heading2'], textColor=colors.HexColor('#2B6083'), spaceBefore=14)
+    body = styles['BodyText']
+    meta = ParagraphStyle('AT_Meta', parent=styles['BodyText'], textColor=colors.grey, fontSize=8.5)
+
+    def _md_inline(s):
+        return _re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+
+    def _df_to_table(df, index=False, max_rows=40):
+        cols = ([df.index.name or ""] + list(df.columns)) if index else list(df.columns)
+        rows = df.reset_index().values.tolist() if index else df.head(max_rows).values.tolist()
+        data = [cols] + [[str(v) for v in row] for row in rows[:max_rows]]
+        t = Table(data, repeatRows=1)
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2B6083')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 7),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7f7f7')]),
+        ]))
+        return t
+
+    story = [
+        Paragraph("AutoTraj Joint Dual-Trajectory Model Report", h1),
+        Paragraph(
+            f"Outcome Y: {k_y}-group {dist_y} &mdash; Outcome Z: {k_z}-group {dist_z} &mdash; "
+            f"LL: {model_j['ll']:.2f} &mdash; BIC (Nagin): {model_j['bic']:.2f}", meta,
+        ),
+        Spacer(1, 10),
+    ]
+
+    if plain_summary:
+        story.append(Paragraph("Plain-Language Summary", h2))
+        for line in plain_summary.split("\n"):
+            if line.strip() == "":
+                continue
+            if line.startswith("#### "):
+                story.append(Paragraph(f"<b>{line[5:]}</b>", body))
+            else:
+                text = _md_inline(line[2:] if line.startswith("- ") else line)
+                story.append(Paragraph(("&bull; " + text) if line.startswith("- ") else text, body))
+        story.append(Spacer(1, 8))
+
+    story.append(Paragraph("Joint Latent-Class Probability Matrix (π)", h2))
+    pi_df = pd.DataFrame(np.round(pis_joint, 4), index=group_names_y, columns=group_names_z)
+    story.append(_df_to_table(pi_df, index=True))
+
+    story.append(Paragraph("Parameter Estimates", h2))
+    story.append(_df_to_table(param_df_j))
+
+    story.append(Paragraph("Model Adequacy Diagnostics (Nagin, 2005)", h2))
+    story.append(Paragraph(f"Joint — Relative Entropy: {joint_rel_entropy:.3f}", meta))
+    story.append(_df_to_table(joint_adq_df))
+    story.append(Paragraph(f"Y-Marginal — Relative Entropy: {y_rel_entropy:.3f}", meta))
+    story.append(_df_to_table(y_adq_df))
+    story.append(Paragraph(f"Z-Marginal — Relative Entropy: {z_rel_entropy:.3f}", meta))
+    story.append(_df_to_table(z_adq_df))
 
     story.append(Spacer(1, 14))
     story.append(Paragraph(
@@ -1886,6 +2238,18 @@ elif app_mode == "Dual-Trajectory (Joint) Mode":
                             st.dataframe(pd.DataFrame(np.round(p_g_given_h, 3), index=group_names_y, columns=group_names_z), use_container_width=True)
 
                         assignments_df_j = get_joint_subject_assignments(model_j, df_y_j, df_z_j)
+                        joint_adq_df, joint_rel_entropy, y_adq_df, y_rel_entropy, z_adq_df, z_rel_entropy = calc_joint_model_adequacy(
+                            assignments_df_j, pis_joint, group_names_y, group_names_z
+                        )
+
+                        joint_plain_summary = _generate_joint_plain_language_summary(
+                            model_j, group_names_y, group_names_z, df_y_j, df_z_j,
+                            y_adq_df, y_rel_entropy, z_adq_df, z_rel_entropy,
+                        )
+                        with st.container(border=True):
+                            st.markdown("##### 🗒️ Plain-Language Summary")
+                            st.markdown(joint_plain_summary)
+                            st.caption("Auto-generated directly from the fitted parameters, marginal/joint adequacy diagnostics, and the observed-vs-independence π comparison — not an AI-written narrative.")
 
                         st.subheader("Hard-Assignment Contingency Table")
                         st.caption("Empirical cross-check: counts of subjects by their most-likely Y-group and Z-group (computed independently of the fitted πₘₕ, from marginal posteriors).")
@@ -1895,9 +2259,6 @@ elif app_mode == "Dual-Trajectory (Joint) Mode":
                         )
                         st.dataframe(contingency_j, use_container_width=True)
 
-                        joint_adq_df, joint_rel_entropy, y_adq_df, y_rel_entropy, z_adq_df, z_rel_entropy = calc_joint_model_adequacy(
-                            assignments_df_j, pis_joint, group_names_y, group_names_z
-                        )
                         st.subheader("Model Adequacy Diagnostics (Nagin, 2005)")
                         tab_adq_j, tab_adq_y, tab_adq_z = st.tabs(["Joint", "Y-Marginal", "Z-Marginal"])
                         with tab_adq_j:
@@ -1914,6 +2275,33 @@ elif app_mode == "Dual-Trajectory (Joint) Mode":
                         st.caption("Theta rows are joint mixing log-odds relative to reference cell Y-Group 1/Z-Group 1. Model-based SE is shown for reference; Robust SE (Huber-White sandwich) is the recommended inference basis.")
                         param_df_j = get_joint_parameter_estimates_for_ui(model_j)
                         st.dataframe(param_df_j, use_container_width=True)
+
+                        st.subheader("Fitted Trajectories")
+                        n_theta_j, y_beta_start_j, z_beta_start_j, num_betas_y_j, num_betas_z_j, _ = _joint_layout(
+                            k_y, k_z, model_j['orders_y'], model_j['orders_z'],
+                            model_j['use_dropout_y'], model_j['dist_y'], model_j['use_dropout_z'], model_j['dist_z']
+                        )
+                        col_traj_y, col_traj_z = st.columns(2)
+                        with col_traj_y:
+                            st.markdown("**Outcome Y**")
+                            fake_x_y = np.concatenate([np.zeros(k_y - 1), model_j['result'].x[y_beta_start_j:z_beta_start_j]])
+                            model_y_view = {'orders': model_j['orders_y'], 'result': SimpleNamespace(x=fake_x_y), 'n_mix': 1}
+                            assignments_y_view = assignments_df_j.rename(columns={
+                                **{f'Y_Group_{g+1}_Prob': f'Group_{g+1}_Prob' for g in range(k_y)},
+                                'Assigned_Group_Y': 'Assigned_Group',
+                            })
+                            fig_traj_y_j = _obs_vs_est_figure(df_y_j, assignments_y_view, model_y_view, group_names_y, model_j['dist_y'])
+                            st.plotly_chart(fig_traj_y_j, use_container_width=True)
+                        with col_traj_z:
+                            st.markdown("**Outcome Z**")
+                            fake_x_z = np.concatenate([np.zeros(k_z - 1), model_j['result'].x[z_beta_start_j:]])
+                            model_z_view = {'orders': model_j['orders_z'], 'result': SimpleNamespace(x=fake_x_z), 'n_mix': 1}
+                            assignments_z_view = assignments_df_j.rename(columns={
+                                **{f'Z_Group_{h+1}_Prob': f'Group_{h+1}_Prob' for h in range(k_z)},
+                                'Assigned_Group_Z': 'Assigned_Group',
+                            })
+                            fig_traj_z_j = _obs_vs_est_figure(df_z_j, assignments_z_view, model_z_view, group_names_z, model_j['dist_z'])
+                            st.plotly_chart(fig_traj_z_j, use_container_width=True)
 
                         st.subheader("Export")
                         exp_col1, exp_col2, exp_col3, exp_col4 = st.columns(4)
@@ -1942,35 +2330,64 @@ elif app_mode == "Dual-Trajectory (Joint) Mode":
                                 file_name="joint_subject_assignments.csv", mime="text/csv",
                             )
 
-                        st.subheader("Fitted Trajectories")
-                        n_theta_j, y_beta_start_j, z_beta_start_j, num_betas_y_j, num_betas_z_j, _ = _joint_layout(
-                            k_y, k_z, model_j['orders_y'], model_j['orders_z'],
-                            model_j['use_dropout_y'], model_j['dist_y'], model_j['use_dropout_z'], model_j['dist_z']
-                        )
-                        col_traj_y, col_traj_z = st.columns(2)
-                        with col_traj_y:
-                            st.markdown("**Outcome Y**")
-                            fake_x_y = np.concatenate([np.zeros(k_y - 1), model_j['result'].x[y_beta_start_j:z_beta_start_j]])
-                            model_y_view = {'orders': model_j['orders_y'], 'result': SimpleNamespace(x=fake_x_y), 'n_mix': 1}
-                            assignments_y_view = assignments_df_j.rename(columns={
-                                **{f'Y_Group_{g+1}_Prob': f'Group_{g+1}_Prob' for g in range(k_y)},
-                                'Assigned_Group_Y': 'Assigned_Group',
-                            })
-                            st.plotly_chart(
-                                _obs_vs_est_figure(df_y_j, assignments_y_view, model_y_view, group_names_y, model_j['dist_y']),
-                                use_container_width=True,
+                        exp2_col1, exp2_col2, exp2_col3, exp2_col4, exp2_col5 = st.columns(5)
+                        with exp2_col1:
+                            st.download_button(
+                                "Parameter Table (LaTeX)",
+                                param_df_j.to_latex(index=False, float_format="%.4f").encode('utf-8'),
+                                file_name="joint_parameters.tex", mime="text/x-tex",
                             )
-                        with col_traj_z:
-                            st.markdown("**Outcome Z**")
-                            fake_x_z = np.concatenate([np.zeros(k_z - 1), model_j['result'].x[z_beta_start_j:]])
-                            model_z_view = {'orders': model_j['orders_z'], 'result': SimpleNamespace(x=fake_x_z), 'n_mix': 1}
-                            assignments_z_view = assignments_df_j.rename(columns={
-                                **{f'Z_Group_{h+1}_Prob': f'Group_{h+1}_Prob' for h in range(k_z)},
-                                'Assigned_Group_Z': 'Assigned_Group',
-                            })
-                            st.plotly_chart(
-                                _obs_vs_est_figure(df_z_j, assignments_z_view, model_z_view, group_names_z, model_j['dist_z']),
-                                use_container_width=True,
+                        with exp2_col2:
+                            joint_repro_script = _build_joint_reproducible_script(model_j)
+                            st.download_button(
+                                "🐍 Reproducible Script (.py)",
+                                joint_repro_script.encode('utf-8'),
+                                file_name="reproduce_joint_fit.py", mime="text/x-python",
+                                help="A standalone Python script (using the pip-installable `autotraj` "
+                                     "package) that reproduces this exact joint specification.",
+                            )
+                        with exp2_col3:
+                            joint_report_html = _build_joint_html_report(
+                                model_j, group_names_y, group_names_z, pis_joint, param_df_j,
+                                joint_adq_df, joint_rel_entropy, y_adq_df, y_rel_entropy, z_adq_df, z_rel_entropy,
+                                joint_plain_summary, fig_traj_y_j, fig_traj_z_j,
+                            )
+                            st.download_button(
+                                "📄 Generate HTML Report",
+                                joint_report_html.encode('utf-8'),
+                                file_name="joint_model_report.html", mime="text/html",
+                                help="A single shareable HTML file with the plain-language summary, "
+                                     "π matrix, adequacy diagnostics, parameter table, and "
+                                     "interactive trajectory plots.",
+                            )
+                        with exp2_col4:
+                            try:
+                                joint_report_pdf = _build_joint_pdf_report(
+                                    model_j, group_names_y, group_names_z, pis_joint, param_df_j,
+                                    joint_adq_df, joint_rel_entropy, y_adq_df, y_rel_entropy, z_adq_df, z_rel_entropy,
+                                    joint_plain_summary,
+                                )
+                                st.download_button(
+                                    "📑 Generate PDF Report",
+                                    joint_report_pdf, file_name="joint_model_report.pdf", mime="application/pdf",
+                                    help="A print-ready PDF (summary, π matrix, adequacy, parameters) — "
+                                         "trajectory plots are interactive-only, see the HTML report for those.",
+                                )
+                            except Exception as e:
+                                st.caption(f"PDF report unavailable: {e}")
+                        with exp2_col5:
+                            joint_zip_buf = io.BytesIO()
+                            with zipfile.ZipFile(joint_zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                                zf.writestr("joint_pi_matrix.csv", pd.DataFrame(pis_joint, index=group_names_y, columns=group_names_z).to_csv())
+                                zf.writestr("joint_contingency_table.csv", contingency_j.to_csv())
+                                zf.writestr("joint_parameter_estimates.csv", param_df_j.to_csv(index=False))
+                                zf.writestr("joint_subject_assignments.csv", assignments_df_j.to_csv(index=False))
+                                zf.writestr("plain_language_summary.md", joint_plain_summary)
+                                zf.writestr("reproduce_joint_fit.py", joint_repro_script)
+                            joint_zip_buf.seek(0)
+                            st.download_button(
+                                "📦 Full Results Package (.zip)",
+                                joint_zip_buf, file_name="joint_results_package.zip", mime="application/zip",
                             )
                 elif st.session_state.get("joint_all_evaluated") is not None:
                     st.error(
@@ -3018,7 +3435,7 @@ else:
                     "at the top of the page."
                 )
 
-                export_col1, export_col2, export_col3, export_col4 = st.columns(4)
+                export_col1, export_col2, export_col3, export_col4, export_col5, export_col6 = st.columns(6)
 
                 with export_col1:
                     st.download_button(
@@ -3100,6 +3517,26 @@ else:
                         )
                     except Exception as e:
                         st.caption(f"PDF report unavailable: {e}")
+
+                with export_col5:
+                    repro_script = _build_reproducible_script(winning_model)
+                    st.download_button(
+                        label="🐍 Reproducible Script (.py)",
+                        data=repro_script.encode('utf-8'),
+                        file_name='reproduce_gbtm_fit.py', mime='text/x-python',
+                        help="A standalone Python script (using the pip-installable `autotraj` "
+                             "package) that reproduces this exact model specification — for "
+                             "journal supplementary materials or independent replication.",
+                    )
+
+                with export_col6:
+                    st.download_button(
+                        label="📊 Parameter Table (LaTeX)",
+                        data=estimates_df_exp.to_latex(index=False, float_format="%.4f").encode('utf-8'),
+                        file_name='trajectory_parameters.tex', mime='text/x-tex',
+                        help="A LaTeX tabular environment of the parameter estimates table, "
+                             "ready to \\input{} into a manuscript.",
+                    )
 
         else:
             st.error("Model Failed to Converge or was rejected based on heuristic rules.")
