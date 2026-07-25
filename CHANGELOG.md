@@ -7,6 +7,23 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### Performance
+
+- **~2x faster fitting by eliminating a redundant kernel pass per BFGS evaluation.** scipy's BFGS
+  was calling the NLL function and the Jacobian function as two independent callables at each
+  evaluation point — but both `calc_universal_subject_gradients_jit` and
+  `calc_joint_dual_outcome_gradients_jit` already compute the NLL and gradient together in one pass,
+  so each pair of calls was re-running the entire per-subject likelihood/gradient loop twice for no
+  reason. Added combined `calc_nll_jac_wrapper`/`calc_joint_nll_jac_wrapper` (returning `(nll,
+  grad)` from a single kernel call) and switched `_run_multistart` to use scipy's `jac=True` mode.
+  Verified bit-identical optimization results before/after (same `x`, same `nfev`/`njev`) — this is
+  a pure deduplication, not a numerical change. Combined with the earlier parallelization, the
+  benchmark AutoTraj Search used throughout this session (Cambridge, 4-group/order-2, 5 restarts)
+  is now ~4.7x faster than the original sequential/non-deduplicated baseline (130s → 57s → 28s);
+  the full slow test suite dropped from 326s to 216s. The separate `calc_jac_wrapper`/
+  `calc_joint_jac_wrapper` remain in use for the finite-difference Hessian pass, which legitimately
+  needs many distinct perturbed points, not the same x twice.
+
 ### New Features
 
 - **AutoTraj Search for the joint dual-trajectory model** (`run_joint_autotraj`) — the joint model

@@ -1246,6 +1246,17 @@ def calc_joint_jac_wrapper(params, *args):
     return grad_flat
 
 
+def calc_joint_nll_jac_wrapper(params, *args):
+    """Combined NLL+Jacobian callable for scipy.optimize.minimize(..., jac=True) --
+    see calc_nll_jac_wrapper's docstring for why this avoids a redundant second
+    full kernel pass per BFGS evaluation point. Used by _run_multistart only;
+    the separate calc_joint_jac_wrapper remains in use for the finite-difference
+    Hessian pass (process_joint_optimization_result), which needs many distinct
+    perturbed points, not the same x twice."""
+    nll, grad_flat, _ = calc_joint_dual_outcome_gradients_jit(params, *args)
+    return nll, grad_flat
+
+
 def calc_joint_grad_subj_wrapper(params, *args):
     """Per-subject-gradient-only callable (Huber-White sandwich G matrix), joint model (V5.0)."""
     _, _, grad_subj = calc_joint_dual_outcome_gradients_jit(params, *args)
@@ -1662,6 +1673,28 @@ def calc_jac_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip
     weights = _resolve_weights_array(n_subjects, weights)
     _, grad_flat, _ = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1], weights)
     return grad_flat
+
+def calc_nll_jac_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None, weights=None):
+    """Combined NLL+Jacobian callable for scipy.optimize.minimize(..., jac=True).
+
+    scipy's BFGS calls ``fun(x)`` and ``jac(x)`` as two independent black-box
+    functions, at the same x, once per line-search evaluation. Since
+    calc_nll_wrapper and calc_jac_wrapper each independently re-run the exact
+    same kernel pass (calc_universal_subject_gradients_jit already computes
+    both the NLL and the gradient together, then one wrapper discards the
+    gradient and the other discards the NLL), calling them separately means
+    the entire per-subject likelihood/gradient loop runs TWICE per BFGS
+    evaluation point for no reason. This wrapper returns both from a single
+    kernel call, used via ``jac=True`` in _run_multistart -- halving the
+    number of full kernel passes needed during optimization (does not affect
+    the separate finite-difference Hessian pass, which legitimately needs
+    calc_jac_wrapper at many distinct perturbed points, not the same x twice).
+    """
+    n_subjects = len(subj_breaks) - 1
+    baseline_X, tvc_Z = _resolve_covariate_arrays(n_subjects, len(times), baseline_X, tvc_Z)
+    weights = _resolve_weights_array(n_subjects, weights)
+    nll, grad_flat, _ = calc_universal_subject_gradients_jit(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X, tvc_Z, baseline_X.shape[1], tvc_Z.shape[1], weights)
+    return nll, grad_flat
 
 def calc_grad_subj_wrapper(params, times, outcomes, dropouts, subj_breaks, orders, zip_iorder, use_dropout, dist_code, cnorm_min, cnorm_max, baseline_X=None, tvc_Z=None, weights=None):
     """Per-subject-gradient-only callable (used to build the Huber-White sandwich G matrix).
@@ -2145,8 +2178,16 @@ def generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outco
     return starts
 
 
-def _run_multistart(nll_fn, jac_fn, starts, args, max_workers=None):
+def _run_multistart(nll_jac_fn, starts, args, max_workers=None):
     """Run BFGS from every start in ``starts`` and return the best result.
+
+    ``nll_jac_fn`` must return ``(nll, grad)`` in a single call (passed to
+    scipy as ``jac=True``) rather than being split into separate fun/jac
+    callables -- scipy calls fun(x) and jac(x) independently at the same x
+    per line-search evaluation, and since the underlying kernel already
+    computes both together, splitting them means the entire per-subject
+    likelihood/gradient loop would otherwise run twice per evaluation point
+    for no reason (see calc_nll_jac_wrapper's docstring).
 
     Restarts are independent (each ``minimize`` call only touches its own
     local state and the shared, read-only ``args`` tuple), so they run
@@ -2164,8 +2205,8 @@ def _run_multistart(nll_fn, jac_fn, starts, args, max_workers=None):
     """
     def _one(s_idx):
         return s_idx, minimize(
-            nll_fn, starts[s_idx], args=args,
-            method='BFGS', jac=jac_fn, options={'maxiter': 3000, 'gtol': 1e-6}
+            nll_jac_fn, starts[s_idx], args=args,
+            method='BFGS', jac=True, options={'maxiter': 3000, 'gtol': 1e-6}
         )
 
     n_workers = max_workers or min(len(starts), os.cpu_count() or 1)
@@ -2283,7 +2324,7 @@ def run_single_model(df, orders_list, zip_iorder=0, use_dropout=False, dist='LOG
 
     starts = generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=n_starts, n_mix=n_mix, n_tvc=n_tvc)
 
-    best_result, best_nll, best_start_idx = _run_multistart(calc_nll_wrapper, calc_jac_wrapper, starts, args)
+    best_result, best_nll, best_start_idx = _run_multistart(calc_nll_jac_wrapper, starts, args)
 
     msg = None
     if best_start_idx > 0:
@@ -2419,7 +2460,7 @@ def run_autotraj(df, min_groups=1, max_groups=3, min_order=0, max_order=3, min_g
         args = (times_scaled, outcomes, dropouts, subj_breaks, orders_arr, int(zip_iorder), use_dropout, dist_code, float(cnorm_min), float(cnorm_max), baseline_X, tvc_Z, weights)
         starts = generate_initial_params(k, orders_list, zip_iorder, use_dropout, dist, outcomes, n_starts=n_starts, n_mix=n_mix, n_tvc=n_tvc)
 
-        best_result, best_nll, best_start_idx = _run_multistart(calc_nll_wrapper, calc_jac_wrapper, starts, args)
+        best_result, best_nll, best_start_idx = _run_multistart(calc_nll_jac_wrapper, starts, args)
 
         if best_start_idx > 0:
             msg = f"  [multi-start] autotraj {orders_list}: best on start {best_start_idx + 1}/{n_starts} (NLL={best_nll:.4f})"
@@ -2682,7 +2723,7 @@ def run_joint_dual_trajectory_model(df_y, df_z, orders_y, orders_z, dist_y='LOGI
     starts = generate_joint_initial_params(k_y, k_z, orders_y, orders_z, use_dropout_y, dist_y, outcomes_y,
                                             use_dropout_z, dist_z, outcomes_z, n_starts=n_starts)
 
-    best_result, best_nll, best_start_idx = _run_multistart(calc_joint_nll_wrapper, calc_joint_jac_wrapper, starts, args)
+    best_result, best_nll, best_start_idx = _run_multistart(calc_joint_nll_jac_wrapper, starts, args)
 
     if best_start_idx > 0:
         msg = f"  [multi-start] joint model Y{orders_y}/Z{orders_z}: best on start {best_start_idx + 1}/{n_starts} (NLL={best_nll:.4f})"
